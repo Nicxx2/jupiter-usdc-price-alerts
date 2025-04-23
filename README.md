@@ -25,6 +25,8 @@ Get real-time alerts when a token hits your custom **buy** or **sell** price tar
 
 ### 🧪 Docker Compose Example
 
+Link to Docker image: https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts
+
 Paste this into a `docker-compose.yml` file.
 
 Update only the `OUTPUT_MINT` value with the token you want alerts for (e.g. BONK, JIM, PEPE).
