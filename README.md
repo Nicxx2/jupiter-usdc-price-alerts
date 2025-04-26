@@ -116,6 +116,12 @@ You’ll be able to:
 - See when each alert was triggered
 - Watch charted price history with trigger lines
 
+
+Web UI Example:
+
+![Web UI Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/Jupiter_USDC_Price_Alert_Web_UI.png)
+
+
 ---
 ## 📲 Push Alerts with `ntfy.sh`
 
