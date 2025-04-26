@@ -18,7 +18,7 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 
 ## 🔗 GitHub Repository
 
-👉 [https://github.com/Nicxx2/jupiter-usdc-price-alerts](https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts)
+👉 [https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts](https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts)
 
 ---
 
