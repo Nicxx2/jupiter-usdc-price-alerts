@@ -6,37 +6,52 @@ services:
     container_name: jupiter-usdc-price-alerts
     restart: unless-stopped
 
-    environment:
-      # ✅ TOKEN CONFIGURATION
+    ports:
+      # Access the Web UI at http://localhost:8000
+      - "8000:8000"
 
-      # INPUT_MINT: Always USDC for dollar-based pricing
+    environment:
+      # --- TOKEN CONFIGURATION ---
+      # Fixed: USDC mint address
       INPUT_MINT: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 
-      # OUTPUT_MINT: The token you want to monitor (REPLACE this!)
+      # Replace with the token you want to monitor
       OUTPUT_MINT: <YOUR_OUTPUT_TOKEN_MINT>
 
-      # ✅ AMOUNT TO SIMULATE (in USD)
+      # --- SIMULATED SWAP AMOUNT ---
+      # Amount of USDC to simulate each check
       USD_AMOUNT: 100
 
-      # ✅ CHECK INTERVAL (in seconds)
+      # --- CHECK INTERVAL ---
+      # How often to check prices (in seconds)
       CHECK_INTERVAL: 60
 
-      # ✅ ALERT TRIGGERS
+      # --- ALERT THRESHOLDS ---
+      # Trigger alerts if price falls below these values
       BUY_ALERTS: "0.00135,0.00130"
+
+      # Trigger alerts if price rises above these values
       SELL_ALERTS: "0.00145,0.00150"
 
-      # ✅ PUSH NOTIFICATIONS
+      # --- PUSH NOTIFICATIONS ---
+      # The topic name for ntfy notifications
       NTFY_TOPIC: token-alerts
+
+      # Default ntfy server (250 messages/day/IP)
       NTFY_SERVER: https://ntfy.sh
 
-      # ✅ REPEAT ALERTS AFTER X MINUTES (0 to disable)
+      # --- COOLDOWN SETTINGS ---
+      # 0 = fire once per target; set minutes to allow repeats
       ALERT_RESET_MINUTES: 0
 
-      # ✅ LOCAL TIMEZONE
+      # --- LOCAL TIMEZONE ---
+      # Update to match your timezone
       TZ: Europe/London
 
     logging:
       driver: "json-file"
       options:
-        max-size: "2m" # Max size per log file (2MB)
-        max-file: "5" # Keep up to 5 rotated logs (~10MB total logs)
+        # Limit individual log files to 2MB
+        max-size: "2m"
+        # Keep 5 rotated log files (10MB total max)
+        max-file: "5"
