@@ -41,9 +41,9 @@ By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI tha
 
 ---
 
-## 🔗 GitHub Repository
+## 🔗 Docker Hub Repository
 
-👉 [https://github.com/Nicxx2/jupiter-usdc-price-alerts](https://github.com/Nicxx2/jupiter-usdc-price-alerts)
+👉 [https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts](https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts)
 
 ---
 
