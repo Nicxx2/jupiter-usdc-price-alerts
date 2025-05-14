@@ -14,7 +14,7 @@ By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI tha
 
 - **RSI is calculated on the token’s USD (USDC) price**, not on the token/SOL pair
 - View live RSI values across multiple intervals: `1s`, `1m`, `5m`, `15m`, `1h`, `4h`
-- Set **RSI alert thresholds**, e.g. `"above:30"`, `"below:70"`
+- Set **RSI alert thresholds**, e.g. `"below:30"`, `"above:70"`
 - Optionally **auto-reset alerts** when RSI crosses back (toggle with `RSI_RESET_ENABLED`)
 
 > 📝 To use RSI features, create a free account at [solanatracker.io](https://www.solanatracker.io/) and generate an API key  
