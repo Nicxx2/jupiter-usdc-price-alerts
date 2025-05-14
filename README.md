@@ -1,24 +1,49 @@
-# 🚀 Jupiter USDC Price Alerts v2
+# 🚀 Jupiter USDC Price Alerts v2.1
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
 Track simulated USDC swaps with real price impact and receive instant alerts via [ntfy.sh](https://ntfy.sh) — now with a **modern Web UI**!
 
+
 ---
 
-## ✨ What's New in v2
+## ✨ What's New in v2.1
+
+### 🔍 RSI Indicators (Optional)
+By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI that lets you:
+
+- View live RSI values across multiple intervals: `1s`, `1m`, `5m`, `15m`, `1h`, `4h`
+- Set **RSI alert thresholds**, e.g. `"above:30"`, `"below:70"`
+- Optionally **auto-reset alerts** when RSI crosses back (toggle with `RSI_RESET_ENABLED`)
+
+> 📝 To use RSI features, create a free account at [solanatracker.io](https://www.solanatracker.io/) and generate an API key  
+> 🚦 Free API keys include **10,000 requests per month**
+
+### 🛡️ Resilience to API Hiccups
+- Handles rate limits (`429`) and timeouts gracefully
+- If RSI data is unavailable, the UI displays `"––"` instead of crashing
+- RSI alerts automatically resume on the next scheduled check
+
+### 🖥️ RSI Alert Status Badges
+- New badges show live RSI alert state:
+  - 🟢 **Active**
+  - 🟡 **Waiting to Reactivate**
+  - 🔴 **Inactive**
+
+
+
+---
 
 - 🌐 **Live Web UI** — View current swap prices, price history, and your alert thresholds  
-- 🧠 **On-the-fly updates** — Adjust USD amount, buy/sell targets, and view real logs  
+- 🧠 **On-the-fly updates** — Adjust USD amount, buy/sell targets, and more  
 - 📈 **Chart View** — Visualize price trends and alert triggers over time  
-- 🐳 **Single container build** — Backend + Web + Alert engine bundled together  
-- ⚙️ **Minimal config needed** — Just change the token mint address and you're ready  
+- 🐳 **Single container build** — Backend + Web + Alert engine bundled together   
 
 ---
 
-## 🔗 Docker Hub Repository
+## 🔗 GitHub Repository
 
-👉 [https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts](https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts)
+👉 [https://github.com/Nicxx2/jupiter-usdc-price-alerts](https://github.com/Nicxx2/jupiter-usdc-price-alerts)
 
 ---
 
@@ -38,55 +63,80 @@ services:
     container_name: jupiter-usdc-price-alerts
     restart: unless-stopped
 
+    # Expose the FastAPI backend for the Web UI
     ports:
-      # Access the Web UI at http://localhost:8000
       - "8000:8000"
 
     environment:
-      # --- TOKEN CONFIGURATION ---
-      # Fixed: USDC mint address
+      # --- Token Configuration ---
+
+      # Input mint (must be USDC for accurate USD-based alerts)
       INPUT_MINT: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 
-      # Replace with the token you want to monitor
+      # Output token mint (token you want to monitor, e.g. JIM)
       OUTPUT_MINT: <YOUR_OUTPUT_TOKEN_MINT>
 
-      # --- SIMULATED SWAP AMOUNT ---
-      # Amount of USDC to simulate each check
+      # Solanatracker.io API key (required for RSI features)
+      # If omitted, RSI data and alerts will be disabled in the UI
+      SOLANATRACKER_API_KEY: ""
+
+      # --- Simulated Swap Settings ---
+
+      # Amount of USDC to simulate swapping
       USD_AMOUNT: 100
 
-      # --- CHECK INTERVAL ---
       # How often to check prices (in seconds)
       CHECK_INTERVAL: 60
 
-      # --- ALERT THRESHOLDS ---
-      # Trigger alerts if price falls below these values
-      BUY_ALERTS: "0.00135,0.00130"
+      # --- Alert Triggers ---
 
-      # Trigger alerts if price rises above these values
-      SELL_ALERTS: "0.00145,0.00150"
+      # Trigger buy alert if price is less than or equal to one of these
+      BUY_ALERTS: "0.00138, 0.00135, 0.00136"
 
-      # --- PUSH NOTIFICATIONS ---
-      # The topic name for ntfy notifications
+      # Trigger sell alert if price is greater than or equal to one of these
+      SELL_ALERTS: "0.00140, 0.00145"
+
+      # --- RSI Configuration ---
+
+      # How often (in minutes) to refresh RSI checks
+      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      RSI_CHECK_INTERVAL: 5
+
+      # RSI alert thresholds (e.g. "above:30", "below:70")
+      RSI_ALERTS: "below:30"
+
+      # Candle interval used for RSI calculation (e.g. 1s, 1m, 5m)
+      RSI_INTERVAL: "5m"
+
+      # If false, RSI alerts trigger only once per session
+      RSI_RESET_ENABLED: "false"
+
+      # --- Push Notifications (via ntfy) ---
+
+      # Unique topic name to receive notifications
       NTFY_TOPIC: token-alerts
 
-      # Default ntfy server (250 messages/day/IP)
+      # Ntfy server URL (default: https://ntfy.sh)
       NTFY_SERVER: https://ntfy.sh
 
-      # --- COOLDOWN SETTINGS ---
-      # 0 = fire once per target; set minutes to allow repeats
+      # --- Alert Reset Cooldown ---
+
+      # Minutes before the same buy/sell alert can trigger again (set to 0 to disable)
       ALERT_RESET_MINUTES: 0
 
-      # --- LOCAL TIMEZONE ---
-      # Update to match your timezone
+      # --- Timezone ---
+
+      # Local timezone for timestamps and scheduling
       TZ: Europe/London
+
+    # --- Log Rotation ---
 
     logging:
       driver: "json-file"
       options:
-        # Limit individual log files to 2MB
         max-size: "2m"
-        # Keep 5 rotated log files (10MB total max)
         max-file: "5"
+
 ```
 
 ---
@@ -115,12 +165,13 @@ You’ll be able to:
 - Change the simulated USD amount
 - See when each alert was triggered
 - Watch charted price history with trigger lines
+- (Optional) Set the SOLANATRACKER_API_KEY env var to enable a live 14-period RSI panel and “above:/below:” threshold alerts in the UI. If you omit the key, the RSI cards stay disabled (showing “—”).
+
 
 
 Web UI Example:
 
-![Web UI Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/Jupiter_USDC_Price_Alert_Web_UI.png)
-
+![Web UI Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/Jupiter_USDC_Price_Alert_Web_UI_with_RSI.png?raw=true)
 
 ---
 ## 📲 Push Alerts with `ntfy.sh`
