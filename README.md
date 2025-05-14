@@ -12,6 +12,7 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 ### 🔍 RSI Indicators (Optional)
 By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI that lets you:
 
+- **RSI is calculated on the token’s USD (USDC) price**, not on the token/SOL pair
 - View live RSI values across multiple intervals: `1s`, `1m`, `5m`, `15m`, `1h`, `4h`
 - Set **RSI alert thresholds**, e.g. `"above:30"`, `"below:70"`
 - Optionally **auto-reset alerts** when RSI crosses back (toggle with `RSI_RESET_ENABLED`)
@@ -165,7 +166,7 @@ You’ll be able to:
 - Change the simulated USD amount
 - See when each alert was triggered
 - Watch charted price history with trigger lines
-- (Optional) Set the SOLANATRACKER_API_KEY env var to enable a live 14-period RSI panel and “above:/below:” threshold alerts in the UI. If you omit the key, the RSI cards stay disabled (showing “—”).
+- (Optional) Set the SOLANATRACKER_API_KEY env var to enable a live 14-period USD-based RSI panel and “above:/below:” threshold alerts in the UI. If you omit the key, the RSI cards stay disabled (showing “—”).
 
 
 
