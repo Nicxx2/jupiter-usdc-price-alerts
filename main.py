@@ -4,6 +4,7 @@ import threading
 import requests
 import json
 from datetime import datetime, timedelta, timezone
+from rsi_utils import get_latest_rsi
 
 INPUT_MINT = os.getenv("INPUT_MINT")
 OUTPUT_MINT = os.getenv("OUTPUT_MINT")
@@ -20,8 +21,20 @@ BUY_ALERTS = []
 SELL_ALERTS = []
 ALERT_RESET_MINUTES = int(os.getenv("ALERT_RESET_MINUTES", 0))
 
+# How often to run RSI logic (in minutes)
+RSI_CHECK_INTERVAL = int(os.getenv("RSI_CHECK_INTERVAL", "4"))
+_last_rsi_at: datetime | None = None
+
 last_buy_alert = {}
 last_sell_alert = {}
+
+# 🔍 RSI config
+SOLANATRACKER_API_KEY = os.getenv("SOLANATRACKER_API_KEY")
+RSI_INTERVAL = os.getenv("RSI_INTERVAL", "1s")
+RSI_ALERTS_RAW = os.getenv("RSI_ALERTS", "")
+RSI_STATE = {}  # format: {'above:70': {"triggered": False}, ...}
+# ─── RSI reset‐mode (true=allow re‐trigger on cross‐back) ───────────
+RSI_RESET_ENABLED = os.getenv("RSI_RESET_ENABLED", "false").lower() == "true"
 
 print("✅ Starting script, checking env vars...", flush=True)
 print(f"INPUT_MINT: {INPUT_MINT}", flush=True)
@@ -31,33 +44,100 @@ if not INPUT_MINT or not OUTPUT_MINT:
     print("❌ Missing required environment variables. Exiting.", flush=True)
     exit(1)
 
+
+def __load_persisted_rsi():
+    try:
+        with open(shared_json_path) as f:
+            data = json.load(f)
+        return data.get("last_triggered_rsi", {})
+    except:
+        return {}
+
+
+
 def parse_env_alerts(env_value):
     try:
         return [float(v.strip()) for v in env_value.split(",") if v.strip()]
     except Exception:
         return []
 
+def parse_rsi_alerts():
+    global RSI_STATE
+    RSI_STATE.clear()
+    if not SOLANATRACKER_API_KEY or not RSI_ALERTS_RAW:
+        return
+    for entry in RSI_ALERTS_RAW.split(","):
+        entry = entry.strip()
+        if ":" not in entry: continue
+        direction, value = entry.split(":")
+        try:
+            threshold = float(value)
+            key = f"{direction}:{threshold:.2f}"
+            RSI_STATE[key] = {"triggered": False}
+        except:
+            continue
+
+
+parse_rsi_alerts()
+
+# ─── on startup, sync in-memory RSI_STATE.triggered from shared JSON ───
+try:
+    with open(shared_json_path) as sf:
+        shared = json.load(sf)
+    persisted = shared.get("last_triggered_rsi", {})
+    for k in RSI_STATE:
+        RSI_STATE[k]["triggered"] = (k in persisted)
+except Exception:
+    pass
+
 def load_dynamic_config():
     global USD_AMOUNT, BUY_ALERTS, SELL_ALERTS, ALERT_RESET_MINUTES
+    global RSI_ALERTS_RAW, RSI_INTERVAL, RSI_RESET_ENABLED
 
-    # ——————— load config.json as before ———————
+    # ─── load config.json ────────────────────────────────────
     if os.path.exists(config_json_path):
         try:
             with open(config_json_path) as f:
-                data = json.load(f)
-                USD_AMOUNT = float(data.get("usd_amount", USD_AMOUNT))
-                BUY_ALERTS = data.get("buy_alerts", BUY_ALERTS)
-                SELL_ALERTS = data.get("sell_alerts", SELL_ALERTS)
-                ALERT_RESET_MINUTES = int(data.get("alert_reset_minutes", ALERT_RESET_MINUTES))
+                cfg = json.load(f)
+
+            USD_AMOUNT        = float(cfg.get("usd_amount", USD_AMOUNT))
+            BUY_ALERTS        = cfg.get("buy_alerts", BUY_ALERTS)
+            SELL_ALERTS       = cfg.get("sell_alerts", SELL_ALERTS)
+            ALERT_RESET_MINUTES = int(cfg.get("alert_reset_minutes", ALERT_RESET_MINUTES))
+
+            # ─── dynamic RSI config ──────────────────────────
+            if "rsi_alerts" in cfg:
+                raw = cfg["rsi_alerts"]
+                # if they're pure numbers, format to two decimals…
+                if raw and all(isinstance(v, (int, float)) for v in raw):
+                   RSI_ALERTS_RAW = ",".join(f"{v:.2f}" for v in raw)
+                else:
+                   # otherwise assume they're strings like "above:30" / "below:70"
+                   RSI_ALERTS_RAW = ",".join(str(v) for v in raw)
+                RSI_INTERVAL      = cfg.get("rsi_interval", RSI_INTERVAL)
+                RSI_RESET_ENABLED = bool(cfg.get("rsi_reset_enabled", RSI_RESET_ENABLED))
+                parse_rsi_alerts()  # rebuild RSI_STATE from the new RSI_ALERTS_RAW
+                
+                # ─── SYNC in-memory triggered flags from shared state ─────────────────
+                try:
+                    with open(shared_json_path) as sf:
+                        shared = json.load(sf)
+                    persisted = shared.get("last_triggered_rsi", {})
+                    for k in RSI_STATE:
+                        # mark triggered = True only if that key is still in persisted
+                        RSI_STATE[k]["triggered"] = (k in persisted)
+                except Exception as e:
+                    print(f"⚠️ Could not sync RSI_STATE: {e}", flush=True)
+
         except Exception as e:
             print(f"⚠️ Failed to load config.json: {e}", flush=True)
     else:
         print("ℹ️ No config.json found — using ENV defaults", flush=True)
-        BUY_ALERTS = parse_env_alerts(os.getenv("BUY_ALERTS", ""))
-        SELL_ALERTS = parse_env_alerts(os.getenv("SELL_ALERTS", ""))
+        BUY_ALERTS        = parse_env_alerts(os.getenv("BUY_ALERTS", ""))
+        SELL_ALERTS       = parse_env_alerts(os.getenv("SELL_ALERTS", ""))
         ALERT_RESET_MINUTES = int(os.getenv("ALERT_RESET_MINUTES", ALERT_RESET_MINUTES))
 
-    # ——————— load & normalize jupiter-latest.json timestamps ———————
+    # ─── load & normalize jupiter-latest.json timestamps ─────
     if os.path.exists(shared_json_path):
         try:
             with open(shared_json_path) as f:
@@ -92,19 +172,15 @@ def load_dynamic_config():
                 dt = dt.astimezone(timezone.utc)
             last_sell_alert[k] = dt
 
-    # ——————— prune any timestamps for alerts that no longer exist ———————
-    valid_buy_keys  = { f"{float(x):.8f}" for x in BUY_ALERTS }
+    # ─── prune old timestamps ────────────────────────────────
+    valid_buy_keys  = {f"{float(x):.8f}" for x in BUY_ALERTS}
     for k in list(last_buy_alert):
         if k not in valid_buy_keys:
             last_buy_alert.pop(k)
-
-    valid_sell_keys = { f"{float(x):.8f}" for x in SELL_ALERTS }
+    valid_sell_keys = {f"{float(x):.8f}" for x in SELL_ALERTS}
     for k in list(last_sell_alert):
         if k not in valid_sell_keys:
             last_sell_alert.pop(k)
-
-    # now last_buy_alert & last_sell_alert only contain timestamps
-    # for alerts still present in BUY_ALERTS / SELL_ALERTS
 
 
 
@@ -134,6 +210,15 @@ def notify_backend_trigger(side: str, price: float):
     except Exception as e:
         print(f"⚠️ Failed to notify backend of {side} trigger: {e}", flush=True)
 
+def notify_backend_rsi_trigger(key: str, timestamp: str):
+    try:
+        requests.post(
+            "http://127.0.0.1:8000/api/rsi/trigger",
+            json={"key": key, "timestamp": timestamp},
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to notify backend of RSI trigger: {e}", flush=True)
+
 def get_out_amount(input_mint, output_mint, amount_lamports):
     url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippage=1"
     res = requests.get(url)
@@ -145,7 +230,7 @@ def get_out_amount(input_mint, output_mint, amount_lamports):
 
 def should_alert(alert_dict, key):
     """
-    Decide whether we should fire an alert for `key`, and return
+    Decide whether we should fire an alert for key, and return
     (allow: bool, timestamp_to_set: datetime or None).
 
     - If ALERT_RESET_MINUTES == 0: only allow on first encounter (when key not in alert_dict).
@@ -193,6 +278,10 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned):
             "sell_alerts": SELL_ALERTS,
             "last_triggered_buy": {k: v.isoformat() for k, v in last_buy_alert.items()},
             "last_triggered_sell": {k: v.isoformat() for k, v in last_sell_alert.items()},
+            # ─── RSI─timestamps ───────────────────────────────
+            "last_triggered_rsi": {
+                k: v for k, v in __load_persisted_rsi().items()
+            },
             "alert_reset_minutes": ALERT_RESET_MINUTES
         }
         with open(shared_json_path, "w") as f:
@@ -297,6 +386,63 @@ def check_prices():
                 continue
     else:
         print("❌ Could not fetch token → USDC quote.", flush=True)
+    
+    
+    # ——— RSI CHECK (only every RSI_CHECK_INTERVAL minutes) ——————————————
+    global _last_rsi_at
+    now_utc = datetime.now(timezone.utc)
+
+    if SOLANATRACKER_API_KEY and RSI_STATE \
+       and (_last_rsi_at is None or (now_utc - _last_rsi_at) >= timedelta(minutes=RSI_CHECK_INTERVAL)):
+        _last_rsi_at = now_utc
+        try:
+            rsi_value, rsi_time = get_latest_rsi(
+                api_key=SOLANATRACKER_API_KEY,
+                token=OUTPUT_MINT,
+                period=14,
+                interval=RSI_INTERVAL
+            )
+            print(f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} at {rsi_time}", flush=True)
+
+            for key, info in RSI_STATE.items():
+                direction, val_str = key.split(":")
+                threshold = float(val_str)
+
+                # ── 1) If already triggered, see if we should reset ───────
+                if info["triggered"]:
+                    if RSI_RESET_ENABLED:
+                        crossed_back = (
+                            (direction == "above" and rsi_value < threshold) or
+                            (direction == "below" and rsi_value > threshold)
+                       )
+                        if crossed_back:
+                            info["triggered"] = False
+                            # tell backend so UI flips immediately
+                            try:
+                                requests.post(
+                                    "http://127.0.0.1:8000/api/rsi/reset-alert",
+                                    json={"key": key},
+                                    timeout=2
+                                )
+                            except Exception:
+                                pass
+                    # skip firing again this tick
+                    continue
+
+                # ── 2) Not triggered yet → test threshold ────────────────
+                should_fire = (
+                    (direction == "above" and rsi_value > threshold) or
+                    (direction == "below" and rsi_value < threshold)
+                )
+                if should_fire:
+                    info["triggered"] = True
+                    msg = f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} {direction} {threshold}"
+                    print(f"🔔 RSI Alert: {msg}", flush=True)
+                    send_alert("RSI Alert", msg)
+                    notify_backend_rsi_trigger(key, rsi_time)
+
+        except Exception as e:
+            print(f"⚠️ RSI check failed: {e}", flush=True)
 
     # ✅ Final status save and debug tracking
     write_status_json(price_buy, price_sell, token_received, usdc_returned)

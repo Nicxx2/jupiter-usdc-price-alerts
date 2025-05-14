@@ -17,6 +17,31 @@ import {
 
 ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Legend);
 
+
+// ─── RSI helpers ─────────────────────────────────────────
+function rsiLabel(value: number | null): string {
+  if (value === null) return "";
+  if (value >= 70) return "Overbought";
+  if (value <= 30) return "Oversold";
+  if (value >= 50) return "Bullish";
+  return "Gray Zone";
+}
+
+function rsiColor(value: number | null): string {
+  if (value === null) return "gray";
+  if (value >= 70) return "red";
+  if (value <= 30) return "blue";
+  if (value >= 50) return "green";
+  return "darkgray";
+}
+
+function getRsiStatus(triggered: boolean, resetEnabled: boolean): string {
+  if (triggered) {
+    return resetEnabled ? "🟡 Waiting to Reactivate" : "🔴 Inactive";
+  }
+  return "🟢 Active";
+}
+
 function getAlertStatusWithCountdown(lastTime: string | undefined, resetMinutes: number): string {
   if (!lastTime) return "🟢 Active";
   try {
@@ -48,6 +73,31 @@ export default function AlertsDashboard() {
   const [history, setHistory] = useState<any[]>([]);
   const [latestBuyPrice, setLatestBuyPrice] = useState<number | null>(null);
   const [latestSellPrice, setLatestSellPrice] = useState<number | null>(null);
+  const [rsi, setRsi] = useState<number | null>(null);
+  const [rsiTime, setRsiTime] = useState<string>("");
+  const [rsiAlerts, setRsiAlerts] = useState<Record<string, { triggered: boolean }>>({});
+  const [rsiResetEnabled, setRsiResetEnabled] = useState(false);
+  // the *applied* interval (shown in the top card)
+  const [rsiInterval, setRsiInterval] = useState("1s");
+  // the *pending* interval (driven by the dropdown)
+  const [pendingInterval, setPendingInterval] = useState("1s");
+  // new state for RSI form
+  const [newRsiDir,  setNewRsiDir]  = useState<"above"|"below">("above");
+  const [newRsiValue, setNewRsiValue] = useState("");
+
+  const fetchRSI = () => {
+    fetch("/api/rsi")
+    .then((res) => res.json())
+    .then((data) => {
+        setRsi(data.latest_rsi);
+        setRsiTime(data.timestamp);
+        setRsiAlerts(data.alerts || {});
+        setRsiInterval(data.interval || "1s");
+        setPendingInterval(data.interval || "1s");
+        setRsiResetEnabled(data.reset_enabled || false);
+      })
+      .catch(() => toast.error("Failed to load RSI"));
+  };
 
   const fetchState = () => {
     fetch("/api/state")
@@ -69,12 +119,16 @@ export default function AlertsDashboard() {
 
   useEffect(() => {
     fetchState();
+    fetchRSI();
+    const rsiIntervalTimer = setInterval(fetchRSI, 60000);
     const interval = setInterval(fetchState, 60000);
     const refreshCountdown = setInterval(() => {
       setLastBuyTimes((prev) => ({ ...prev }));
       setLastSellTimes((prev) => ({ ...prev }));
     }, 1000);
+
     return () => {
+      clearInterval(rsiIntervalTimer);
       clearInterval(interval);
       clearInterval(refreshCountdown);
     };
@@ -188,6 +242,163 @@ export default function AlertsDashboard() {
           </CardContent>
         </Card>
       </div>
+
+      {/* ─── RSI Info Card ────────────────────────────────── */}
+      <Card>
+        <CardContent className="p-4 text-center">
+          <h2 className="text-xl font-semibold">RSI ({rsiInterval})</h2>
+          <p className="text-2xl font-bold" style={{ color: rsiColor(rsi) }}>
+            {rsi !== null ? rsi.toFixed(2) : "--"}
+          </p>
+          <p className="italic text-sm text-gray-500">{rsiLabel(rsi)}</p>
+        </CardContent>
+      </Card>
+
+
+      {/* ─── RSI Alerts Card ───────────────────────────────── */}
+      <Card>
+        <CardContent className="space-y-2 p-4">
+          <Label>RSI Alerts</Label>
+          <div className="flex gap-2 items-center">
+            <select
+              value={newRsiDir}
+              onChange={e => setNewRsiDir(e.target.value as any)}
+              className="border p-1 rounded"
+            >
+              <option value="above">Above</option>
+              <option value="below">Below</option>
+            </select>
+            <Input
+              value={newRsiValue}
+              onChange={e => setNewRsiValue(e.target.value)}
+              placeholder="Threshold"
+            />
+            <Button
+              onClick={async () => {
+                const num = parseFloat(newRsiValue);
+                if (isNaN(num) || num < 0) return toast.error("Invalid RSI value");
+                // we send the raw number; backend will treat it as float threshold
+                await fetch("/api/rsi", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ values: [`${newRsiDir}:${num.toFixed(2)}`] }),
+                });
+                setNewRsiValue("");
+                fetchRSI();
+              }}
+            >
+              Add
+            </Button>
+          </div>
+          <ul className="list-disc pl-5">
+            {Object.entries(rsiAlerts).map(([key, { triggered }]) => {
+              const status = getRsiStatus(triggered, rsiResetEnabled);
+              return (
+                <li key={key} className="flex justify-between items-center gap-2">
+                  <div>
+                    <span>{key}</span> — <span className="font-semibold">{status}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        await fetch("/api/rsi/reset-alert", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ key }),
+                        });
+                        fetchRSI();
+                      }}
+                    >
+                      Reset
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        await fetch("/api/rsi", {
+                          method: "DELETE",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ key }),     // <-- pass the alert key string
+                        });
+                        fetchRSI();
+                      }}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </CardContent>
+      </Card>
+
+      {/* ─── RSI Interval Card ────────────────────────────── */}
+      <Card>
+        <CardContent className="space-y-2 p-4">
+          <Label>RSI Interval</Label>
+          <div className="flex gap-2">
+            <select
+              value={pendingInterval}
+              onChange={(e) => setPendingInterval(e.target.value)}
+              className="border p-1 rounded"
+            >
+              {["1s", "1m", "5m", "15m", "1h", "4h"].map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </select>
+            <Button
+              onClick={async () => {
+                // clear out the old RSI so we dont show stale,
+                // then apply & re‐fetch immediately
+                setRsi(null);
+                await fetch("/api/rsi/interval", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ interval: pendingInterval }),
+                });
+                setRsiInterval(pendingInterval);
+                fetchRSI();
+              }}
+            >
+              Update
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ─── RSI Reset Mode Card ───────────────────────────── */}
+      <Card>
+        <CardContent className="space-y-2 p-4">
+          <Label>RSI Reset Mode</Label>
+          <div className="flex gap-2">
+            <select
+              value={rsiResetEnabled ? "true" : "false"}
+              onChange={(e) => setRsiResetEnabled(e.target.value === "true")}
+              className="border p-1 rounded"
+            >
+              <option value="true">Re-trigger on cross-back</option>
+              <option value="false">One-time only</option>
+            </select>
+            <Button
+              onClick={async () => {
+                await fetch("/api/rsi/reset-mode", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ enabled: rsiResetEnabled }),
+                });
+                fetchRSI();
+              }}
+            >
+              Update
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Rest of the UI remains unchanged */}
       <Card>
