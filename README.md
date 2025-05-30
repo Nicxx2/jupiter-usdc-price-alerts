@@ -1,4 +1,4 @@
-# 🚀 Jupiter USDC Price Alerts v2.1
+# 🚀 Jupiter USDC Price Alerts v2.2.1
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -7,7 +7,19 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 
 ---
 
-## ✨ What's New in v2.1
+## ✨ What's New in v2.2
+
+### 📱 Mobile Layout Tweaks
+- Improved layout so the UI now looks better on phones and smaller screens.
+
+### 💼 Wallet Information Panel
+- You can now add wallets to view real-time holdings and cost basis.
+- A new **“All”** option shows the combined totals across all wallets.
+- Requires: `SOLANATRACKER_API_KEY` and that you set `WALLET_ADDRESSES` with at least one wallet address.
+
+---
+
+## v2.1
 
 ### 🔍 RSI Indicators (Optional)
 By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI that lets you:
@@ -16,6 +28,7 @@ By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI tha
 - View live RSI values across multiple intervals: `1s`, `1m`, `5m`, `15m`, `1h`, `4h`
 - Set **RSI alert thresholds**, e.g. `"below:30"`, `"above:70"`
 - Optionally **auto-reset alerts** when RSI crosses back (toggle with `RSI_RESET_ENABLED`)
+
 
 > 📝 To use RSI features, create a free account at [solanatracker.io](https://www.solanatracker.io/) and generate an API key  
 > 🚦 Free API keys include **10,000 requests per month**
@@ -56,7 +69,6 @@ Paste the following into a `docker-compose.yml` file.
 🕒 Make sure to change the `TZ` (timezone) to match **your region** — this helps timestamps and cooldown logic align properly.
 
 ```yaml
-version: '3.9'
 
 services:
   jupiter-usdc-price-alert:
@@ -111,6 +123,11 @@ services:
 
       # If false, RSI alerts trigger only once per session
       RSI_RESET_ENABLED: "false"
+
+      # Persisted, wallet tracking config
+      # Comma-separated list of Solana wallet addresses to track
+      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      WALLET_ADDRESSES: ""
 
       # --- Push Notifications (via ntfy) ---
 
@@ -167,6 +184,7 @@ You’ll be able to:
 - See when each alert was triggered
 - Watch charted price history with trigger lines
 - (Optional) Set the SOLANATRACKER_API_KEY env var to enable a live 14-period USD-based RSI panel and “above:/below:” threshold alerts in the UI. If you omit the key, the RSI cards stay disabled (showing “—”).
+- (Optional) View token holdings and cost basis for one or more wallets (with optional aggregation) using the SOLANATRACKER_API_KEY — requires setting `WALLET_ADDRESSES` with at least one wallet address. 
 
 
 
