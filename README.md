@@ -7,7 +7,7 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 
 ---
 
-## ✨ What's New in v2.2
+## ✨ What's New in v2.2.1
 
 ### 📱 Mobile Layout Tweaks
 - Improved layout so the UI now looks better on phones and smaller screens.
