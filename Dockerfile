@@ -43,6 +43,7 @@ COPY --from=frontend /app/frontend_app/dist /app/frontend
 COPY main.py /app/
 COPY backend_api.py /app/
 COPY rsi_utils.py /app/
+COPY solana_rate_limiter.py /app/
 
 # Copy shared folder
 RUN mkdir /shared

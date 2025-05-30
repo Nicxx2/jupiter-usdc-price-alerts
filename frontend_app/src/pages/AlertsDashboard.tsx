@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -73,6 +73,16 @@ export default function AlertsDashboard() {
   const [history, setHistory] = useState<any[]>([]);
   const [latestBuyPrice, setLatestBuyPrice] = useState<number | null>(null);
   const [latestSellPrice, setLatestSellPrice] = useState<number | null>(null);
+  // ─── Wallet Tracking State & Helpers ─────────────────────────
+  const [wallets, setWallets] = useState<string[]>([]);
+  const [walletRefresh, setWalletRefresh] = useState<number>(60);
+  // <-- new: store the mint coming from the backend
+  const [outputMint, setOutputMint] = useState<string>("");
+  const [newWallet, setNewWallet] = useState("");
+  const [selectedWallet, setSelectedWallet] = useState("all");
+  const [pnlData, setPnlData] = useState<{ individual: Record<string, any>; aggregated?: any }>({ individual: {} });
+
+  const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
   const [rsi, setRsi] = useState<number | null>(null);
   const [rsiTime, setRsiTime] = useState<string>("");
   const [rsiAlerts, setRsiAlerts] = useState<Record<string, { triggered: boolean }>>({});
@@ -84,6 +94,8 @@ export default function AlertsDashboard() {
   // new state for RSI form
   const [newRsiDir,  setNewRsiDir]  = useState<"above"|"below">("above");
   const [newRsiValue, setNewRsiValue] = useState("");
+  const lastPnlFetch = useRef<number>(Date.now());
+
 
   const fetchRSI = () => {
     fetch("/api/rsi")
@@ -99,40 +111,195 @@ export default function AlertsDashboard() {
       .catch(() => toast.error("Failed to load RSI"));
   };
 
-  const fetchState = () => {
-    fetch("/api/state")
-      .then((res) => res.json())
-      .then((data) => {
-        setUsdAmount(data.usd_amount || 100);
-        setBuyAlerts(data.buy_alerts || []);
-        setSellAlerts(data.sell_alerts || []);
-        setLastBuyTimes(data.last_triggered_buy || {});
-        setLastSellTimes(data.last_triggered_sell || {});
-        setAlertResetMinutes(data.alert_reset_minutes || 0);
-        setHistory(data.latest_prices || []);
-        const last = data.latest_prices?.at(-1);
-        setLatestBuyPrice(last?.buy_price ?? null);
-        setLatestSellPrice(last?.sell_price ?? null);
-      })
-      .catch(() => toast.error("Failed to load state"));
+  const fetchState = async () => {
+    try {
+      const stored = localStorage.getItem("selectedWallet");
+      const res = await fetch("/api/state");
+      const data = await res.json();
+
+      setUsdAmount(data.usd_amount || 100);
+      setBuyAlerts(data.buy_alerts || []);
+      setSellAlerts(data.sell_alerts || []);
+      setLastBuyTimes(data.last_triggered_buy || {});
+      setLastSellTimes(data.last_triggered_sell || {});
+      // Wallet config
+      setWallets(data.wallet_addresses || []);
+      setWalletRefresh(data.wallet_refresh_minutes || 60);
+      setOutputMint(data.output_mint || "");
+      setSelectedWallet(stored || "all");
+      setAlertResetMinutes(data.alert_reset_minutes || 0);
+      setHistory(data.latest_prices || []);
+      const last = data.latest_prices?.at(-1);
+      setLatestBuyPrice(last?.buy_price ?? null);
+      setLatestSellPrice(last?.sell_price ?? null);
+
+    } catch {
+      toast.error("Failed to load state");
+    }
   };
 
-  useEffect(() => {
-    fetchState();
-    fetchRSI();
-    const rsiIntervalTimer = setInterval(fetchRSI, 60000);
-    const interval = setInterval(fetchState, 60000);
-    const refreshCountdown = setInterval(() => {
-      setLastBuyTimes((prev) => ({ ...prev }));
-      setLastSellTimes((prev) => ({ ...prev }));
-    }, 1000);
+  
+// ─── Fetch PnL for each wallet (with rate-limit & retry) ─────────────────
+async function fetchPnl() {
+  if (!wallets.length || !outputMint) {
+    setPnlData({ individual: {}, aggregated: undefined });
+    lastPnlFetch.current = Date.now();
+    return;
+  }
+  
+  
+  // grab last known individual data so we can fall back on it
+  const prev = pnlData.individual;
 
-    return () => {
-      clearInterval(rsiIntervalTimer);
-      clearInterval(interval);
-      clearInterval(refreshCountdown);
-    };
-  }, []);
+  const tokenMint = outputMint;
+  const indiv: Record<string, any> = {};
+  const failed: string[] = [];
+  
+  // record one timestamp for this entire run
+  const fetchTime = new Date().toLocaleString();
+
+  //First pass
+  for (const w of wallets) {
+    try {
+      const res = await fetch(`/api/pnl/${w}/${tokenMint}`);
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      // attach timestamp
+      indiv[w] = { ...data, lastFetchedAt: fetchTime };
+    } catch {
+      // if it failed, mark for retry but *preserve* last known
+      failed.push(w);
+      indiv[w] = { ...(prev[w] || {}) };
+    }
+    await delay(1100);
+  }
+
+  //Retry failures
+  if (failed.length) {
+    await delay(2000);
+    const still: string[] = [];
+    for (const w of failed) {
+      try {
+        const res = await fetch(`/api/pnl/${w}/${tokenMint}`);
+        if (!res.ok) throw new Error();
+        const retryData = await res.json();
+
+        indiv[w] = { ...retryData, lastFetchedAt: fetchTime };
+      } catch {
+        // still failed on retry → keep old data/timestamp
+        still.push(w);
+        indiv[w] = { ...(prev[w] || {}) };
+      }
+      await delay(1100);
+    }
+    if (still.length) toast.error(`Failed to load PnL for: ${still.join(", ")}`);
+  }
+
+  //Compute aggregate across all wallets
+  let agg = {
+    holding:        0,
+    realized:       0,
+    unrealized:     0,
+    current_value:  0,
+    cost_basis:     0,
+    last_trade_time: null as string | null,
+    lastFetchedAt: fetchTime,
+    staleCount: 0,
+  };
+  let weightedCost = 0;
+  let maxTs = 0;
+
+  for (const [_w, d] of Object.entries(indiv)) {
+    agg.holding       += d.holding;
+    agg.realized      += d.realized;
+    agg.unrealized    += d.unrealized;
+    agg.current_value += d.current_value;
+    weightedCost      += d.cost_basis * d.holding;
+
+    const t = Date.parse(d.last_trade_time || "");
+    if (!isNaN(t) && t > maxTs) maxTs = t;
+  }
+
+  if (agg.holding > 0) {
+    agg.cost_basis = weightedCost / agg.holding;
+  }
+  agg.last_trade_time = maxTs
+    ? new Date(maxTs).toLocaleString()
+    : null;
+
+
+  // Track which wallets failed or have stale data
+  const failedWallets: string[] = [];
+  for (const [wallet, data] of Object.entries(indiv)) {
+    // Check if wallet has stale timestamp OR all zero values
+    const isStale = data.lastFetchedAt !== fetchTime;
+    const hasNoData = data.holding === 0 && data.realized === 0 && 
+                    data.unrealized === 0 && data.cost_basis === 0;
+  
+    if (isStale || (hasNoData && !data.last_trade_time)) {
+      failedWallets.push(wallet);
+    }
+  }
+  agg.staleCount = failedWallets.length;
+  agg.failedWallets = failedWallets;
+
+
+  //Store both individual & aggregated
+  setPnlData({
+    individual: indiv,
+    aggregated: agg
+  });
+  
+  await fetch("/api/pnl", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ individual: indiv, aggregated: agg }),
+  });
+    
+  // ─── record this successful fetch time ────────────────────────────
+  lastPnlFetch.current = Date.now();
+}
+
+
+  //Poll state every 60 s
+  useEffect(() => {
+    fetchState()
+    const id = setInterval(fetchState, 60_000)
+    return () => clearInterval(id)
+  }, [])
+
+  //Poll RSI every 60 s
+  useEffect(() => {
+    fetchRSI()
+    const id = setInterval(fetchRSI, 60_000)
+    return () => clearInterval(id)
+  }, [])
+
+
+  useEffect(() => {
+  
+    //load persisted PnL from the server
+     fetch("/api/pnl")
+      .then(res => res.json())
+      .then(serverPnl => setPnlData(serverPnl))
+      .catch(() => {
+         // first‐load failure is okay, we'll fill in on next fetchPnl()
+      });
+
+    }, []);
+
+
+  //Countdown ticker for the “🔁” timers
+  useEffect(() => {
+    const id = setInterval(() => {
+      setLastBuyTimes(prev => ({ ...prev }))
+      setLastSellTimes(prev => ({ ...prev }))
+    }, 1_000)
+    return () => clearInterval(id)
+  }, [])
+  
+  
+
 
   const applyUsdAmount = async () => {
     const amount = parseFloat(usdAmount.toString());
@@ -220,7 +387,9 @@ export default function AlertsDashboard() {
   };
 
   return (
-    <div className="p-6 max-w-4xl mx-auto space-y-6">
+    <div className="relative p-6 max-w-4xl mx-auto space-y-6">
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v2.2.1</div>
+
       <h1 className="text-3xl font-bold mb-4">Jupiter USDC Price Alerts</h1>
 
       {/* Real-time Prices */}
@@ -259,11 +428,11 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="space-y-2 p-4">
           <Label>RSI Alerts</Label>
-          <div className="flex gap-2 items-center">
+          <div className="flex flex-wrap items-center gap-2">
             <select
               value={newRsiDir}
               onChange={e => setNewRsiDir(e.target.value as any)}
-              className="border p-1 rounded"
+              className="flex-shrink-0"
             >
               <option value="above">Above</option>
               <option value="below">Below</option>
@@ -272,6 +441,7 @@ export default function AlertsDashboard() {
               value={newRsiValue}
               onChange={e => setNewRsiValue(e.target.value)}
               placeholder="Threshold"
+              className="flex-grow min-w-0"
             />
             <Button
               onClick={async () => {
@@ -286,6 +456,7 @@ export default function AlertsDashboard() {
                 setNewRsiValue("");
                 fetchRSI();
               }}
+              className="flex-shrink-0"
             >
               Add
             </Button>
@@ -512,6 +683,120 @@ export default function AlertsDashboard() {
           />
         </CardContent>
       </Card>
+      
+{wallets.length > 0 && (
+  <Card>
+    <CardContent className="space-y-4 p-4">
+      <div className="flex justify-between items-center mb-2">
+        <Label>Wallet Info</Label>
+          <span className="text-sm text-gray-500">
+             Latest update: {pnlData.aggregated?.lastFetchedAt || "—"}
+             {pnlData.aggregated?.failedWallets?.length > 0 && (
+                <span className="text-orange-500">
+                    {` (Failed: ${pnlData.aggregated.failedWallets.map(w => w.slice(0, 8) + "...").slice(0, 3).join(", ")})`}
+                </span>
+             )}
+          </span>
+      </div>
+
+<div className="space-y-3">
+  {/* Add wallet section - above dropdown */}
+  <div className="flex flex-col sm:flex-row gap-2">
+    <Button 
+      onClick={async () => {
+        if (!newWallet) return toast.error("Enter an address");
+
+        // 1. Add the wallet
+        const res = await fetch("/api/wallets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values: [newWallet] }),
+        });
+
+        if (res.ok) {
+          toast.success("Wallet added");
+          setNewWallet("");
+          fetchState(); // updates wallet list
+
+          // 2. Show loading for just this wallet
+          setPnlData(prev => ({
+            ...prev,
+            individual: {
+              ...prev.individual,
+              [newWallet]: { loading: true }
+            }
+          }));
+        }
+      }} 
+      className="w-full sm:w-auto order-2 sm:order-1"
+    >
+      Add
+    </Button>
+    <Input
+      placeholder="New wallet address"
+      value={newWallet}
+      onChange={e => setNewWallet(e.target.value)}
+      className="flex-grow order-1 sm:order-2"
+    />
+  </div>
+
+  {/* Wallet selector dropdown - below add section */}
+  <select
+    value={selectedWallet}
+    onChange={e => {
+      setSelectedWallet(e.target.value);
+      localStorage.setItem("selectedWallet", e.target.value);
+    }}
+    className="border p-1 rounded w-full"
+  >
+    <option value="all">All</option>
+    {wallets.slice(-5).map(w => (
+      <option key={w} value={w}>{w}</option>
+    ))}
+  </select>
+</div>
+  
+     <div className="overflow-x-auto">
+      <ul className="min-w-full list-disc pl-5 space-y-1">
+        {(
+          selectedWallet === "all"
+            ? pnlData.aggregated
+                ? [{ key: "Aggregated", ...pnlData.aggregated }]
+                : []
+            : pnlData.individual[selectedWallet]
+                ? [{ key: selectedWallet, ...pnlData.individual[selectedWallet] }]
+                : []
+        ).map(item => (
+            <li key={item.key} className="space-y-1">
+              <div className="flex justify-between items-center">
+                <strong>{item.key}</strong>
+                <span className="text-xs text-gray-500">
+                  {item.lastFetchedAt}
+                </span>
+              </div>
+            {item.loading ? (
+              <div className="italic text-gray-500">
+                 click “Update All” to load
+               </div>
+           ) : (
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <span>Holding:</span>      <span>{item.holding.toFixed(4)}</span>
+              <span>Realized:</span>     <span>{item.realized.toFixed(4)}</span>
+              <span>Unrealized:</span>   <span>{item.unrealized.toFixed(4)}</span>
+              <span>Current Value:</span><span>{item.current_value.toFixed(4)}</span>
+              <span>Cost Basis:</span>    <span>{item.cost_basis.toFixed(6)}</span>
+              <span>Last Trade:</span>    <span>{item.last_trade_time || "--"}</span>
+            </div>
+            )}
+          </li>
+        ))}
+      </ul>
+     </div>
+
+      <Button onClick={fetchPnl}>Update All</Button>
+    </CardContent>
+  </Card>
+)}
     </div>
   );
 }

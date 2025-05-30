@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
+from solana_rate_limiter import throttle
 
 def fetch_candles(
     token: str,
@@ -27,6 +28,7 @@ def fetch_candles(
         "removeOutliers": str(remove_outliers).lower(),
         "time_from":      time_from,
     }
+    throttle()
     resp = requests.get(url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
     df = pd.DataFrame(resp.json().get("oclhv", []))

@@ -9,6 +9,14 @@ import json
 import os
 from datetime import datetime
 from rsi_utils import get_latest_rsi
+import requests
+from solana_rate_limiter import throttle
+from typing import Dict, Any, Optional
+
+
+class PnL(BaseModel):
+    individual: Dict[str, Any]
+    aggregated: Optional[Dict[str, Any]]
 
 
 def normalize_rsi_key(entry: str) -> str:
@@ -50,7 +58,32 @@ state = {
     "last_triggered_rsi": {},           # map "above:70.00" → ISO timestamp
     "rsi_interval": os.getenv("RSI_INTERVAL", "1s"),
     "rsi_reset_enabled": os.getenv("RSI_RESET_ENABLED", "false").lower() == "true",
+    # ─── WALLET CONFIG ────────────────────────────────────
+    "wallet_addresses": [],               # list of Solana wallet strings
+    "wallet_refresh_minutes": 120,         # default refresh interval
 }
+
+
+# in-memory store
+_latest_pnl: Dict[str, Any] = {"individual": {}, "aggregated": None}
+
+@app.post("/api/pnl")
+async def write_pnl(pnl: PnL):
+    """
+    Frontend’s fetchPnl() calls this to save the freshly computed
+    individual + aggregated PnL into our in-memory store.
+    """
+    global _latest_pnl
+    _latest_pnl = pnl.dict()
+    return {"ok": True}
+
+@app.get("/api/pnl", response_model=PnL)
+async def read_pnl():
+    """
+    Dashboard on mount does GET /api/pnl to hydrate
+    with the last PnL we received.
+    """
+    return _latest_pnl
 
 def safe_parse_alerts(value: str):
     try:
@@ -69,6 +102,10 @@ def load_env_defaults():
         state["rsi_alerts"] = sorted({ normalize_rsi_key(e) for e in raw })
         state["rsi_interval"]      = os.getenv("RSI_INTERVAL", state["rsi_interval"])
         state["rsi_reset_enabled"] = os.getenv("RSI_RESET_ENABLED", str(state["rsi_reset_enabled"])).lower() == "true"
+        # ─── Wallet env defaults ────────────────────────────
+        raw_wallets = os.getenv("WALLET_ADDRESSES", "")
+        state["wallet_addresses"] = [w.strip() for w in raw_wallets.split(",") if w.strip()]
+        state["wallet_refresh_minutes"] = int(os.getenv("WALLET_REFRESH_MINUTES", state["wallet_refresh_minutes"]))
     except Exception as e:
         print(f"⚠️ Failed to load ENV defaults: {e}")
 
@@ -86,6 +123,9 @@ def load_state():
                 state["rsi_alerts"] = sorted({ normalize_rsi_key(e) for e in state["rsi_alerts"] })
                 state["rsi_interval"]      = cfg.get("rsi_interval", state["rsi_interval"])
                 state["rsi_reset_enabled"] = cfg.get("rsi_reset_enabled", state["rsi_reset_enabled"])
+                # ─── Wallet config from config.json ────────────────
+                state["wallet_addresses"]      = cfg.get("wallet_addresses", state["wallet_addresses"])
+                state["wallet_refresh_minutes"] = cfg.get("wallet_refresh_minutes", state["wallet_refresh_minutes"])
         except Exception as e:
             print(f"⚠️ Failed to load config.json: {e}")
 
@@ -112,6 +152,9 @@ def write_config():
                 "rsi_alerts":        state["rsi_alerts"],
                 "rsi_interval":      state["rsi_interval"],
                 "rsi_reset_enabled": state["rsi_reset_enabled"],
+                # ─── Wallet CONFIG ─────────────────────
+                "wallet_addresses":       state["wallet_addresses"],
+                "wallet_refresh_minutes": state["wallet_refresh_minutes"],
             }, f, indent=2)
     except Exception as e:
         print(f"❌ Failed to write config.json: {e}")
@@ -174,6 +217,17 @@ class RsiReset(BaseModel):
 class RsiDelete(BaseModel):
     key: str
 
+
+# ─── Wallet Pnemonic Models ───────────────────────────────
+class AddressesList(BaseModel):
+     values: List[str]
+
+class AddressValue(BaseModel):
+     value: str
+     
+
+
+
 @app.post("/api/rsi/trigger")
 async def trigger_rsi(data: RsiTrigger):
     # persist the exact RSI key ("above:70.00" or "below:30.00")
@@ -184,7 +238,13 @@ async def trigger_rsi(data: RsiTrigger):
 
 @app.get("/api/state")
 async def get_state():
-    return state
+    # include wallets and refresh interval
+    return {
+        **state,
+        "wallet_addresses":       state["wallet_addresses"],
+        "wallet_refresh_minutes": state["wallet_refresh_minutes"],
+        "output_mint":            os.getenv("OUTPUT_MINT"),
+    }
 
 @app.post("/api/usd")
 async def set_usd(alert: AlertValue):
@@ -399,6 +459,78 @@ async def get_rsi_status():
         "alerts":        RSI_STATE,
         "reset_enabled": state["rsi_reset_enabled"],
     }
+
+
+@app.get("/api/wallets")
+async def get_wallets():
+    return {"values": state["wallet_addresses"]}
+
+@app.post("/api/wallets")
+async def add_wallets(payload: AddressesList):
+    for w in payload.values:
+        if w not in state["wallet_addresses"]:
+            state["wallet_addresses"].append(w)
+    write_config()
+    return {"success": True}
+
+@app.delete("/api/wallets")
+async def delete_wallet(payload: AddressValue):
+    if payload.value in state["wallet_addresses"]:
+        state["wallet_addresses"].remove(payload.value)
+        write_config()
+        return {"success": True}
+    raise HTTPException(status_code=404, detail="Wallet not found")
+
+# ─── On-chain PnL endpoint ──────────────────────────────────
+@app.get("/api/pnl/{wallet}/{token}")
+async def get_pnl(wallet: str, token: str):
+    api_key = os.getenv("SOLANATRACKER_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="SolanaTracker API key not set")
+
+    url = f"https://data.solanatracker.io/pnl/{wallet}/{token}?holdingCheck=true"
+    headers = {"x-api-key": api_key}
+
+    # enforce our 1-request-per-second rate limit
+    throttle()
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # extract only the six fields we care about
+        result = {
+            "holding":       data.get("holding", 0),
+            "realized":      data.get("realized", 0),
+            "unrealized":    data.get("unrealized", 0),
+            "current_value": data.get("current_value", 0),
+            "cost_basis":    data.get("cost_basis", 0),
+        }
+
+        # convert last_trade_time (ms) → ISO
+        lt = data.get("last_trade_time")
+        if isinstance(lt, (int, float)):
+            result["last_trade_time"] = datetime.fromtimestamp(lt / 1000).isoformat()
+        else:
+            result["last_trade_time"] = None
+
+        return result
+
+
+    except Exception as e:
+        # log the error, but return a 200 with empty/default data
+        print(f"⚠️ [PnL] fetch failed for wallet={wallet}, token={token}: {e}", flush=True)
+        return {
+            "holding":        0,
+            "realized":       0,
+            "unrealized":     0,
+            "current_value":  0,
+            "cost_basis":     0,
+            "last_trade_time": None,
+        }
+
+
 
 
 

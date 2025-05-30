@@ -1,4 +1,3 @@
-version: '3.9'
 
 services:
   jupiter-usdc-price-alert:
@@ -53,6 +52,11 @@ services:
 
       # If false, RSI alerts trigger only once per session
       RSI_RESET_ENABLED: "false"
+
+      # Persisted, wallet tracking config
+      # Comma-separated list of Solana wallet addresses to track
+      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      WALLET_ADDRESSES: ""
 
       # --- Push Notifications (via ntfy) ---
 

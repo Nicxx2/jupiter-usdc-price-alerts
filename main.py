@@ -5,6 +5,8 @@ import requests
 import json
 from datetime import datetime, timedelta, timezone
 from rsi_utils import get_latest_rsi
+from typing import Dict, Any, Optional
+
 
 INPUT_MINT = os.getenv("INPUT_MINT")
 OUTPUT_MINT = os.getenv("OUTPUT_MINT")
@@ -265,7 +267,7 @@ def should_alert(alert_dict, key):
 
 
 
-def write_status_json(price_buy, price_sell, token_received, usdc_returned):
+def write_status_json(price_buy, price_sell, token_received, usdc_returned, latest_rsi=None, latest_rsi_time=None):
     try:
         json_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -282,7 +284,9 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned):
             "last_triggered_rsi": {
                 k: v for k, v in __load_persisted_rsi().items()
             },
-            "alert_reset_minutes": ALERT_RESET_MINUTES
+            "alert_reset_minutes": ALERT_RESET_MINUTES,
+            "latest_rsi": latest_rsi,
+            "latest_rsi_time": latest_rsi_time
         }
         with open(shared_json_path, "w") as f:
             json.dump(json_data, f, indent=2)
@@ -529,6 +533,12 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+class PnL(BaseModel):
+    individual: Dict[str, Any]
+    aggregated: Optional[Dict[str, Any]]
+
+_latest_pnl: Dict[str, Any] = {"individual": {}, "aggregated": None}
+
 app = FastAPI()
 
 app.add_middleware(
@@ -555,6 +565,7 @@ def reset_alert(data: ResetAlert):
     # ✨ Immediately write updated config so it's saved
     write_status_json(None, None, None, None)
     return {"success": True}
+    
 
 if __name__ == "__main__":
     print("🚀 Jupiter Price Monitor started.", flush=True)
