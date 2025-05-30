@@ -192,6 +192,12 @@ Web UI Example:
 
 ![Web UI Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/Jupiter_USDC_Price_Alert_Web_UI_with_RSI.png?raw=true)
 
+
+Example of Wallet Information:
+
+![Wallet Information Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/preview-wallet-ui-v2.2.1.png?raw=true)
+
+
 ---
 ## 📲 Push Alerts with `ntfy.sh`
 
