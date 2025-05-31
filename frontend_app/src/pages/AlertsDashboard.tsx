@@ -388,7 +388,7 @@ async function fetchPnl() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v2.2.1</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v2.2.2</div>
 
       <h1 className="text-3xl font-bold mb-4">Jupiter USDC Price Alerts</h1>
 
