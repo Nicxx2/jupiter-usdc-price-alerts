@@ -1,6 +1,6 @@
 # nicxx2/jupiter-usdc-price-alerts
 
-[![Sponsored OSS](https://img.shields.io/badge/Sponsored–OSS-8a3af8?logo=github-sponsors&logoColor=white)](https://github.com/sponsors/nicxx2)
+![Sponsored OSS](https://img.shields.io/badge/Sponsored-OSS-8a3af8?logo=github-sponsors&logoColor=white)
 
 [![Docker Image Version](https://img.shields.io/docker/v/nicxx2/jupiter-usdc-price-alerts?label=version)](https://hub.docker.com/r/nicxx2/jupiter-usdc-price-alerts)
 
