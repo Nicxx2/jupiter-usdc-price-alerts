@@ -7,7 +7,7 @@ from typing import List
 from typing import Union, Literal
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from rsi_utils import get_latest_rsi
 import requests
 from solana_rate_limiter import throttle
@@ -43,6 +43,17 @@ app.add_middleware(
 
 CONFIG_PATH = "/shared/config.json"
 STATE_PATH = "/shared/jupiter-latest.json"
+
+# Cache for RSI data to respect RSI_CHECK_INTERVAL
+_rsi_cache = {
+    "value": None,
+    "timestamp": None,
+    "last_fetch": None
+}
+
+# Get RSI check interval from env
+RSI_CHECK_INTERVAL = int(os.getenv("RSI_CHECK_INTERVAL", "5"))
+
 
 state = {
     "usd_amount": 100.0,
@@ -136,6 +147,11 @@ def load_state():
                 state["latest_prices"] = s.get("latest_prices", [])
                 state["last_triggered_buy"] = s.get("last_triggered_buy", {})
                 state["last_triggered_sell"] = s.get("last_triggered_sell", {})
+                
+                # Load RSI cache from state if available
+                if "latest_rsi" in s and "latest_rsi_time" in s:
+                    _rsi_cache["value"] = s.get("latest_rsi")
+                    _rsi_cache["timestamp"] = s.get("latest_rsi_time")
 
         except Exception as e:
             print(f"⚠️ Failed to load jupiter-latest.json: {e}")
@@ -166,7 +182,10 @@ def write_state():
                 "latest_prices": state["latest_prices"],
                 "last_triggered_buy": state["last_triggered_buy"],
                 "last_triggered_sell": state["last_triggered_sell"],
-                "last_triggered_rsi":   state["last_triggered_rsi"]
+                "last_triggered_rsi":   state["last_triggered_rsi"],
+                # Store RSI cache in state
+                "latest_rsi": _rsi_cache.get("value"),
+                "latest_rsi_time": _rsi_cache.get("timestamp"),
             }, f, indent=2)
     except Exception as e:
         print(f"❌ Failed to write jupiter-latest.json: {e}")
@@ -368,6 +387,8 @@ async def reset_rsi_alert(data: RsiReset):
 @app.post("/api/rsi/interval")
 async def set_rsi_interval(cfg: IntervalConfig):
     state["rsi_interval"] = cfg.interval
+    # Clear cache when interval changes
+    _rsi_cache["last_fetch"] = None
     write_config()
     return {"success": True}
 
@@ -400,7 +421,10 @@ async def update_price(data: PriceData):
 
 @app.get("/api/rsi")
 async def get_rsi_status():
-    # If you want to allow empty config, you can skip 400 here:
+    """
+    Returns cached RSI data if fresh enough, otherwise fetches new data.
+    Respects RSI_CHECK_INTERVAL to avoid excessive API calls.
+    """
     SOLANATRACKER_API_KEY = os.getenv("SOLANATRACKER_API_KEY")
     if not SOLANATRACKER_API_KEY:
         return {
@@ -411,32 +435,43 @@ async def get_rsi_status():
             "reset_enabled": state["rsi_reset_enabled"],
         }
 
-    # Fetch the actual RSI value (but don’t break the API if SolanaTracker is slow)
-    try:
-        rsi_value, rsi_time = get_latest_rsi(
-            api_key=SOLANATRACKER_API_KEY,
-            token=os.getenv("OUTPUT_MINT"),
-            period=14,
-            interval=state["rsi_interval"],
-        )
-    except Exception as e:
-        # Log the timeout or other errors, then return “no data” rather than a 500
-        print(f"⚠️ Failed to fetch RSI (continuing): {e}", flush=True)
-        return {
-            "latest_rsi": None,
-            "timestamp": None,
-            "interval": state["rsi_interval"],
-            # build the alerts map exactly as below so UI still sees configured thresholds
-            "alerts": {
-                **{ key: { "triggered": True } for key in state["last_triggered_rsi"] },
-                **{ key: { "triggered": False }
-                     for key in state["rsi_alerts"]
-                     if key not in state["last_triggered_rsi"] }
-            },
-            "reset_enabled": state["rsi_reset_enabled"],
-        }
+    # Check if we need to fetch new RSI data
+    now = datetime.now()
+    need_fetch = False
+    
+    if _rsi_cache["last_fetch"] is None:
+        need_fetch = True
+    else:
+        time_since_fetch = now - _rsi_cache["last_fetch"]
+        if time_since_fetch >= timedelta(minutes=RSI_CHECK_INTERVAL):
+            need_fetch = True
+    
+    # Fetch new RSI data if needed
+    if need_fetch:
+        try:
+            rsi_value, rsi_time = get_latest_rsi(
+                api_key=SOLANATRACKER_API_KEY,
+                token=os.getenv("OUTPUT_MINT"),
+                period=14,
+                interval=state["rsi_interval"],
+            )
+            # Update cache
+            _rsi_cache["value"] = rsi_value
+            _rsi_cache["timestamp"] = rsi_time
+            _rsi_cache["last_fetch"] = now
+            
+            # Also update the state file so main.py can see it
+            write_state()
+            
+            print(f"📊 [API] Fetched fresh RSI: {rsi_value:.2f} at {rsi_time}", flush=True)
+            
+        except Exception as e:
+            print(f"⚠️ Failed to fetch RSI (using cache): {e}", flush=True)
+    else:
+        time_until_next = RSI_CHECK_INTERVAL * 60 - (now - _rsi_cache["last_fetch"]).seconds
+        print(f"📊 [API] Using cached RSI (next fetch in {time_until_next}s)", flush=True)
 
-    # Build the alerts map from state["rsi_alerts"] (strings "above:30", etc.)
+    # Build the alerts map from state["rsi_alerts"]
     RSI_STATE: dict[str, dict[str,bool]] = {}
     # first, mark anything already triggered
     for key in state["last_triggered_rsi"].keys():
@@ -453,8 +488,8 @@ async def get_rsi_status():
             RSI_STATE[key] = {"triggered": False}
 
     return {
-        "latest_rsi":    round(rsi_value, 2),
-        "timestamp":     rsi_time,
+        "latest_rsi":    round(_rsi_cache["value"], 2) if _rsi_cache["value"] is not None else None,
+        "timestamp":     _rsi_cache["timestamp"],
         "interval":      state["rsi_interval"],
         "alerts":        RSI_STATE,
         "reset_enabled": state["rsi_reset_enabled"],
