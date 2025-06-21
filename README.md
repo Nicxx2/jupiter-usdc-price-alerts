@@ -18,7 +18,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 ---
 
 
-# 🚀 Jupiter USDC Price Alerts v2.2.2
+# 🚀 Jupiter USDC Price Alerts v2.2.3
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -27,7 +27,7 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 
 ---
 
-## ✨ What's New in v2.2.2
+## ✨ What's New in v2.2.3
 
 ### 📱 Mobile Layout Tweaks
 - Improved layout so the UI now looks better on phones and smaller screens.
