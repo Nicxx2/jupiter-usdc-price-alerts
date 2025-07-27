@@ -1,3 +1,11 @@
+## 💖 Support This Project
+
+If you found this helpful and want to support what I do, you can leave a tip here — thank you so much!
+
+[![Support on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/nicxx2)
+
+---
+
 # 🚀 Jupiter USDC Price Alerts v2.2.2
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
