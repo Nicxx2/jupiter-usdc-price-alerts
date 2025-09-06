@@ -6,16 +6,35 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v2.2.2
+# 🚀 Jupiter USDC Price Alerts v2.3
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
 Track simulated USDC swaps with real price impact and receive instant alerts via [ntfy.sh](https://ntfy.sh) — now with a **modern Web UI**!
 
+---
+
+
+## ✨ What’s New in v2.3
+
+### 🧮 Sell % Simulator (Wallets)
+Quickly model a partial exit from your position and see an estimated breakdown of proceeds:
+
+- Adjust **0–100%** via slider, numeric input, or quick chips
+- Shows:
+  - Estimated **current token price**
+  - **Tokens to sell**
+  - **Expected proceeds**
+  - Split into **principal** vs **unrealized profit/loss**
+- Works with the **selected wallet** or **All** (aggregate)
+- **Hidden** when no wallets are configured or when the selected source has no holdings
+- Uses the latest values from the Wallet Info card (PnL):  
+  `price ≈ current_value / holding`, with proceeds split using the current **cost basis** and **unrealized** PnL
+- Note: This is an **estimate**; execution may vary due to price impact and slippage
 
 ---
 
-## ✨ What's New in v2.2.2
+## v2.2.2
 
 ### 📱 Mobile Layout Tweaks
 - Improved layout so the UI now looks better on phones and smaller screens.
