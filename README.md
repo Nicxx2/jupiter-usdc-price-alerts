@@ -6,7 +6,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v2.3
+# 🚀 Jupiter USDC Price Alerts v2.3.1
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -14,8 +14,16 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 
 ---
 
+## ✨ What’s New in v2.3.1
 
-## ✨ What’s New in v2.3
+### 🔗 Jupiter API Update
+- Migrated from the deprecated `quote-api.jup.ag/v6` to the new `lite-api.jup.ag/swap/v1`.
+- Added retry and backoff logic for more resilient price checks.
+- Added `restrictIntermediateTokens=true` to reduce rare dust-pool price spikes.
+
+---
+
+## v2.3
 
 ### 🧮 Sell % Simulator (Wallets)
 Quickly model a partial exit from your position and see an estimated breakdown of proceeds:
