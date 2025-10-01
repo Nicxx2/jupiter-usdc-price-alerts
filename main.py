@@ -222,12 +222,40 @@ def notify_backend_rsi_trigger(key: str, timestamp: str):
         print(f"⚠️ Failed to notify backend of RSI trigger: {e}", flush=True)
 
 def get_out_amount(input_mint, output_mint, amount_lamports):
-    url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippage=1"
-    res = requests.get(url)
-    if res.status_code == 200:
-        data = res.json()
-        return int(data.get("outAmount", 0)) / 1_000_000
-    return None
+    """
+    Uses Jupiter's current Swap Quote API (lite-api) and returns outAmount
+    in 1e6 units.
+    """
+    base = "https://lite-api.jup.ag/swap/v1/quote"  # free tier (no key)
+    params = (
+        f"?inputMint={input_mint}"
+        f"&outputMint={output_mint}"
+        f"&amount={amount_lamports}"
+        f"&slippageBps=100"  # 1% slippage
+        f"&restrictIntermediateTokens=true"  # avoid dust routes / spikes
+    )
+    url = f"{base}{params}"
+
+    # Small, defensive retry for transient network errors or 429s
+    for attempt in range(3):
+        try:
+            res = requests.get(url, timeout=10)
+            if res.status_code == 429:
+                # simple backoff for rate-limit; sliding window clears quickly
+                time.sleep(2 + attempt)
+                continue
+            res.raise_for_status()
+            data = res.json()
+
+            # Jupiter returns outAmount as a string in atomic units.
+            out_raw = data.get("outAmount", "0")
+            return int(out_raw) / 1_000_000
+        except Exception as e:
+            if attempt == 2:
+                print(f"⚠️ Jupiter quote failed after retries: {e}", flush=True)
+                return None
+            time.sleep(1 + attempt)  # short backoff before retry
+
 
 
 def should_alert(alert_dict, key):
