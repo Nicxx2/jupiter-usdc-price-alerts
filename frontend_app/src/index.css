@@ -6,3 +6,15 @@
 html {
   scroll-behavior: smooth;
 }
+
+/* Dark-mode friendly native selects across browsers */
+select, option {
+  color: inherit;
+  background-color: inherit;
+}
+
+/* Ensure the dropdown menu (where supported) inherits dark styles */
+select:-internal-list-box, select::-ms-expand {
+  background-color: inherit !important;
+  color: inherit !important;
+}

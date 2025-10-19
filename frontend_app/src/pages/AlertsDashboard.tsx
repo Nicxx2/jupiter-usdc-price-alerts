@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Input, Select } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 import { Line } from "react-chartjs-2";
@@ -105,6 +105,17 @@ export default function AlertsDashboard() {
 
   // Sell % simulator state
   const [sellPercent, setSellPercent] = useState<number>(25);
+
+  // ─── Dark mode detection for chart theming ───────────────────────
+  const [isDark, setIsDark] = useState<boolean>(
+    typeof document !== "undefined" && document.documentElement.classList.contains("dark")
+  );
+  useEffect(() => {
+    const update = () => setIsDark(document.documentElement.classList.contains("dark"));
+    const obs = new MutationObserver(update);
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => obs.disconnect();
+  }, []);
 
   const fetchRSI = () => {
     fetch("/api/rsi")
@@ -379,9 +390,51 @@ export default function AlertsDashboard() {
     ],
   };
 
+  const options = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        display: true,
+        position: "top" as const,
+        labels: {
+          color: isDark ? "#e5e7eb" : "#111827",
+        },
+      },
+      tooltip: {
+        backgroundColor: isDark ? "rgba(31,41,55,0.9)" : "rgba(255,255,255,0.9)",
+        titleColor: isDark ? "#f9fafb" : "#111827",
+        bodyColor: isDark ? "#e5e7eb" : "#111827",
+        borderColor: isDark ? "#374151" : "#e5e7eb",
+        borderWidth: 1,
+      },
+    },
+    scales: {
+      x: {
+        ticks: {
+          color: isDark ? "#d1d5db" : "#374151",
+        },
+        grid: {
+          color: isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)",
+        },
+      },
+      y: {
+        ticks: {
+          color: isDark ? "#d1d5db" : "#374151",
+          callback: function (value: any) {
+            return safe(value).toFixed(8);
+          },
+        },
+        grid: {
+          color: isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)",
+        },
+      },
+    },
+  } as const;
+
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v2.3.1</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v2.4</div>
 
       <h1 className="text-3xl font-bold mb-4">Jupiter USDC Price Alerts</h1>
 
@@ -422,14 +475,14 @@ export default function AlertsDashboard() {
         <CardContent className="space-y-2 p-4">
           <Label>RSI Alerts</Label>
           <div className="flex flex-wrap items-center gap-2">
-            <select
+            <Select
               value={newRsiDir}
               onChange={(e) => setNewRsiDir(e.target.value as "above" | "below")}
               className="flex-shrink-0"
             >
               <option value="above">Above</option>
               <option value="below">Below</option>
-            </select>
+            </Select>
             <Input
               value={newRsiValue}
               onChange={(e) => setNewRsiValue(e.target.value)}
@@ -504,7 +557,7 @@ export default function AlertsDashboard() {
         <CardContent className="space-y-2 p-4">
           <Label>RSI Interval</Label>
           <div className="flex gap-2">
-            <select
+            <Select
               value={pendingInterval}
               onChange={(e) => setPendingInterval(e.target.value)}
               className="border p-1 rounded"
@@ -514,7 +567,7 @@ export default function AlertsDashboard() {
                   {opt}
                 </option>
               ))}
-            </select>
+            </Select>
             <Button
               onClick={async () => {
                 setRsi(null);
@@ -538,14 +591,14 @@ export default function AlertsDashboard() {
         <CardContent className="space-y-2 p-4">
           <Label>RSI Reset Mode</Label>
           <div className="flex gap-2">
-            <select
+            <Select
               value={rsiResetEnabled ? "true" : "false"}
               onChange={(e) => setRsiResetEnabled(e.target.value === "true")}
               className="border p-1 rounded"
             >
               <option value="true">Re-trigger on cross-back</option>
               <option value="false">One-time only</option>
-            </select>
+            </Select>
             <Button
               onClick={async () => {
                 await fetch("/api/rsi/reset-mode", {
@@ -650,34 +703,9 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="p-4">
           <h2 className="text-lg font-bold mb-2">Price Chart</h2>
-          <Line
-            data={data}
-            options={{
-              responsive: true,
-              plugins: {
-                tooltip: {
-                  callbacks: {
-                    label: function (ctx) {
-                      return `${ctx.dataset.label}: ${safe(ctx.parsed.y).toFixed(8)}`;
-                    },
-                  },
-                },
-                legend: {
-                  display: true,
-                  position: "top",
-                },
-              },
-              scales: {
-                y: {
-                  ticks: {
-                    callback: function (value) {
-                      return safe(value).toFixed(8);
-                    },
-                  },
-                },
-              },
-            }}
-          />
+          <div style={{ height: 320 }}>
+            <Line data={data} options={options} />
+          </div>
         </CardContent>
       </Card>
 
@@ -740,7 +768,7 @@ export default function AlertsDashboard() {
               </div>
 
               {/* Wallet selector */}
-              <select
+            <Select
                 value={selectedWallet}
                 onChange={(e) => {
                   setSelectedWallet(e.target.value);
@@ -754,7 +782,7 @@ export default function AlertsDashboard() {
                     {w}
                   </option>
                 ))}
-              </select>
+            </Select>
             </div>
 
             <div className="overflow-x-auto">
