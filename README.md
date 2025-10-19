@@ -6,7 +6,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v2.3.1
+# 🚀 Jupiter USDC Price Alerts v2.4
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -14,7 +14,19 @@ Track simulated USDC swaps with real price impact and receive instant alerts via
 
 ---
 
-## ✨ What’s New in v2.3.1
+## ✨ What's New in v2.4
+
+### 🌙 Dark Mode Support
+- **Persistent theme toggle** — Sun/moon button in top-right corner
+- **System preference detection** — Automatically detects your OS dark/light preference on first visit
+- **Per-device memory** — Each browser/device remembers your theme choice
+- **Dark-aware charts** — Chart.js axes, grid, and tooltips adapt to dark mode
+- **Improved dropdowns** — All select elements now have proper dark mode styling
+- **Smooth transitions** — Clean theme switching without page reload
+
+---
+
+## v2.3.1
 
 ### 🔗 Jupiter API Update
 - Migrated from the deprecated `quote-api.jup.ag/v6` to the new `lite-api.jup.ag/swap/v1`.
