@@ -18,14 +18,28 @@ services:
       # Output token mint (token you want to monitor, e.g. JIM)
       OUTPUT_MINT: <YOUR_OUTPUT_TOKEN_MINT>
 
-      # Solanatracker.io API key (required for RSI features)
-      # If omitted, RSI data and alerts will be disabled in the UI
+      # Solanatracker.io API key (required for RSI, wallet info, and sell simulator)
+      # If omitted, SolanaTracker-only panels will be disabled in the UI
       SOLANATRACKER_API_KEY: ""
+
+      # Master SolanaTracker feature switch. Docker is the first-run default;
+      # saved app settings in /shared/config.json take priority after you edit them in the UI.
+      SOLANATRACKER_ENABLED: "true"
+
+      # SolanaTracker limiter: safe, custom, or off.
+      # Use safe for free accounts. Use custom/off only if your plan allows it.
+      SOLANATRACKER_RATE_LIMIT_MODE: safe
+      SOLANATRACKER_REQUESTS_PER_SECOND: 1
 
       # --- Simulated Swap Settings ---
 
       # Amount of USDC to simulate swapping
       USD_AMOUNT: 100
+
+      # Optional token decimals override. Leave blank for auto-detect/fallback.
+      # USDC is 6 decimals; output token decimals vary by mint.
+      INPUT_DECIMALS: ""
+      OUTPUT_DECIMALS: ""
 
       # How often to check prices (in seconds)
       CHECK_INTERVAL: 60
@@ -39,6 +53,9 @@ services:
       SELL_ALERTS: "0.00140, 0.00145"
 
       # --- RSI Configuration ---
+
+      # Per-token RSI can also be switched off in the UI
+      RSI_ENABLED: "true"
 
       # How often (in minutes) to refresh RSI checks
       # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
@@ -76,6 +93,10 @@ services:
       # Local timezone for timestamps and scheduling
       TZ: Europe/London
 
+    # Persist UI-edited settings, alert state, and price history
+    volumes:
+      - jupiter-alert-data:/shared
+
     # --- Log Rotation ---
 
     logging:
@@ -84,3 +105,5 @@ services:
         max-size: "2m"
         max-file: "5"
 
+volumes:
+  jupiter-alert-data:

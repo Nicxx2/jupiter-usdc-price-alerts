@@ -17,51 +17,59 @@ def fetch_candles(
     going back `lookback_days` (UTC). Starts from first real trade,
     includes all bars to present, but forward-fills prices during
     zero-volume periods. Returns a DataFrame with ['timestamp','close', 'volume']
-    sorted oldest→newest, then keeps only the last `fetch_n` rows.
+    sorted oldest to newest, then keeps only the last `fetch_n` rows.
     """
     time_from = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp())
     url = f"https://data.solanatracker.io/chart/{token}"
     headers = {"x-api-key": api_key}
     params = {
-        "type":           interval,
+        "type": interval,
         "removeOutliers": str(remove_outliers).lower(),
-        "time_from":      time_from,
+        "time_from": time_from,
     }
     throttle()
     resp = requests.get(url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
+
     df = pd.DataFrame(resp.json().get("oclhv", []))
+    required_columns = {"time", "close", "volume"}
+    missing = required_columns - set(df.columns)
+    if df.empty:
+        raise ValueError(f"No RSI candles returned in the last {lookback_days} days")
+    if missing:
+        raise ValueError(f"RSI candle response missing columns: {', '.join(sorted(missing))}")
 
-    if "volume" in df.columns:
-        # Find first real trade (remove leading phantoms)
-        nonzero = df[df["volume"] > 0]
-        if nonzero.empty:
-            raise ValueError(f"No non-zero volume bars in the last {lookback_days} days")
-        first_real_idx = nonzero.index[0]
-        
-        # Keep everything from first real trade onwards (including phantoms after last trade)
-        df = df.loc[first_real_idx:].reset_index(drop=True)
-        
-        # Forward-fill prices where volume is 0 (phantom bars)
-        # This keeps the last traded price constant during no-trade periods
-        mask_no_volume = df["volume"] == 0
-        df.loc[mask_no_volume, "close"] = pd.NA
-        df["close"] = df["close"].ffill()
+    # The API docs define the fields, but not a guaranteed row order. Sort first
+    # so newest-first responses do not make the first real-trade trim drop history.
+    df["time"] = pd.to_numeric(df["time"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    df = df.dropna(subset=["time", "close"]).sort_values("time").reset_index(drop=True)
 
-    # ensure enough bars to seed + one period
+    if df.empty:
+        raise ValueError(f"No valid RSI candles returned in the last {lookback_days} days")
+
+    # Find first real trade (remove leading phantoms), then keep everything after.
+    nonzero = df[df["volume"] > 0]
+    if nonzero.empty:
+        raise ValueError(f"No non-zero volume bars in the last {lookback_days} days")
+    first_real_idx = nonzero.index[0]
+    df = df.loc[first_real_idx:].reset_index(drop=True)
+
+    # Forward-fill prices where volume is 0 (phantom bars). This keeps the last
+    # traded price constant during no-trade periods without inventing RSI moves.
+    mask_no_volume = df["volume"] == 0
+    df.loc[mask_no_volume, "close"] = pd.NA
+    df["close"] = df["close"].ffill()
+
+    # Ensure enough bars to seed + one period.
     if len(df) < period + 1:
         raise ValueError(f"Not enough bars for RSI({period}): got {len(df)}")
 
-    # sort old→new, convert timestamps & close
-    df = df.sort_values("time").reset_index(drop=True)
     df["timestamp"] = pd.to_datetime(df["time"], unit="s")
-    df["close"]     = df["close"].astype(float)
-    
-    # Ensure volume is numeric so `volume.iat[i] == 0` works reliably
-    df["volume"] = df["volume"].astype(float)
 
-    # only keep the last fetch_n bars (we need volume too, to skip phantom bars)
-    return df[["timestamp","close","volume"]].tail(fetch_n).reset_index(drop=True)
+    # Only keep the last fetch_n bars (we need volume too, to skip phantom bars).
+    return df[["timestamp", "close", "volume"]].tail(fetch_n).reset_index(drop=True)
 
 
 def compute_wilder_rsi(closes: pd.Series, volume: pd.Series, period: int = 14) -> pd.Series:
@@ -71,7 +79,7 @@ def compute_wilder_rsi(closes: pd.Series, volume: pd.Series, period: int = 14) -
       2) recursive smoothing thereafter
     """
     if len(closes) < period + 1:
-        raise ValueError(f"Not enough data for RSI: need ≥ {period+1} points, got {len(closes)}")
+        raise ValueError(f"Not enough data for RSI: need >= {period+1} points, got {len(closes)}")
 
     delta    = closes.diff().fillna(0)
     gain     = delta.clip(lower=0)
@@ -87,7 +95,7 @@ def compute_wilder_rsi(closes: pd.Series, volume: pd.Series, period: int = 14) -
     # 2) recursive smoothing
     for i in range(period + 1, len(closes)):
         if volume.iat[i] == 0:
-            # phantom bar → freeze
+            # Phantom bar: freeze.
             avg_gain.iat[i] = avg_gain.iat[i-1]
             avg_loss.iat[i] = avg_loss.iat[i-1]
         else:

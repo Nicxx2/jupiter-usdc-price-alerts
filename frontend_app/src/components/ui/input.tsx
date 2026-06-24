@@ -1,4 +1,4 @@
-import { InputHTMLAttributes } from "react";
+import { InputHTMLAttributes, SelectHTMLAttributes } from "react";
 
 export function Input({
   className = "",
@@ -12,7 +12,7 @@ export function Input({
   );
 }
 
-export function Select({ className = "", ...props }: React.SelectHTMLAttributes<HTMLSelectElement> & { className?: string }) {
+export function Select({ className = "", ...props }: SelectHTMLAttributes<HTMLSelectElement> & { className?: string }) {
   return (
     <select
       className={`border border-gray-300 rounded px-3 py-2 bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-400 dark:bg-gray-800 dark:text-white dark:border-gray-600 ${className}`}

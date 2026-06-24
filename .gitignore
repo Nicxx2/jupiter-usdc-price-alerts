@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Frontend
+frontend_app/node_modules/
+frontend_app/dist/
+frontend_app/.vite/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state / local Docker volume data
+/shared/
+config.json
+jupiter-latest.json
+*.json.lock
+solanatracker-rate-limit.lock
+
+# Logs / local temp
+*.log
+*.err
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
