@@ -763,5 +763,149 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             backend.normalize_wallet_addresses([" WalletA ", "WalletA", "", None, "WalletB"]),
             ["WalletA", "WalletB"],
         )
+
+    def test_backend_extracts_solanatracker_pnl_v2_position(self):
+        backend = import_backend_module()
+        result = backend.extract_pnl_result({
+            "wallet": "WalletA",
+            "current": {"balance": 10, "value": 25, "avgCost": 1.2, "costBasis": 12},
+            "pnl": {"token": {"realized": 3, "unrealized": 13, "total": 16}},
+            "timing": {"lastTrade": 1_710_000_000_000},
+        }, attempts=1)
+
+        self.assertEqual(result["pnl_status"], "ok")
+        self.assertEqual(result["holding"], 10)
+        self.assertEqual(result["current_value"], 25)
+        self.assertEqual(result["cost_basis"], 1.2)
+        self.assertEqual(result["cost_basis_total"], 12)
+        self.assertEqual(result["realized"], 3)
+        self.assertEqual(result["unrealized"], 13)
+        self.assertIn("+00:00", result["last_trade_time"])
+
+    def test_backend_accepts_all_documented_pnl_modes(self):
+        backend = import_backend_module()
+        original_mode = backend.SOLANATRACKER_PNL_MODE
+        try:
+            for mode in ["strict", "adjusted", "raw"]:
+                backend.SOLANATRACKER_PNL_MODE = mode
+                self.assertEqual(backend._solanatracker_pnl_mode(), mode)
+            backend.SOLANATRACKER_PNL_MODE = "bad"
+            self.assertEqual(backend._solanatracker_pnl_mode(), "adjusted")
+        finally:
+            backend.SOLANATRACKER_PNL_MODE = original_mode
+    def test_backend_pnl_batch_retries_raw_wallet_array_body(self):
+        backend = import_backend_module()
+        original_request = backend._request_solanatracker_json
+        calls = []
+        try:
+            def fake_request(method, url, headers, *, params=None, json_body=None, timeout=10):
+                calls.append(json_body)
+                if isinstance(json_body, dict):
+                    raise backend.SolanaTrackerRequestError("Body shape rejected", status_code=422)
+                return {
+                    "positions": [{
+                        "wallet": "WalletA",
+                        "current": {"balance": 3, "value": 9, "avgCost": 2, "costBasis": 6},
+                        "pnl": {"token": {"realized": 1, "unrealized": 3, "total": 4}},
+                    }]
+                }, 1
+
+            backend._request_solanatracker_json = fake_request
+            result = backend.fetch_pnl_batch_results(["WalletA"], SOL_MINT, "key")
+
+            self.assertEqual(calls[0], {"wallets": ["WalletA"]})
+            self.assertEqual(calls[1], ["WalletA"])
+            self.assertEqual(result["WalletA"]["pnl_status"], "ok")
+            self.assertEqual(result["WalletA"]["holding"], 3)
+            self.assertEqual(result["WalletA"]["cost_basis"], 2)
+        finally:
+            backend._request_solanatracker_json = original_request
+    def test_backend_pnl_batch_falls_back_to_basic_wallet_holding(self):
+        backend = import_backend_module()
+        original_request = backend._request_solanatracker_json
+        original_throttle = backend.throttle
+        calls = []
+        try:
+            backend.throttle = lambda: None
+
+            def fake_request(method, url, headers, *, params=None, json_body=None, timeout=10):
+                calls.append((method, url, json_body))
+                if method == "POST":
+                    return {
+                        "positions": [{
+                            "wallet": "WalletA",
+                            "current": {"balance": 1, "value": 4, "avgCost": 2, "costBasis": 2},
+                            "pnl": {"token": {"realized": 0, "unrealized": 2, "total": 2}},
+                        }],
+                        "notFound": ["WalletB"],
+                    }, 1
+                return {"tokens": [{"address": SOL_MINT, "balance": 2, "value": 8, "price": {"usd": 4}}]}, 1
+
+            backend._request_solanatracker_json = fake_request
+            result = backend.fetch_pnl_batch_results(["WalletA", "WalletB"], SOL_MINT, "key")
+
+            self.assertEqual(result["WalletA"]["pnl_status"], "ok")
+            self.assertEqual(result["WalletA"]["holding"], 1)
+            self.assertEqual(result["WalletB"]["pnl_status"], "holding_only")
+            self.assertEqual(result["WalletB"]["holding"], 2)
+            self.assertEqual(result["WalletB"]["current_value"], 8)
+            self.assertEqual([call[0] for call in calls], ["POST", "GET"])
+        finally:
+            backend._request_solanatracker_json = original_request
+            backend.throttle = original_throttle
+
+    def test_backend_pnl_batch_marks_queued_wallet_as_indexing_with_holding(self):
+        backend = import_backend_module()
+        original_request = backend._request_solanatracker_json
+        try:
+            def fake_request(method, url, headers, *, params=None, json_body=None, timeout=10):
+                if method == "POST":
+                    return {"data": {"indexed": False, "queued": True, "message": "Wallet not yet indexed. Queued for processing."}}, 1
+                return {"tokens": [{"address": SOL_MINT, "balance": 5, "value": 15, "price": {"usd": 3}}]}, 1
+
+            backend._request_solanatracker_json = fake_request
+            result = backend.fetch_pnl_batch_results(["WalletA"], SOL_MINT, "key")
+
+            self.assertEqual(result["WalletA"]["pnl_status"], "indexing")
+            self.assertEqual(result["WalletA"]["holding"], 5)
+            self.assertIn("Queued", result["WalletA"]["pnl_message"])
+        finally:
+            backend._request_solanatracker_json = original_request
+
+    def test_jupiter_quote_uses_v2_order_without_taker(self):
+        jupiter_quote = importlib.import_module("jupiter_quote")
+        original_get = jupiter_quote.requests.get
+        original_throttle = jupiter_quote.throttle
+        calls = []
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"outAmount": "12345", "transaction": None, "inUsdValue": "1", "outUsdValue": "0.99"}
+
+        try:
+            jupiter_quote.throttle = lambda: calls.append(("throttle", None, None))
+
+            def fake_get(url, params=None, timeout=10):
+                calls.append(("get", url, params))
+                return Response()
+
+            jupiter_quote.requests.get = fake_get
+            out_amount = jupiter_quote.quote_out_amount_raw("InputMint", "OutputMint", 1000)
+
+            self.assertEqual(out_amount, 12345)
+            get_call = [call for call in calls if call[0] == "get"][0]
+            self.assertTrue(get_call[1].endswith("/swap/v2/order"))
+            self.assertEqual(get_call[2]["amount"], 1000)
+            self.assertNotIn("taker", get_call[2])
+            self.assertNotIn("restrictIntermediateTokens", get_call[2])
+        finally:
+            jupiter_quote.requests.get = original_get
+            jupiter_quote.throttle = original_throttle
 if __name__ == "__main__":
     unittest.main()

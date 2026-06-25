@@ -14,7 +14,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v3.0
+# 🚀 Jupiter USDC Price Alerts v3.1
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -22,7 +22,7 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 
 ---
 
-## ✨ What's New in v3.0
+## ✨ What's New in v3.1
 
 ### 🪙 Multi-token monitoring
 - Track multiple output tokens from the web UI while keeping Docker Compose as the simple default setup.
@@ -33,6 +33,11 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 - Each token can have its own simulated USD amount, buy/sell alerts, alert reset minutes, RSI alerts, RSI interval, RSI reset mode, decimals, price check interval, RSI check interval, and optional ntfy topic.
 - Per-token ntfy test notifications make it easy to confirm the right topic before alerts fire.
 - Chart window, wallet selection, and sell simulator preferences are remembered per token in the browser.
+
+### 🔌 API and wallet reliability
+- Jupiter price checks now use keyless Swap V2 quote-only requests with a dedicated 0.5 req/sec default limiter.
+- Wallet info now uses SolanaTracker PnL V2 batch positions with a fallback to basic wallet holdings for migrated or not-yet-indexed tokens.
+- Sell simulator keeps proceeds visible for holding-only data, but avoids showing a misleading principal/profit split until PnL is indexed.
 
 ### 🛡️ Safer rate and state management
 - SolanaTracker calls use a shared safe limiter by default for free accounts, with custom/off modes for higher plans.
@@ -179,6 +184,9 @@ services:
       # Use custom/off only if your plan allows it.
       SOLANATRACKER_RATE_LIMIT_MODE: safe
       SOLANATRACKER_REQUESTS_PER_SECOND: 1
+
+      # Jupiter keyless quote limiter. Default matches public keyless access.
+      JUPITER_REQUESTS_PER_SECOND: 0.5
 
       # --- Simulated Swap Settings ---
 
@@ -346,10 +354,10 @@ Open the app and **subscribe to your topic** (e.g. `token-alerts`).
 - 🧲 `linux/arm/v7` (Raspberry Pi 3 and older ARM chips)
 
 ---
-## v3.0 Production Notes
+## v3.1 Production Notes
 
 - The web UI now has a settings button next to dark mode for runtime settings. Docker Compose values remain the defaults; UI edits are persisted into `/shared/config.json`.
-- The web UI can save multiple output tokens, validate new token mints with Jupiter before adding them, and switch the active token without editing Docker Compose. The monitor rotates through enabled saved tokens with a conservative due-token scheduler, while the active token still feeds the main chart and controls.
+- The web UI can save multiple output tokens, validate new token mints with Jupiter before adding them, and switch the active token without editing Docker Compose. Jupiter quotes use keyless Swap V2 quote-only requests, and the monitor rotates through enabled saved tokens with a conservative due-token scheduler while the active token still feeds the main chart and controls.
 - Each saved token can have its own simulated USD amount, buy/sell alerts, RSI alerts, RSI interval, RSI reset mode, RSI on/off preference, decimals, optional `ntfy_topic`, price check interval, and RSI check interval. Blank cadence/topic values inherit the Docker Compose / global defaults.
 - Token alert messages include the token label and mint, and the UI can send a per-token ntfy test notification so topics can be verified before alerts fire.
 - Mount `/shared` as shown above so alerts, wallets, price history, and UI-edited settings survive container recreation.

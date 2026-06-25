@@ -26,6 +26,16 @@ const safe = (n: any, d: any = 0) => {
 };
 const fmt = (n: any, digits = 2) => safe(n).toFixed(digits);
 
+const pnlStatusText = (item: any) => {
+  const status = item?.pnl_status;
+  if (!status || status === "ok") return "";
+  if (status === "holding_only") return item?.pnl_message || "Holding found; P&L not indexed yet";
+  if (status === "indexing") return item?.pnl_message || "P&L is queued for indexing";
+  if (status === "not_found") return item?.pnl_message || "No holding found for this token";
+  if (status === "partial") return item?.pnl_message || "Some wallet P&L data is unavailable";
+  return item?.pnl_error || "Wallet info update issue";
+};
+
 type RateLimitMode = "safe" | "custom" | "off";
 
 type SettingsHelpLabelProps = {
@@ -365,7 +375,6 @@ export default function AlertsDashboard() {
   const [addTokenExpanded, setAddTokenExpanded] = useState(false);
   const [editingTokenMint, setEditingTokenMint] = useState<string | null>(null);
 
-  const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
   const [rsi, setRsi] = useState<number | null>(null);
   const [rsiStatus, setRsiStatus] = useState("waiting");
@@ -389,21 +398,9 @@ export default function AlertsDashboard() {
     return Math.max(0.1, safe(solanaTrackerRps, 1));
   }, [solanaTrackerRateLimitMode, solanaTrackerRps]);
 
-  const walletRequestDelayMs = useMemo(() => {
-    if (solanaTrackerRateLimitMode === "off") return 100;
-    const rps = effectiveSolanaTrackerRps || 1;
-    return Math.ceil(1000 / rps) + 100;
-  }, [effectiveSolanaTrackerRps, solanaTrackerRateLimitMode]);
-
-  const estimatedWalletRefreshSeconds = useMemo(() => {
-    if (!wallets.length) return 0;
-    return Math.ceil((wallets.length * walletRequestDelayMs) / 1000);
-  }, [walletRequestDelayMs, wallets.length]);
-
   const walletRefreshLabel = pnlLoading
-    ? `Updating ${wallets.length} wallets...`
-    : `Update All${estimatedWalletRefreshSeconds ? ` (~${estimatedWalletRefreshSeconds}s)` : ""}`;
-
+    ? `Updating ${wallets.length} wallet${wallets.length === 1 ? "" : "s"}...`
+    : "Update All";
   const settingsHelpProps = (key: string) => ({
     open: settingsHelpOpen === key,
     onToggle: () => setSettingsHelpOpen((current) => current === key ? null : key),
@@ -658,7 +655,7 @@ export default function AlertsDashboard() {
     }
   };
 
-  // Fetch PnL for each wallet with rate-limit and retry.
+  // Fetch PnL for the active token. Backend handles SolanaTracker rate limiting, chunking, and holdings fallback.
   async function fetchPnl() {
     if (!solanaTrackerEnabled) {
       setPnlData({ individual: {}, aggregated: undefined, token_mint: outputMint || activeTokenMint });
@@ -678,42 +675,34 @@ export default function AlertsDashboard() {
       const prev = pnlData.individual;
       const tokenMint = outputMint;
       const indiv: Record<string, any> = {};
-      const failed: string[] = [];
       const fetchTime = new Date().toLocaleString();
 
-      for (const w of wallets) {
-        try {
-          const res = await fetch(`/api/pnl/${encodeURIComponent(w)}/${encodeURIComponent(tokenMint)}`);
-          if (!res.ok) throw new Error();
-          const data = await res.json();
-          if (data?.pnl_status === "error" && prev[w]) {
-            indiv[w] = { ...prev[w], pnl_status: "error", pnl_error: data.pnl_error };
-          } else {
-            indiv[w] = { ...data, lastFetchedAt: fetchTime };
-          }
-        } catch {
-          failed.push(w);
-          indiv[w] = { ...(prev[w] || {}), pnl_status: "error" };
-        }
-        await delay(walletRequestDelayMs);
-      }
+      try {
+        const res = await fetch("/api/pnl/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wallets, token: tokenMint }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const payload = await res.json();
+        const batch = payload?.individual && typeof payload.individual === "object" ? payload.individual : {};
 
-      if (failed.length) {
-        await delay(Math.max(1000, walletRequestDelayMs));
-        const still: string[] = [];
-        for (const w of failed) {
-          try {
-            const res = await fetch(`/api/pnl/${encodeURIComponent(w)}/${encodeURIComponent(tokenMint)}`);
-            if (!res.ok) throw new Error();
-            const retryData = await res.json();
-            indiv[w] = { ...retryData, lastFetchedAt: fetchTime };
-          } catch {
-            still.push(w);
-            indiv[w] = { ...(prev[w] || {}), pnl_status: "error" };
+        for (const wallet of wallets) {
+          const data = batch[wallet];
+          if (!data) {
+            indiv[wallet] = { ...(prev[wallet] || {}), pnl_status: "error", pnl_error: "No wallet result" };
+          } else if (data.pnl_status === "error" && prev[wallet]) {
+            indiv[wallet] = { ...prev[wallet], pnl_status: "error", pnl_error: data.pnl_error || "Wallet info update issue" };
+          } else {
+            indiv[wallet] = { ...data, lastFetchedAt: fetchTime };
           }
-          await delay(walletRequestDelayMs);
         }
-        if (still.length) toast.error(`Failed to load PnL for: ${still.join(", ")}`);
+      } catch (error: any) {
+        const message = String(error?.message || error || "Wallet info update failed").slice(0, 160);
+        for (const wallet of wallets) {
+          indiv[wallet] = { ...(prev[wallet] || {}), pnl_status: "error", pnl_error: message };
+        }
+        toast.error("Failed to load wallet info");
       }
 
       if (outputMintRef.current && outputMintRef.current !== tokenMint) return;
@@ -724,9 +713,11 @@ export default function AlertsDashboard() {
         unrealized: 0,
         current_value: 0,
         cost_basis: 0,
+        cost_basis_total: 0,
         last_trade_time: null as string | null,
         lastFetchedAt: fetchTime,
         staleCount: 0,
+        limitedPnlCount: 0,
       };
       let weightedCost = 0;
       let maxTs = 0;
@@ -737,11 +728,14 @@ export default function AlertsDashboard() {
         const u = safe((d as any).unrealized);
         const r = safe((d as any).realized);
         const cb = safe((d as any).cost_basis);
+        const status = (d as any).pnl_status;
+        if (["holding_only", "indexing"].includes(status) && (h > 0 || cv > 0)) agg.limitedPnlCount += 1;
 
         agg.holding += h;
         agg.realized += r;
         agg.unrealized += u;
         agg.current_value += cv;
+        agg.cost_basis_total += safe((d as any).cost_basis_total);
         weightedCost += cb * h;
 
         const t = Date.parse((d as any).last_trade_time || "");
@@ -755,20 +749,18 @@ export default function AlertsDashboard() {
 
       const failedWallets: string[] = [];
       for (const [wallet, data] of Object.entries(indiv)) {
-        const isStale = (data as any).lastFetchedAt !== fetchTime;
-        const hasNoData =
-          safe((data as any).holding) === 0 &&
-          safe((data as any).realized) === 0 &&
-          safe((data as any).unrealized) === 0 &&
-          safe((data as any).cost_basis) === 0;
-
+        const isStale = Boolean((data as any).lastFetchedAt) && (data as any).lastFetchedAt !== fetchTime;
         const status = (data as any).pnl_status;
-        if (status === "error" || isStale || (status !== "ok" && hasNoData && !(data as any).last_trade_time)) {
+        if (status === "error" || isStale) {
           failedWallets.push(wallet);
         }
       }
       agg.staleCount = failedWallets.length;
       agg.failedWallets = failedWallets;
+      if (agg.limitedPnlCount > 0) {
+        agg.pnl_status = "partial";
+        agg.pnl_message = `${agg.limitedPnlCount} wallet${agg.limitedPnlCount === 1 ? "" : "s"} included with holdings only`;
+      }
 
       setPnlData({ individual: indiv, aggregated: agg, token_mint: tokenMint });
 
@@ -788,7 +780,6 @@ export default function AlertsDashboard() {
       setPnlLoading(false);
     }
   }
-
 
   // Poll state every 60 s
   useEffect(() => {
@@ -1313,7 +1304,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.0</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.1</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -2245,6 +2236,11 @@ export default function AlertsDashboard() {
                       <strong className="min-w-0 truncate" title={item.key}>{item.key === "Aggregated" ? item.key : shortMint(item.key)}</strong>
                       <span className="flex-shrink-0 text-xs text-gray-500">{item.lastFetchedAt}</span>
                     </div>
+                    {pnlStatusText(item) && (
+                      <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300">
+                        {pnlStatusText(item)}
+                      </div>
+                    )}
                     {item.loading ? (
                       <div className="text-sm italic text-gray-500">Click update to load</div>
                     ) : (
@@ -2327,6 +2323,7 @@ export default function AlertsDashboard() {
               const currentValue = safe(src.current_value);
               const unrealized = safe(src.unrealized);
               const costBasis = safe(src.cost_basis);
+              const pnlLimited = ["holding_only", "indexing", "partial"].includes(src?.pnl_status);
 
               const pricePerToken = holding > 0 ? currentValue / holding : 0;
               const tokensToSell = holding * pct;
@@ -2360,25 +2357,33 @@ export default function AlertsDashboard() {
                   </div>
 
                   <div className="space-y-1">
-                    <div className="flex justify-between gap-3">
-                      <span>From principal:</span>
-                      <span className="font-semibold">{fmt(principalPart, 2)}</span>
-                    </div>
-                    <div className={`flex justify-between gap-3 ${profitPart >= 0 ? "" : "text-red-600"}`}>
-                      <span>{profitPart >= 0 ? "From unrealized profit:" : "Unrealized loss portion:"}</span>
-                      <span className="font-semibold">{fmt(profitPart, 2)}</span>
-                    </div>
-                    <div className="flex justify-between gap-3 text-xs text-gray-500">
-                      <span>Split ratio:</span>
-                      <span>
-                        {fmt(splitPrincipalPct, 1)}% principal | {fmt(splitProfitPct, 1)}%{" "}
-                        {profitPart >= 0 ? "profit" : "loss"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between gap-3 text-xs text-gray-500 pt-1">
-                      <span>Position principal (held):</span>
-                      <span>{fmt(principalValue, 2)}</span>
-                    </div>
+                    {pnlLimited ? (
+                      <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300">
+                        Holding value is available, but P&L split is not indexed yet.
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex justify-between gap-3">
+                          <span>From principal:</span>
+                          <span className="font-semibold">{fmt(principalPart, 2)}</span>
+                        </div>
+                        <div className={`flex justify-between gap-3 ${profitPart >= 0 ? "" : "text-red-600"}`}>
+                          <span>{profitPart >= 0 ? "From unrealized profit:" : "Unrealized loss portion:"}</span>
+                          <span className="font-semibold">{fmt(profitPart, 2)}</span>
+                        </div>
+                        <div className="flex justify-between gap-3 text-xs text-gray-500">
+                          <span>Split ratio:</span>
+                          <span>
+                            {fmt(splitPrincipalPct, 1)}% principal | {fmt(splitProfitPct, 1)}%{" "}
+                            {profitPart >= 0 ? "profit" : "loss"}
+                          </span>
+                        </div>
+                        <div className="flex justify-between gap-3 text-xs text-gray-500 pt-1">
+                          <span>Position principal (held):</span>
+                          <span>{fmt(principalValue, 2)}</span>
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   <div className="text-xs text-gray-500 sm:col-span-2">

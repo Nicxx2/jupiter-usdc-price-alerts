@@ -6,6 +6,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
+from jupiter_quote import JupiterQuoteError, quote_out_amount_raw
 from rsi_utils import get_latest_rsi
 from solana_rate_limiter import configure_rate_limit
 from typing import Dict, Any, Optional
@@ -792,33 +793,14 @@ def notify_backend_rsi_trigger(key: str, timestamp: str):
 
 def get_out_amount_raw(input_mint, output_mint, amount_lamports):
     """
-    Uses Jupiter's current Swap Quote API (lite-api) and returns raw outAmount.
+    Uses Jupiter Swap V2 order in quote-only mode and returns raw outAmount.
     The caller is responsible for converting raw token units with the output mint decimals.
     """
-    base = "https://lite-api.jup.ag/swap/v1/quote"
-    params = (
-        f"?inputMint={input_mint}"
-        f"&outputMint={output_mint}"
-        f"&amount={amount_lamports}"
-        f"&slippageBps=100"
-        f"&restrictIntermediateTokens=true"
-    )
-    url = f"{base}{params}"
-
-    for attempt in range(3):
-        try:
-            res = requests.get(url, timeout=10)
-            if res.status_code == 429:
-                time.sleep(2 + attempt)
-                continue
-            res.raise_for_status()
-            out_raw = res.json().get("outAmount", "0")
-            return int(out_raw)
-        except Exception as e:
-            if attempt == 2:
-                print(f"Jupiter quote failed after retries: {e}", flush=True)
-                return None
-            time.sleep(1 + attempt)
+    try:
+        return quote_out_amount_raw(input_mint, output_mint, amount_lamports)
+    except JupiterQuoteError as e:
+        print(f"Jupiter quote failed after retries: {e}", flush=True)
+        return None
 
 
 def should_alert(alert_dict, key, reset_minutes=None):

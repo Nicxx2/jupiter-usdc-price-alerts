@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 import threading
 import time
+from jupiter_quote import quote_out_amount_raw as jupiter_quote_out_amount_raw
 from solana_rate_limiter import throttle, configure_rate_limit
 from typing import Dict, Any, Optional
 
@@ -50,11 +51,11 @@ app.add_middleware(
 CONFIG_PATH = "/shared/config.json"
 STATE_PATH = "/shared/jupiter-latest.json"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-JUPITER_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 NTFY_TOPIC_ALPHABET = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
 SOLANATRACKER_PNL_RETRIES = 2
-
+SOLANATRACKER_BASE_URL = os.getenv("SOLANATRACKER_BASE_URL", "https://data.solanatracker.io").rstrip("/")
+SOLANATRACKER_PNL_MODE = os.getenv("SOLANATRACKER_PNL_MODE", "adjusted").strip().lower()
 
 def _optional_int(value):
     try:
@@ -580,22 +581,7 @@ def get_token_state_summary():
     return summary
 
 def quote_out_amount_raw(input_mint, output_mint, amount):
-    resp = requests.get(
-        JUPITER_QUOTE_URL,
-        params={
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": int(amount),
-            "slippageBps": 100,
-            "restrictIntermediateTokens": "true",
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    out_amount = int(resp.json().get("outAmount", "0"))
-    if out_amount <= 0:
-        raise ValueError("Jupiter returned no output amount")
-    return out_amount
+    return jupiter_quote_out_amount_raw(input_mint, output_mint, amount)
 
 
 
@@ -1147,6 +1133,10 @@ class AddressesList(BaseModel):
 
 class AddressValue(BaseModel):
      value: str
+
+class PnLBatchRequest(BaseModel):
+     token: str
+     wallets: List[str]
      
 
 
@@ -1653,42 +1643,286 @@ async def delete_wallet(payload: AddressValue):
         return {"success": True, "values": active_token_wallets(), "token_mint": state.get("active_token_mint")}
     raise HTTPException(status_code=404, detail="Wallet not found")
 
-def empty_pnl_result(status="error", error=None, attempts=0):
+def _number_or_none(value):
+    try:
+        number = float(value)
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
+
+
+def _number(value, default=0):
+    number = _number_or_none(value)
+    return default if number is None else number
+
+
+def _epoch_to_iso(value):
+    if isinstance(value, str):
+        return value or None
+    number = _number_or_none(value)
+    if number is None or number <= 0:
+        return None
+    timestamp = number / 1000 if number > 100_000_000_000 else number
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def empty_pnl_result(status="error", error=None, attempts=0, message=None):
     result = {
         "holding": 0,
         "realized": 0,
         "unrealized": 0,
         "current_value": 0,
         "cost_basis": 0,
+        "cost_basis_total": 0,
         "last_trade_time": None,
         "pnl_status": status,
         "pnl_attempts": attempts,
     }
     if error:
         result["pnl_error"] = str(error)[:160]
+    if message:
+        result["pnl_message"] = str(message)[:160]
     return result
 
 
 def extract_pnl_result(data, attempts):
-    result = {
-        "holding": data.get("holding", 0),
-        "realized": data.get("realized", 0),
-        "unrealized": data.get("unrealized", 0),
-        "current_value": data.get("current_value", 0),
-        "cost_basis": data.get("cost_basis", 0),
+    data = data or {}
+    current = data.get("current") if isinstance(data.get("current"), dict) else {}
+    pnl_root = data.get("pnl") if isinstance(data.get("pnl"), dict) else {}
+    token_pnl = pnl_root.get("token") if isinstance(pnl_root.get("token"), dict) else pnl_root
+
+    holding = _number(current.get("balance"), _number(data.get("holding"), 0))
+    cost_basis_total = _number(current.get("costBasis"), 0)
+    avg_cost = _number_or_none(current.get("avgCost"))
+    if avg_cost is None:
+        avg_cost = cost_basis_total / holding if holding > 0 and cost_basis_total else _number(data.get("cost_basis"), 0)
+
+    realized = _number(token_pnl.get("realized"), _number(data.get("realized"), 0))
+    unrealized = _number(token_pnl.get("unrealized"), _number(data.get("unrealized"), 0))
+    total = _number(token_pnl.get("total"), realized + unrealized)
+    timing = data.get("timing") if isinstance(data.get("timing"), dict) else {}
+
+    return {
+        "holding": holding,
+        "realized": realized,
+        "unrealized": unrealized,
+        "total": total,
+        "current_value": _number(current.get("value"), _number(data.get("current_value"), 0)),
+        "cost_basis": avg_cost,
+        "cost_basis_total": cost_basis_total,
+        "last_trade_time": _epoch_to_iso(timing.get("lastTrade") or data.get("last_trade_time")),
         "pnl_status": "ok",
         "pnl_attempts": attempts,
     }
 
-    lt = data.get("last_trade_time")
-    if isinstance(lt, (int, float)):
-        result["last_trade_time"] = datetime.fromtimestamp(lt / 1000).isoformat()
-    else:
-        result["last_trade_time"] = None
-    return result
+
+def _wallet_from_entry(entry):
+    if isinstance(entry, dict):
+        return str(entry.get("wallet") or entry.get("address") or entry.get("owner") or "").strip()
+    return str(entry or "").strip()
 
 
-# On-chain PnL endpoint
+def _token_mint_from_wallet_entry(entry):
+    token = entry.get("token") if isinstance(entry.get("token"), dict) else {}
+    return str(entry.get("address") or entry.get("mint") or token.get("mint") or token.get("address") or "").strip()
+
+
+def _extract_basic_wallet_holding(data, token, attempts, source_status="holding_only", source_message=None):
+    root = data if isinstance(data, dict) else {}
+    if isinstance(root.get("data"), dict):
+        root = root.get("data")
+    for entry in root.get("tokens", []):
+        if not isinstance(entry, dict) or _token_mint_from_wallet_entry(entry) != token:
+            continue
+        holding = _number(entry.get("balance"), _number(entry.get("amount"), 0))
+        price_data = entry.get("price")
+        price = _number(price_data.get("usd"), 0) if isinstance(price_data, dict) else _number(price_data, 0)
+        current_value = _number(entry.get("value"), holding * price if price else 0)
+        if holding <= 0 and current_value <= 0:
+            continue
+        result = empty_pnl_result(
+            status=source_status,
+            attempts=attempts,
+            message=source_message or "Holding found, but PnL is not available yet",
+        )
+        result.update({
+            "holding": holding,
+            "current_value": current_value,
+            "price": price,
+            "pnl_error": None,
+        })
+        return result
+    return None
+
+
+def _solanatracker_headers(api_key):
+    return {"x-api-key": api_key, "Content-Type": "application/json"}
+
+
+def _solanatracker_pnl_mode():
+    return SOLANATRACKER_PNL_MODE if SOLANATRACKER_PNL_MODE in {"adjusted", "strict", "raw"} else "adjusted"
+
+
+class SolanaTrackerRequestError(RuntimeError):
+    def __init__(self, error, status_code=None):
+        super().__init__(str(error))
+        self.status_code = status_code
+
+
+def _request_solanatracker_json(method, url, headers, *, params=None, json_body=None, timeout=10):
+    transient_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+    last_error = None
+    last_status = None
+    for attempt in range(1, SOLANATRACKER_PNL_RETRIES + 1):
+        throttle()
+        try:
+            if method == "POST":
+                resp = requests.post(url, headers=headers, params=params, json=json_body, timeout=timeout)
+            else:
+                resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            last_status = resp.status_code
+            if resp.status_code in transient_statuses and attempt < SOLANATRACKER_PNL_RETRIES:
+                last_error = f"HTTP {resp.status_code}"
+                time.sleep(min(attempt, 2))
+                continue
+            resp.raise_for_status()
+            return resp.json(), attempt
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < SOLANATRACKER_PNL_RETRIES and last_status in transient_statuses:
+                time.sleep(min(attempt, 2))
+                continue
+            break
+        except Exception as e:
+            last_error = e
+            break
+    raise SolanaTrackerRequestError(last_error or "SolanaTracker request failed", last_status)
+
+
+def fetch_basic_wallet_holding(wallet, token, headers, source_status="holding_only", source_error=None):
+    try:
+        data, attempts = _request_solanatracker_json(
+            "GET",
+            f"{SOLANATRACKER_BASE_URL}/wallet/{wallet}/basic",
+            headers,
+            timeout=8,
+        )
+        result = _extract_basic_wallet_holding(data, token, attempts, source_status, str(source_error) if source_error else None)
+        if result:
+            return result
+        status = "indexing" if source_status == "indexing" else "not_found"
+        return empty_pnl_result(status=status, error=source_error or "No holding found", attempts=attempts)
+    except Exception as e:
+        status = "indexing" if source_status == "indexing" else "error"
+        return empty_pnl_result(status=status, error=source_error or e, attempts=SOLANATRACKER_PNL_RETRIES)
+
+
+def fetch_pnl_batch_results(wallets, token, api_key):
+    token = str(token or "").strip()
+    normalized_wallets = normalize_wallet_addresses(wallets)
+    headers = _solanatracker_headers(api_key)
+    results = {}
+
+    for start in range(0, len(normalized_wallets), 200):
+        chunk = normalized_wallets[start:start + 200]
+        chunk_set = set(chunk)
+        try:
+            payload, attempts = _request_solanatracker_json(
+                "POST",
+                f"{SOLANATRACKER_BASE_URL}/v2/pnl/tokens/{token}/positions/batch",
+                headers,
+                params={"pnlMode": _solanatracker_pnl_mode()},
+                json_body={"wallets": chunk},
+                timeout=12,
+            )
+        except SolanaTrackerRequestError as e:
+            if e.status_code in {400, 422}:
+                try:
+                    payload, attempts = _request_solanatracker_json(
+                        "POST",
+                        f"{SOLANATRACKER_BASE_URL}/v2/pnl/tokens/{token}/positions/batch",
+                        headers,
+                        params={"pnlMode": _solanatracker_pnl_mode()},
+                        json_body=chunk,
+                        timeout=12,
+                    )
+                except Exception:
+                    for wallet in chunk:
+                        results[wallet] = fetch_basic_wallet_holding(wallet, token, headers, "holding_only", "PnL unavailable")
+                    continue
+            else:
+                for wallet in chunk:
+                    results[wallet] = fetch_basic_wallet_holding(wallet, token, headers, "holding_only", "PnL unavailable")
+                continue
+        except Exception:
+            for wallet in chunk:
+                results[wallet] = fetch_basic_wallet_holding(wallet, token, headers, "holding_only", "PnL unavailable")
+            continue
+
+        root_payload = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+        if isinstance(root_payload, dict) and (root_payload.get("indexed") is False or root_payload.get("queued") is True):
+            message = root_payload.get("message") or "Wallet PnL is queued for indexing"
+            for wallet in chunk:
+                results[wallet] = fetch_basic_wallet_holding(wallet, token, headers, "indexing", message)
+            continue
+
+        if isinstance(root_payload, list):
+            positions = root_payload
+            not_found_entries = []
+            invalid_entries = []
+        else:
+            positions = root_payload.get("positions", []) if isinstance(root_payload, dict) else []
+            not_found_entries = root_payload.get("notFound", []) if isinstance(root_payload, dict) else []
+            invalid_entries = root_payload.get("invalid", []) if isinstance(root_payload, dict) else []
+
+        if isinstance(positions, dict):
+            positions = list(positions.values())
+
+        for position in positions or []:
+            if not isinstance(position, dict):
+                continue
+            wallet = _wallet_from_entry(position)
+            if not wallet and len(chunk) == 1:
+                wallet = chunk[0]
+            if wallet:
+                results[wallet] = extract_pnl_result(position, attempts)
+
+        invalid_wallets = {_wallet_from_entry(entry) for entry in invalid_entries or []}
+        invalid_wallets = {wallet for wallet in invalid_wallets if wallet in chunk_set}
+        for wallet in invalid_wallets:
+            results[wallet] = empty_pnl_result(status="error", error="Invalid wallet address", attempts=attempts)
+
+        not_found_wallets = {_wallet_from_entry(entry) for entry in not_found_entries or []}
+        not_found_wallets = {wallet for wallet in not_found_wallets if wallet in chunk_set}
+        missing_wallets = [wallet for wallet in chunk if wallet not in results]
+        for wallet in missing_wallets:
+            reason = "PnL not found" if wallet in not_found_wallets else "PnL unavailable"
+            results[wallet] = fetch_basic_wallet_holding(wallet, token, headers, "holding_only", reason)
+
+    return {wallet: results.get(wallet, empty_pnl_result(status="error", error="No result")) for wallet in normalized_wallets}
+
+
+@app.post("/api/pnl/batch")
+async def get_pnl_batch(payload: PnLBatchRequest):
+    if not state.get("solanatracker_features_enabled", True):
+        raise HTTPException(status_code=400, detail="SolanaTracker features are disabled")
+    api_key = os.getenv("SOLANATRACKER_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="SolanaTracker API key not set")
+    token = str(payload.token or "").strip()
+    if not is_probable_mint(token):
+        raise HTTPException(status_code=400, detail="Invalid Solana token mint")
+    wallets = normalize_wallet_addresses(payload.wallets)
+    if not wallets:
+        return {"individual": {}, "token_mint": token}
+    return {"individual": fetch_pnl_batch_results(wallets, token, api_key), "token_mint": token}
+
+
 @app.get("/api/pnl/{wallet}/{token}")
 async def get_pnl(wallet: str, token: str):
     if not state.get("solanatracker_features_enabled", True):
@@ -1696,34 +1930,13 @@ async def get_pnl(wallet: str, token: str):
     api_key = os.getenv("SOLANATRACKER_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=400, detail="SolanaTracker API key not set")
-
-    url = f"https://data.solanatracker.io/pnl/{wallet}/{token}?holdingCheck=true"
-    headers = {"x-api-key": api_key}
-    transient_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
-    last_error = None
-
-    for attempt in range(1, SOLANATRACKER_PNL_RETRIES + 1):
-        throttle()
-        try:
-            resp = requests.get(url, headers=headers, timeout=6)
-            if resp.status_code in transient_statuses and attempt < SOLANATRACKER_PNL_RETRIES:
-                last_error = f"HTTP {resp.status_code}"
-                time.sleep(min(attempt, 2))
-                continue
-            resp.raise_for_status()
-            return extract_pnl_result(resp.json(), attempt)
-        except requests.RequestException as e:
-            last_error = e
-            if attempt < SOLANATRACKER_PNL_RETRIES:
-                time.sleep(min(attempt, 2))
-                continue
-        except Exception as e:
-            last_error = e
-            break
-
-    print(f"[PnL] fetch failed for wallet={wallet}, token={token}: {last_error}", flush=True)
-    return empty_pnl_result(error=last_error, attempts=SOLANATRACKER_PNL_RETRIES)
-
+    token = str(token or "").strip()
+    if not is_probable_mint(token):
+        raise HTTPException(status_code=400, detail="Invalid Solana token mint")
+    clean_wallet = str(wallet or "").strip()
+    if not clean_wallet:
+        raise HTTPException(status_code=400, detail="Wallet address is required")
+    return fetch_pnl_batch_results([clean_wallet], token, api_key).get(clean_wallet, empty_pnl_result())
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 

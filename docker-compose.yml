@@ -31,6 +31,9 @@ services:
       SOLANATRACKER_RATE_LIMIT_MODE: safe
       SOLANATRACKER_REQUESTS_PER_SECOND: 1
 
+      # Jupiter keyless quote limiter. Default matches public keyless access.
+      JUPITER_REQUESTS_PER_SECOND: 0.5
+
       # --- Simulated Swap Settings ---
 
       # Amount of USDC to simulate swapping

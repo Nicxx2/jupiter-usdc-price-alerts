@@ -29,6 +29,7 @@ solanatracker-rate-limit.lock
 *.log
 *.err
 *.tmp
+.codex-remote-attachments/
 
 # OS files
 .DS_Store
