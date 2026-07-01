@@ -1304,7 +1304,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.1</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.1.1</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -1811,7 +1811,7 @@ export default function AlertsDashboard() {
         <>
       {/* RSI Info Card */}
       <Card>
-        <CardContent className="p-4 text-center">
+        <CardContent className="min-w-0 p-4 text-center">
           <h2 className="inline-flex items-center justify-center gap-1 text-xl font-semibold">
             RSI ({rsiInterval})
             <span className={rsiMeta.color} title={rsiMeta.label} aria-label={rsiMeta.label}>
@@ -1821,7 +1821,9 @@ export default function AlertsDashboard() {
           <p className="text-2xl font-bold" style={{ color: rsiColor(rsi) }}>
             {rsi !== null ? fmt(rsi, 2) : "--"}
           </p>
-          <p className="italic text-sm text-gray-500">{rsiLabel(rsi) || rsiMeta.label}</p>
+          <p className="max-w-full whitespace-pre-wrap break-words text-sm italic text-gray-500 [overflow-wrap:anywhere]">
+            {rsiLabel(rsi) || rsiMeta.label}
+          </p>
           {/* RSI timestamp intentionally omitted */}
         </CardContent>
       </Card>
@@ -2237,7 +2239,7 @@ export default function AlertsDashboard() {
                       <span className="flex-shrink-0 text-xs text-gray-500">{item.lastFetchedAt}</span>
                     </div>
                     {pnlStatusText(item) && (
-                      <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300">
+                      <div className="max-w-full whitespace-pre-wrap break-words rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700 [overflow-wrap:anywhere] dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-300">
                         {pnlStatusText(item)}
                       </div>
                     )}

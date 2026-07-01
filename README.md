@@ -14,7 +14,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v3.1
+# 🚀 Jupiter USDC Price Alerts v3.1.1
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -22,7 +22,7 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 
 ---
 
-## ✨ What's New in v3.1
+## ✨ What's New in v3.1.1
 
 ### 🪙 Multi-token monitoring
 - Track multiple output tokens from the web UI while keeping Docker Compose as the simple default setup.
@@ -38,6 +38,7 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 - Jupiter price checks now use keyless Swap V2 quote-only requests with a dedicated 0.5 req/sec default limiter.
 - Wallet info now uses SolanaTracker PnL V2 batch positions with a fallback to basic wallet holdings for migrated or not-yet-indexed tokens.
 - Sell simulator keeps proceeds visible for holding-only data, but avoids showing a misleading principal/profit split until PnL is indexed.
+- Long SolanaTracker RSI and wallet status errors wrap cleanly within mobile and desktop cards without changing the original error text.
 
 ### 🛡️ Safer rate and state management
 - SolanaTracker calls use a shared safe limiter by default for free accounts, with custom/off modes for higher plans.
@@ -354,7 +355,7 @@ Open the app and **subscribe to your topic** (e.g. `token-alerts`).
 - 🧲 `linux/arm/v7` (Raspberry Pi 3 and older ARM chips)
 
 ---
-## v3.1 Production Notes
+## v3.1.1 Production Notes
 
 - The web UI now has a settings button next to dark mode for runtime settings. Docker Compose values remain the defaults; UI edits are persisted into `/shared/config.json`.
 - The web UI can save multiple output tokens, validate new token mints with Jupiter before adding them, and switch the active token without editing Docker Compose. Jupiter quotes use keyless Swap V2 quote-only requests, and the monitor rotates through enabled saved tokens with a conservative due-token scheduler while the active token still feeds the main chart and controls.
