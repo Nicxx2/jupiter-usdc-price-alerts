@@ -114,7 +114,7 @@ By providing a `SOLANATRACKER_API_KEY`, you enable a new RSI panel in the UI tha
 
 
 > 📝 To use RSI features, create a free account at [solanatracker.io](https://www.solanatracker.io/) and generate an API key  
-> 🚦 Free API keys include **10,000 requests per month**
+> 🚦 Free API keys include **2,500 requests per month**
 
 ### 🛡️ Resilience to API Hiccups
 - Handles rate limits (`429`) and timeouts gracefully
@@ -216,7 +216,7 @@ services:
       RSI_ENABLED: "true"
 
       # How often (in minutes) to refresh RSI checks
-      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      # Note: Free solanatracker.io API keys are limited to 2,500 requests per month
       RSI_CHECK_INTERVAL: 5
 
       # RSI alert thresholds (e.g. "above:30", "below:70")
@@ -230,7 +230,7 @@ services:
 
       # Persisted, wallet tracking config
       # Comma-separated list of Solana wallet addresses to track
-      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      # Note: Free solanatracker.io API keys are limited to 2,500 requests per month
       WALLET_ADDRESSES: ""
 
       # --- Push Notifications (via ntfy) ---
@@ -365,6 +365,6 @@ Open the app and **subscribe to your topic** (e.g. `token-alerts`).
 - RSI is cached by the monitor process. The UI reads the cached value and status instead of making extra SolanaTracker candle calls per browser tab.
 - Missing or failed RSI data is shown as `--` with a small status dot instead of `0.00`.
 - `SOLANATRACKER_ENABLED=true` is the first-run default for SolanaTracker-only features. Turning it off in the UI persists to `/shared/config.json` and hides RSI, wallet info, and the sell simulator without stopping Jupiter price checks.
-- `SOLANATRACKER_RATE_LIMIT_MODE=safe` protects free SolanaTracker accounts with a conservative 1 request/second limit. The UI labels this separately from the RSI check interval so request pacing is not confused with RSI cadence. SolanaTracker currently lists the Data API Free plan as 10,000 requests/month and 3 req/sec, so safe mode leaves headroom for RSI and wallet calls. Use `custom` with `SOLANATRACKER_REQUESTS_PER_SECOND`, or `off` only when your plan/private setup can handle it. See the [SolanaTracker pricing docs](https://docs.solanatracker.io/pricing) for current limits.
+- `SOLANATRACKER_RATE_LIMIT_MODE=safe` protects free SolanaTracker accounts with a conservative 1 request/second limit. The UI labels this separately from the RSI check interval so request pacing is not confused with RSI cadence. SolanaTracker currently lists the Data API Free plan as 2,500 requests/month and 3 req/sec, so safe mode leaves headroom for RSI and wallet calls. Use `custom` with `SOLANATRACKER_REQUESTS_PER_SECOND`, or `off` only when your plan/private setup can handle it. See the [SolanaTracker pricing docs](https://docs.solanatracker.io/pricing) for current limits.
 - Token decimals are auto-detected through Solana RPC when possible, with `INPUT_DECIMALS` / `OUTPUT_DECIMALS` available as explicit overrides.
 - Quick offline validation: `python -m unittest tests.test_scheduler_rate_limit` checks scheduler interval inheritance, round-robin due-token selection, and rate-limit safe/custom/off behavior without live API calls.
