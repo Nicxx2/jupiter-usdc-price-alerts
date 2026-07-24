@@ -76,6 +76,20 @@ const finite = (value: unknown): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const isValidTrendPoint = (point?: TrendPoint) =>
+  point?.kind === "point" && finite(point.value) !== null;
+
+const trendPointRadius = (points: TrendPoint[], index: number, validPointCount: number) => {
+  if (!isValidTrendPoint(points[index])) return 0;
+  if (validPointCount <= 120) return 1.5;
+
+  const hasPreviousPoint = isValidTrendPoint(points[index - 1]);
+  const hasNextPoint = isValidTrendPoint(points[index + 1]);
+  if (!hasPreviousPoint && !hasNextPoint) return 3;
+  if (!hasPreviousPoint || !hasNextPoint) return 1.5;
+  return 0;
+};
+
 const formatValue = (value: unknown, unit?: RuleUnit) => {
   const number = finite(value);
   if (number === null) return "--";
@@ -182,7 +196,8 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
   }, [item.type, mint, refreshKey, retryNonce, trendOpen, window]);
 
   const points = Array.isArray(payload?.points) ? payload!.points : [];
-  const hasValidPoints = points.some((point) => point.kind === "point" && finite(point.value) !== null);
+  const validPointCount = points.filter(isValidTrendPoint).length;
+  const hasValidPoints = validPointCount > 0;
   const latestScenario = [...points].reverse().find((point) => point.scenario_label)?.scenario_label
     || payload?.latest_valid?.scenario_label
     || "";
@@ -196,8 +211,10 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
         borderColor: "#3b82f6",
         backgroundColor: "#3b82f6",
         borderWidth: 2,
-        pointRadius: points.length > 120 ? 0 : 1.5,
+        pointRadius: (context: any) =>
+          trendPointRadius(points, Number(context.dataIndex), validPointCount),
         pointHoverRadius: 4,
+        pointHitRadius: 8,
         spanGaps: false,
         tension: 0.22,
       },
@@ -213,7 +230,7 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
         stepped: true as const,
       },
     ],
-  }), [isDark, points, window]);
+  }), [isDark, points, validPointCount, window]);
 
   const chartOptions = useMemo(() => ({
     responsive: true,
@@ -310,7 +327,7 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
   };
 
   return (
-    <div className={`min-w-0 rounded-lg border p-3 transition-colors ${itemStyle}`}>
+    <div className={`min-w-0 rounded-lg border p-3 transition-colors ${trendOpen ? "" : "sm:min-h-48"} ${itemStyle}`}>
       <div className="flex min-w-0 items-start gap-2">
         <span className="min-w-0 flex-1 font-medium">{item.label}</span>
         <span className="flex-shrink-0 rounded bg-white/70 px-2 py-0.5 text-xs font-semibold dark:bg-gray-900/50">
