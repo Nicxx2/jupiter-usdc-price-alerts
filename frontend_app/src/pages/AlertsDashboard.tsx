@@ -1533,7 +1533,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.1</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -2234,7 +2234,7 @@ export default function AlertsDashboard() {
               {rulesEvaluationVisible && (
                 <>
                   {activeRuleRows.length > 0 ? (
-                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 xl:grid-cols-3">
                       {activeRuleRows.map((item) => (
                         <RuleTrendCard
                           key={`${activeTokenMint}:${item.type}`}
