@@ -1,6 +1,9 @@
 # Python
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -12,25 +15,49 @@ htmlcov/
 frontend_app/node_modules/
 frontend_app/dist/
 frontend_app/.vite/
+frontend_app/.pnpm-store/
+*.tsbuildinfo
 
 # Environment / secrets
 .env
 .env.*
 !.env.example
+secrets/
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+wallet.json
+*keypair*.json
+docker-compose.override.yml
+compose.override.yml
 
 # Runtime state / local Docker volume data
 /shared/
 config.json
 jupiter-latest.json
 *.json.lock
-solanatracker-rate-limit.lock
+*-rate-limit.lock
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 
 # Logs / local temp
 *.log
 *.err
 *.tmp
+*.pid
+*.swp
+*~
 .codex-remote-attachments/
 
-# OS files
+# Editors / OS files
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db

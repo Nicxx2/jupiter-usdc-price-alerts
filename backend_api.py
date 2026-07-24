@@ -13,6 +13,19 @@ import requests
 import threading
 import time
 from jupiter_quote import quote_out_amount_raw as jupiter_quote_out_amount_raw
+from community_rules import (
+    CONFIRMATION_SAMPLES,
+    default_rules_config,
+    normalize_rules_config,
+    rules_config_signature,
+    stale_rules_state,
+)
+from rule_history import (
+    HISTORY_WINDOWS,
+    delete_rule_history,
+    get_rule_history,
+    mark_rule_history_gaps,
+)
 from solana_rate_limiter import throttle, configure_rate_limit
 from typing import Dict, Any, Optional
 
@@ -48,8 +61,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CONFIG_PATH = "/shared/config.json"
-STATE_PATH = "/shared/jupiter-latest.json"
+CONFIG_PATH = os.getenv("CONFIG_PATH", "/shared/config.json")
+STATE_PATH = os.getenv("SHARED_STATE_PATH", "/shared/jupiter-latest.json")
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 NTFY_TOPIC_ALPHABET = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
@@ -61,8 +74,12 @@ def _optional_int(value):
     try:
         if value is None or value == "":
             return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, float) and not value.is_integer():
+            return None
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -85,18 +102,28 @@ def coerce_int(value, default, minimum=None, maximum=None):
     return number
 
 
+COMMUNITY_RULES_STALE_SECONDS = coerce_int(os.getenv("COMMUNITY_RULES_STALE_SECONDS"), 360, minimum=60, maximum=86400)
+
+
 def coerce_float(value, default, minimum=None, maximum=None):
     try:
+        if isinstance(value, bool):
+            raise ValueError
         number = float(value)
         if not (number == number) or number in (float("inf"), float("-inf")):
             raise ValueError
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = default
     if minimum is not None:
         number = max(minimum, number)
     if maximum is not None:
         number = min(maximum, number)
     return number
+
+COMMUNITY_RULES_CHECK_INTERVAL = coerce_int(os.getenv("COMMUNITY_RULES_CHECK_INTERVAL"), 120, minimum=60, maximum=3600)
+COMMUNITY_RULES_JUPITER_REQUESTS_PER_SECOND = coerce_float(os.getenv("COMMUNITY_RULES_JUPITER_REQUESTS_PER_SECOND"), 0.5, minimum=0.1, maximum=50.0)
+JUPITER_REQUESTS_PER_SECOND = coerce_float(os.getenv("JUPITER_REQUESTS_PER_SECOND"), 0.5, minimum=0.1, maximum=50.0)
+
 
 
 def coerce_bool(value, default=False):
@@ -116,6 +143,18 @@ def coerce_bool(value, default=False):
 
 def solanatracker_features_default():
     return coerce_bool(os.getenv("SOLANATRACKER_ENABLED", os.getenv("SOLANATRACKER_FEATURES_ENABLED")), True)
+
+
+
+
+
+
+def jupiter_api_key_configured():
+    return bool(str(os.getenv("JUPITER_API_KEY") or "").strip())
+
+
+def community_rules_effective_enabled():
+    return bool(state.get("community_rules_enabled", False)) and jupiter_api_key_configured()
 
 
 def solanatracker_api_key_configured():
@@ -348,6 +387,8 @@ def normalize_token_entry(entry, fallback=None):
         "rsi_interval": str(entry.get("rsi_interval", fallback.get("rsi_interval", state.get("rsi_interval", "1s"))) or "1s").strip() or "1s",
         "rsi_reset_enabled": coerce_bool(entry.get("rsi_reset_enabled", fallback.get("rsi_reset_enabled", state.get("rsi_reset_enabled", False))), state.get("rsi_reset_enabled", False)),
         "rsi_enabled": coerce_bool(entry.get("rsi_enabled", fallback.get("rsi_enabled", state.get("rsi_enabled", True))), True),
+        "rsi_refresh_nonce": str(entry.get("rsi_refresh_nonce", fallback.get("rsi_refresh_nonce", "")) or ""),
+        "rules_config": normalize_rules_config(entry.get("rules_config", fallback.get("rules_config", default_rules_config()))),
         "ntfy_topic": safe_ntfy_topic(entry.get("ntfy_topic", fallback.get("ntfy_topic", ""))),
         "wallet_addresses": normalize_wallet_addresses(entry.get("wallet_addresses", fallback.get("wallet_addresses", []))),
         "check_interval": optional_bounded_int(entry.get("check_interval", fallback.get("check_interval")), 5, 86400),
@@ -534,6 +575,14 @@ def get_token_state_summary():
     summary = []
     for token in state.get("tokens", []):
         token_state = token_states.get(token["mint"], {})
+        if not isinstance(token_state, dict):
+            token_state = {}
+        rules_state = stale_rules_state(
+            token_state.get("rules_state"),
+            token.get("rules_config"),
+            stale_after_seconds=COMMUNITY_RULES_STALE_SECONDS,
+            global_enabled=community_rules_effective_enabled(),
+        )
         effective_check_interval = optional_bounded_int(token.get("check_interval"), 5, 86400) or state["check_interval"]
         effective_rsi_check_interval = optional_bounded_int(token.get("rsi_check_interval"), 1, 43200) or state["rsi_check_interval"]
         rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
@@ -560,6 +609,7 @@ def get_token_state_summary():
             "enabled": token.get("enabled", True),
             "buy_price": token_state.get("buy_price"),
             "sell_price": token_state.get("sell_price"),
+            "rules_state": rules_state,
             "rsi": rsi_value,
             "rsi_status": rsi_status,
             "last_checked": token_state.get("timestamp"),
@@ -631,6 +681,8 @@ state = {
     "solanatracker_rate_limit_mode": normalize_rate_limit_mode(os.getenv("SOLANATRACKER_RATE_LIMIT_MODE"), os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND")),
     "solanatracker_requests_per_second": clamp_float(os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND", "1"), 1.0, 0.1, 50.0),
     "solanatracker_features_enabled": solanatracker_features_default(),
+    "community_rules_enabled": coerce_bool(os.getenv("COMMUNITY_RULES_ENABLED"), True) and jupiter_api_key_configured(),
+    "community_rules_refresh_nonce": "",
     "ntfy_topic": "",
     "input_decimals": _optional_decimals(os.getenv("INPUT_DECIMALS")),
     "output_decimals": _optional_decimals(os.getenv("OUTPUT_DECIMALS")),
@@ -647,7 +699,7 @@ state = {
     # WALLET CONFIG
     "wallet_addresses": [],               # list of Solana wallet strings
     "wallet_refresh_minutes": 120,         # default refresh interval
-    "schema_version": 3,
+    "schema_version": 5,
     "tokens": [],
     "active_token_mint": os.getenv("OUTPUT_MINT"),
 }
@@ -733,6 +785,7 @@ def load_env_defaults():
         state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(os.getenv("SOLANATRACKER_RATE_LIMIT_MODE", state["solanatracker_rate_limit_mode"]), os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND", state["solanatracker_requests_per_second"]))
         state["solanatracker_requests_per_second"] = clamp_float(os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND", state["solanatracker_requests_per_second"]), 1.0, 0.1, 50.0)
         state["solanatracker_features_enabled"] = coerce_bool(os.getenv("SOLANATRACKER_ENABLED", os.getenv("SOLANATRACKER_FEATURES_ENABLED", state["solanatracker_features_enabled"])), state["solanatracker_features_enabled"])
+        state["community_rules_enabled"] = coerce_bool(os.getenv("COMMUNITY_RULES_ENABLED", state["community_rules_enabled"]), state["community_rules_enabled"]) and jupiter_api_key_configured()
         apply_solanatracker_rate_limit()
         state["input_decimals"] = _optional_decimals(os.getenv("INPUT_DECIMALS", state["input_decimals"] or ""))
         state["output_decimals"] = _optional_decimals(os.getenv("OUTPUT_DECIMALS", state["output_decimals"] or ""))
@@ -766,6 +819,8 @@ def load_state():
             state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(cfg.get("solanatracker_rate_limit_mode", state["solanatracker_rate_limit_mode"]), cfg.get("solanatracker_requests_per_second", state["solanatracker_requests_per_second"]))
             state["solanatracker_requests_per_second"] = clamp_float(cfg.get("solanatracker_requests_per_second", state["solanatracker_requests_per_second"]), state["solanatracker_requests_per_second"], 0.1, 50.0)
             state["solanatracker_features_enabled"] = coerce_bool(cfg.get("solanatracker_features_enabled", state["solanatracker_features_enabled"]), state["solanatracker_features_enabled"])
+            state["community_rules_enabled"] = coerce_bool(cfg.get("community_rules_enabled", state["community_rules_enabled"]), state["community_rules_enabled"]) and jupiter_api_key_configured()
+            state["community_rules_refresh_nonce"] = str(cfg.get("community_rules_refresh_nonce") or "")
             apply_solanatracker_rate_limit()
             state["ntfy_topic"] = safe_ntfy_topic(cfg.get("ntfy_topic", state.get("ntfy_topic", "")))
             state["input_decimals"] = _optional_decimals(cfg.get("input_decimals", state["input_decimals"]))
@@ -816,6 +871,8 @@ def write_config():
             "solanatracker_rate_limit_mode": state["solanatracker_rate_limit_mode"],
             "solanatracker_requests_per_second": state["solanatracker_requests_per_second"],
             "solanatracker_features_enabled": state["solanatracker_features_enabled"],
+            "community_rules_enabled": state["community_rules_enabled"],
+            "community_rules_refresh_nonce": state["community_rules_refresh_nonce"],
             "ntfy_topic": safe_ntfy_topic(state.get("ntfy_topic")),
             "input_decimals": state["input_decimals"],
             "output_decimals": state["output_decimals"],
@@ -826,7 +883,7 @@ def write_config():
             "rsi_enabled": state["rsi_enabled"],
             "wallet_addresses": normalize_wallet_addresses(state["wallet_addresses"]),
             "wallet_refresh_minutes": state["wallet_refresh_minutes"],
-            "schema_version": 3,
+            "schema_version": 5,
             "tokens": state["tokens"],
             "active_token_mint": state["active_token_mint"],
         })
@@ -861,6 +918,88 @@ def write_state(include_triggers=True):
     except Exception as e:
         print(f"Failed to write jupiter-latest.json: {e}")
 
+
+
+def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, rules_global_enabled=None):
+    """Make config transitions visible immediately without replacing unrelated runtime state."""
+    mint = str((token or {}).get("mint") or "").strip()
+    if not mint:
+        return
+    try:
+        with json_file_lock(STATE_PATH):
+            existing = read_json_file(STATE_PATH)
+            token_states = existing.get("token_states", {})
+            if not isinstance(token_states, dict):
+                token_states = {}
+            token_state = token_states.get(mint, {})
+            if not isinstance(token_state, dict):
+                token_state = {}
+
+            if rsi_status in {"waiting", "disabled"}:
+                rsi_error = None if rsi_status == "waiting" else "RSI disabled for this token"
+                token_state.update({
+                    "latest_rsi": None,
+                    "latest_rsi_time": None,
+                    "rsi_status": rsi_status,
+                    "rsi_error": rsi_error,
+                    "rsi_last_fetch_at": None,
+                    "rsi_refresh_nonce": token.get("rsi_refresh_nonce", ""),
+                })
+                if mint == state.get("active_token_mint"):
+                    existing.update({
+                        "latest_rsi": None,
+                        "latest_rsi_time": None,
+                        "rsi_status": rsi_status,
+                        "rsi_error": rsi_error,
+                        "rsi_last_fetch_at": None,
+                    })
+
+            if rules_changed:
+                config = normalize_rules_config(token.get("rules_config"))
+                active_rules = [item for item in config["items"] if item["enabled"]]
+                signature = rules_config_signature(config)
+                previous_rules = token_state.get("rules_state")
+                previous_rules = previous_rules if isinstance(previous_rules, dict) else {}
+                same_rules_config = previous_rules.get("config_signature") == signature
+                previous_alert_state = previous_rules.get("alert_state")
+                if not same_rules_config or not isinstance(previous_alert_state, dict):
+                    previous_alert_state = {
+                        "armed": True,
+                        "fired": False,
+                        "last_sent_at": None,
+                        "last_delivery_error": None,
+                    }
+
+                global_enabled = community_rules_effective_enabled() if rules_global_enabled is None else coerce_bool(rules_global_enabled, True) and jupiter_api_key_configured()
+                if not global_enabled:
+                    rules_status = "global_disabled"
+                elif not config["enabled"]:
+                    rules_status = "disabled"
+                elif not active_rules:
+                    rules_status = "not_configured"
+                else:
+                    rules_status = "waiting"
+                token_state["rules_state"] = {
+                    "status": rules_status,
+                    "items": [],
+                    "enabled_count": len(active_rules),
+                    "evaluated_at": None,
+                    "status_updated_at": datetime.now(timezone.utc).isoformat(),
+                    "confirmed_ready": False,
+                    "pass_streak": 0,
+                    "fail_streak": 0,
+                    "confirmation_required": CONFIRMATION_SAMPLES,
+                    "config_signature": signature,
+                    "alert_enabled": config["alert_enabled"],
+                    "alert_mode": config["alert_mode"],
+                    "alert_state": dict(previous_alert_state),
+                }
+
+            token_states[mint] = token_state
+            existing["token_states"] = token_states
+            atomic_write_json(STATE_PATH, existing)
+    except Exception as exc:
+        print(f"Failed to update cached token state for {mint}: {exc}")
 
 
 def update_active_token_trigger_cache(side, key, timestamp=None, remove=False):
@@ -1092,6 +1231,7 @@ class RsiDelete(BaseModel):
 
 
 class RuntimeSettings(BaseModel):
+    community_rules_enabled: Optional[bool] = None
     check_interval: Optional[int] = None
     rsi_check_interval: Optional[int] = None
     solanatracker_requests_per_second: Optional[float] = None
@@ -1113,6 +1253,7 @@ class TokenPayload(BaseModel):
     rsi_interval: Optional[str] = None
     rsi_reset_enabled: Optional[bool] = None
     rsi_enabled: Optional[bool] = None
+    rules_config: Optional[Dict[str, Any]] = None
 
 
 class TokenUpdatePayload(BaseModel):
@@ -1123,6 +1264,7 @@ class TokenUpdatePayload(BaseModel):
     rsi_interval: Optional[str] = None
     rsi_reset_enabled: Optional[bool] = None
     rsi_enabled: Optional[bool] = None
+    rules_config: Optional[Dict[str, Any]] = None
 
 
 class ActiveTokenPayload(BaseModel):
@@ -1168,6 +1310,11 @@ async def get_state():
         "solanatracker_api_key_configured": solanatracker_api_key_configured(),
         "solanatracker_features_enabled": state["solanatracker_features_enabled"],
         "solanatracker_enabled": solanatracker_effective_enabled(),
+        "community_rules_enabled": community_rules_effective_enabled(),
+        "jupiter_api_key_configured": jupiter_api_key_configured(),
+        "jupiter_requests_per_second": JUPITER_REQUESTS_PER_SECOND,
+        "community_rules_jupiter_requests_per_second": COMMUNITY_RULES_JUPITER_REQUESTS_PER_SECOND,
+        "community_rules_check_interval": COMMUNITY_RULES_CHECK_INTERVAL,
         "ntfy_topic": safe_ntfy_topic(state.get("ntfy_topic")),
         "ntfy_effective_topic": effective_global_ntfy_topic(),
         "ntfy_configured": bool(effective_global_ntfy_topic()),
@@ -1212,6 +1359,12 @@ async def add_token(payload: TokenPayload):
         clean_ntfy_topic = normalize_ntfy_topic(payload.ntfy_topic)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    try:
+        clean_rules_config = normalize_rules_config(payload.rules_config, strict=True)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if clean_rules_config["enabled"] and not jupiter_api_key_configured():
+        raise HTTPException(status_code=400, detail="JUPITER_API_KEY is required to enable Action Rules")
 
     validation = await validate_token(payload)
     mint = validation["mint"]
@@ -1229,6 +1382,7 @@ async def add_token(payload: TokenPayload):
         "rsi_interval": state["rsi_interval"],
         "rsi_reset_enabled": state["rsi_reset_enabled"],
         "rsi_enabled": coerce_bool(payload.rsi_enabled, True),
+        "rules_config": clean_rules_config,
         "ntfy_topic": clean_ntfy_topic,
         "check_interval": payload.check_interval,
         "rsi_check_interval": payload.rsi_check_interval,
@@ -1240,6 +1394,7 @@ async def add_token(payload: TokenPayload):
         state["active_token_mint"] = token["mint"]
         apply_active_token_to_legacy()
     write_config()
+    update_token_cached_states(token, rules_changed=True)
     return {"success": True, "token": token}
 
 
@@ -1248,6 +1403,19 @@ async def add_token(payload: TokenPayload):
 async def update_token(mint: str, payload: TokenUpdatePayload):
     token = find_token_or_404(mint)
     fields = provided_fields(payload)
+    old_rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
+    rsi_transition = None
+    clean_rules_config = None
+    existing_rules_config = normalize_rules_config(token.get("rules_config"))
+    existing_rules_signature = rules_config_signature(existing_rules_config)
+    if "rules_config" in fields:
+        existing_rules_enabled = existing_rules_config["enabled"]
+        try:
+            clean_rules_config = normalize_rules_config(payload.rules_config, strict=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if clean_rules_config["enabled"] and not existing_rules_enabled and not jupiter_api_key_configured():
+            raise HTTPException(status_code=400, detail="JUPITER_API_KEY is required to enable Action Rules")
 
     if "name" in fields:
         token["name"] = str(payload.name or short_mint(token["mint"])).strip()[:40]
@@ -1266,10 +1434,35 @@ async def update_token(mint: str, payload: TokenUpdatePayload):
         token["rsi_reset_enabled"] = coerce_bool(payload.rsi_reset_enabled, token.get("rsi_reset_enabled", False))
     if "rsi_enabled" in fields:
         token["rsi_enabled"] = coerce_bool(payload.rsi_enabled, token.get("rsi_enabled", True))
+        if token["rsi_enabled"] != old_rsi_enabled:
+            token["rsi_refresh_nonce"] = datetime.now(timezone.utc).isoformat()
+            rsi_transition = "waiting" if token["rsi_enabled"] else "disabled"
+    if clean_rules_config is not None:
+        token["rules_config"] = clean_rules_config
+        rules_changed = rules_config_signature(clean_rules_config) != existing_rules_signature
+    else:
+        rules_changed = False
 
     if token["mint"] == state.get("active_token_mint"):
         apply_active_token_to_legacy()
     write_config()
+    update_token_cached_states(token, rsi_status=rsi_transition, rules_changed=rules_changed)
+    if rules_changed and clean_rules_config is not None:
+        previous_enabled = {
+            item["type"] for item in existing_rules_config["items"]
+            if existing_rules_config["enabled"] and item["enabled"]
+        }
+        next_enabled = {
+            item["type"] for item in clean_rules_config["items"]
+            if clean_rules_config["enabled"] and item["enabled"]
+        }
+        stopped_types = previous_enabled - next_enabled
+        if stopped_types:
+            try:
+                mark_rule_history_gaps(token["mint"], existing_rules_config, rule_types=stopped_types)
+            except Exception as e:
+                print(f"Failed to mark Action Rule history gap for {token['mint']}: {e}", flush=True)
+
     return {"success": True, "token": token, "summary": get_token_state_summary()}
 
 
@@ -1329,7 +1522,31 @@ async def delete_token(mint: str):
     write_config()
     prune_pnl_cache(mint)
     prune_token_state(mint)
+    try:
+        delete_rule_history(mint)
+    except Exception as e:
+        print(f"Failed to remove Action Rule history for {mint}: {e}", flush=True)
+
     return {"success": True}
+
+
+@app.get("/api/tokens/{mint}/rule-history")
+async def token_rule_history(mint: str, rule_type: str, window: str = "7d"):
+    token = find_token_or_404(mint)
+    if not jupiter_api_key_configured():
+        raise HTTPException(status_code=400, detail="JUPITER_API_KEY is required for Action Rule history")
+    normalized = normalize_rules_config(token.get("rules_config"))
+    configured_types = {item["type"] for item in normalized["items"]}
+    if rule_type not in configured_types:
+        raise HTTPException(status_code=404, detail="This Action Rule is not configured for the token")
+    if window not in HISTORY_WINDOWS:
+        raise HTTPException(status_code=400, detail="History window must be 24h, 7d, 30d, or 90d")
+    try:
+        return get_rule_history(mint, rule_type, window)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Action Rule history is temporarily unavailable: {e}")
 
 
 @app.post("/api/settings")
@@ -1337,19 +1554,38 @@ async def update_settings(settings: RuntimeSettings):
     fields = provided_fields(settings)
     old_input_decimals = state.get("input_decimals")
     old_output_decimals = state.get("output_decimals")
+    old_solanatracker_enabled = coerce_bool(state.get("solanatracker_features_enabled"), True)
+    old_community_rules_enabled = coerce_bool(state.get("community_rules_enabled"), True)
+    community_rules_transition = None
+    # Validate the complete request before mutating state. A rejected multi-setting
+    # save must not partially apply an earlier field in memory.
+    if settings.check_interval is not None and settings.check_interval < 5:
+        raise HTTPException(status_code=400, detail="Check interval must be at least 5 seconds")
+    if settings.rsi_check_interval is not None and settings.rsi_check_interval < 1:
+        raise HTTPException(status_code=400, detail="RSI check interval must be at least 1 minute")
+    if "solanatracker_rate_limit_mode" in fields:
+        raw_mode_for_validation = str(settings.solanatracker_rate_limit_mode or "safe").strip().lower()
+        if raw_mode_for_validation not in {"safe", "custom", "off", "disabled", "none"}:
+            raise HTTPException(status_code=400, detail="Invalid SolanaTracker rate limit mode")
+    if "community_rules_enabled" in fields:
+        requested_rules_for_validation = coerce_bool(settings.community_rules_enabled, state["community_rules_enabled"])
+        if requested_rules_for_validation and not jupiter_api_key_configured():
+            raise HTTPException(status_code=400, detail="Add JUPITER_API_KEY before enabling Action Rules")
+    if "ntfy_topic" in fields:
+        try:
+            normalized_ntfy_topic = normalize_ntfy_topic(settings.ntfy_topic)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    if "input_decimals" in fields and settings.input_decimals is not None and not 0 <= settings.input_decimals <= 12:
+        raise HTTPException(status_code=400, detail="Input decimals must be between 0 and 12")
+    if "output_decimals" in fields and settings.output_decimals is not None and not 0 <= settings.output_decimals <= 12:
+        raise HTTPException(status_code=400, detail="Output decimals must be between 0 and 12")
     if settings.check_interval is not None:
-        if settings.check_interval < 5:
-            raise HTTPException(status_code=400, detail="Check interval must be at least 5 seconds")
         state["check_interval"] = settings.check_interval
     if settings.rsi_check_interval is not None:
-        if settings.rsi_check_interval < 1:
-            raise HTTPException(status_code=400, detail="RSI check interval must be at least 1 minute")
         state["rsi_check_interval"] = settings.rsi_check_interval
     if "solanatracker_rate_limit_mode" in fields:
-        raw_mode = str(settings.solanatracker_rate_limit_mode or "safe").strip().lower()
-        if raw_mode not in {"safe", "custom", "off", "disabled", "none"}:
-            raise HTTPException(status_code=400, detail="Invalid SolanaTracker rate limit mode")
-        state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(raw_mode)
+        state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(raw_mode_for_validation)
     if settings.solanatracker_requests_per_second is not None:
         state["solanatracker_requests_per_second"] = clamp_float(
             settings.solanatracker_requests_per_second,
@@ -1359,22 +1595,48 @@ async def update_settings(settings: RuntimeSettings):
         )
     if "solanatracker_features_enabled" in fields:
         state["solanatracker_features_enabled"] = coerce_bool(settings.solanatracker_features_enabled, state["solanatracker_features_enabled"])
+        if state["solanatracker_features_enabled"] != old_solanatracker_enabled:
+            refresh_nonce = datetime.now(timezone.utc).isoformat()
+            for token in state.get("tokens", []):
+                token["rsi_refresh_nonce"] = refresh_nonce
+                token_rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
+                next_status = "waiting" if state["solanatracker_features_enabled"] and token_rsi_enabled else "disabled"
+                update_token_cached_states(token, rsi_status=next_status)
+    if "community_rules_enabled" in fields:
+        state["community_rules_enabled"] = requested_rules_for_validation
+        if state["community_rules_enabled"] != old_community_rules_enabled:
+            state["community_rules_refresh_nonce"] = datetime.now(timezone.utc).isoformat()
+            community_rules_transition = state["community_rules_enabled"]
     apply_solanatracker_rate_limit()
     if "ntfy_topic" in fields:
-        try:
-            state["ntfy_topic"] = normalize_ntfy_topic(settings.ntfy_topic)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        state["ntfy_topic"] = normalized_ntfy_topic
     if "input_decimals" in fields:
-        if settings.input_decimals is not None and (settings.input_decimals < 0 or settings.input_decimals > 12):
-            raise HTTPException(status_code=400, detail="Input decimals must be between 0 and 12")
         state["input_decimals"] = settings.input_decimals
     if "output_decimals" in fields:
-        if settings.output_decimals is not None and (settings.output_decimals < 0 or settings.output_decimals > 12):
-            raise HTTPException(status_code=400, detail="Output decimals must be between 0 and 12")
         state["output_decimals"] = settings.output_decimals
 
     write_config()
+    if community_rules_transition is not None:
+        for token in state.get("tokens", []):
+            update_token_cached_states(
+                token,
+                rules_changed=True,
+                rules_global_enabled=community_rules_transition,
+            )
+            if not community_rules_transition:
+                config = normalize_rules_config(token.get("rules_config"))
+                enabled_types = {
+                    item["type"] for item in config["items"]
+                    if config["enabled"] and item["enabled"]
+                }
+                try:
+                    mark_rule_history_gaps(
+                        token.get("mint"), config, rule_types=enabled_types,
+                        reason="Action Rules were disabled globally",
+                        observed_at=state.get("community_rules_refresh_nonce"),
+                    )
+                except Exception as e:
+                    print(f"Failed to mark global Action Rule history gap for {token.get('mint')}: {e}", flush=True)
     if state.get("input_decimals") != old_input_decimals or state.get("output_decimals") != old_output_decimals:
         clear_active_price_history()
     return {"success": True}
@@ -1938,14 +2200,12 @@ async def get_pnl(wallet: str, token: str):
         raise HTTPException(status_code=400, detail="Wallet address is required")
     return fetch_pnl_batch_results([clean_wallet], token, api_key).get(clean_wallet, empty_pnl_result())
 
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+FRONTEND_DIR = os.getenv("FRONTEND_DIR", "frontend")
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 @app.get("/{full_path:path}")
 async def serve_index(full_path: str):
-    index_path = os.path.join("frontend", "index.html")
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
     raise HTTPException(status_code=404, detail="Page not found")
-
-
-

@@ -424,7 +424,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         backend = import_backend_module()
         trigger_key = "above:70.00"
         buy_key = "0.12345678"
-        history_point = {"timestamp": "2026-06-24T12:00:00+00:00", "buy_price": 1.23, "sell_price": 1.24}
+        history_point = {"timestamp": datetime.now(timezone.utc).isoformat(), "buy_price": 1.23, "sell_price": 1.24}
         existing = {
             "token_price_history": {SOL_MINT: [history_point]},
             "token_states": {
@@ -877,6 +877,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         original_get = jupiter_quote.requests.get
         original_throttle = jupiter_quote.throttle
         calls = []
+        original_api_key = os.environ.get("JUPITER_API_KEY")
 
         class Response:
             status_code = 200
@@ -890,6 +891,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
 
         try:
             jupiter_quote.throttle = lambda: calls.append(("throttle", None, None))
+            os.environ.pop("JUPITER_API_KEY", None)
 
             def fake_get(url, params=None, timeout=10):
                 calls.append(("get", url, params))
@@ -907,5 +909,9 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         finally:
             jupiter_quote.requests.get = original_get
             jupiter_quote.throttle = original_throttle
+            if original_api_key is None:
+                os.environ.pop("JUPITER_API_KEY", None)
+            else:
+                os.environ["JUPITER_API_KEY"] = original_api_key
 if __name__ == "__main__":
     unittest.main()

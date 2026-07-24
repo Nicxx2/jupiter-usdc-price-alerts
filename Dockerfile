@@ -29,6 +29,8 @@ FROM python:3.12-slim
 
 # Create app directory
 WORKDIR /app
+COPY community_rules.py /app/
+COPY rule_history.py /app/
 
 # Copy scripts and dependencies
 COPY --from=base /usr/local /usr/local

@@ -14,7 +14,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v3.1.1
+# 🚀 Jupiter USDC Price Alerts v3.3
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -22,7 +22,61 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 
 ---
 
-## ✨ What's New in v3.1.1
+## ✨ What's New in v3.3
+
+### 📈 Per-rule Action Readiness trends
+- Open the dedicated graph button on any enabled rule card to switch safely between its live value and its history.
+- Choose **24h, 7d, 30d, or 90d** views on desktop or mobile; each coin and rule remembers its own view and range in that browser.
+- Actual readings are plotted against the rule target, including stepped target changes and separate price-impact scenario segments.
+
+### 🛡️ Truthful gaps and provider timing
+- Rule Trends reuse completed Action Readiness evaluations and make **no additional Jupiter requests**.
+- Only fresh, finite readings are saved. Unknown, stale, malformed, disabled, and interrupted periods appear as gaps and are never converted to zero.
+- Jupiter token metrics are deduplicated by the provider's source timestamp, while live price-impact quotes use their own quote timestamp.
+
+### 💾 Bounded, isolated history
+- Trend history is stored in `/shared/action-rules-history.sqlite3`, separately from current readiness, configuration, alerts, and price history.
+- Recent readings stay detailed, older readings are progressively downsampled, and retention is bounded to 90 days by default.
+- History endpoints return a mobile-safe bounded number of points, and deleting a tracked coin also deletes its rule history.
+- A history storage problem cannot stop current Action Readiness checks or alerts.
+
+### 📱 Focused responsive cards
+- A dedicated 36px graph control prevents accidental card activation and keeps the current Pass / Not passed / Unknown status visible.
+- Charts use compact labels and tap-friendly tooltips, disable animation for motion safety, and explain gaps and the latest valid reading.
+
+---
+
+## ✨ What's New in v3.2
+
+### ✅ Action Rules and Action Readiness
+- Create independent per-coin conditions for holder count, market cap, liquidity, 24-hour volume, sell pressure, volume/liquidity ratio, and maximum Jupiter sell-quote price impact.
+- See each rule's **current value**, **target**, and **Pass / Not passed / Unknown** result in a responsive Action Readiness card.
+- Enable or disable Action Rules globally or per coin while preserving every coin's saved configuration.
+- Jupiter-reported holder counts are clearly identified as provider data and may differ slightly from other indexers.
+
+### 🔔 Confirmed Action Rules alerts
+- Optionally send an ntfy alert when every enabled rule has passed two fresh checks.
+- Choose a **send once** alert or **re-arm** after two confirmed failures followed by two new passes.
+- Stale, missing, malformed, or zero-denominator data stays **Unknown** and cannot trigger an alert.
+- Per-coin ntfy topics override the global topic, and delivery failures retry on later checks without repeating a successfully completed one-time alert.
+
+### 🔌 Safe Jupiter integration
+- The optional `JUPITER_API_KEY` is used only by Action Rules for Tokens V2 data and authenticated sell quotes.
+- Without that key, Action Rules remain unavailable while the existing keyless Jupiter price monitor and price alerts continue unchanged.
+- Action Rules use a separate conservative limiter, batch metadata for up to 100 mints, and retry only transient failures such as timeouts, `429`, and server errors.
+- Permanent `4xx` errors stop only the current retry burst; the next scheduled refresh still tries again normally.
+- Signed Swap V2 price impact is normalized into adverse percentage points so a negative signed value cannot incorrectly pass a maximum-impact rule.
+
+### 📱 UI and long-running reliability
+- Action Readiness starts as a compact, expandable status bar, remembers each coin's browser expand/collapse preference, and stays responsive on desktop and mobile.
+- When `JUPITER_API_KEY` is blank or Action Rules are globally disabled, Action Readiness and Rules indicators stay hidden from the main dashboard; Settings clearly explains the inactive state. A global visibility change only takes effect after Settings is saved.
+- Settings displays the effective Action Rules refresh interval and isolated limiter from Docker/ENV configuration.
+- Global/per-coin transitions, restarts, stale gaps, unrelated token edits, and alert state persistence are handled without false-ready alerts.
+- Re-enabling RSI now shows a waiting state immediately instead of briefly reporting that RSI is still disabled.
+
+---
+
+## 🧾 What's New in v3.1.1
 
 ### 🪙 Multi-token monitoring
 - Track multiple output tokens from the web UI while keeping Docker Compose as the simple default setup.
@@ -186,8 +240,25 @@ services:
       SOLANATRACKER_RATE_LIMIT_MODE: safe
       SOLANATRACKER_REQUESTS_PER_SECOND: 1
 
-      # Jupiter keyless quote limiter. Default matches public keyless access.
+      # Optional and used only by Action Rules. Existing prices remain keyless.
+      # Leave blank to keep Action Rules unavailable; create one at https://portal.jup.ag.
+      JUPITER_API_KEY: ""
+
+      # Existing keyless price-monitor limiter (unchanged by Action Rules).
       JUPITER_REQUESTS_PER_SECOND: 0.5
+
+      # Separate authenticated limiter used only by Action Rules.
+      COMMUNITY_RULES_JUPITER_REQUESTS_PER_SECOND: 0.5
+      # This is forced off automatically while JUPITER_API_KEY is blank.
+      COMMUNITY_RULES_ENABLED: "true"
+      COMMUNITY_RULES_CHECK_INTERVAL: 120
+      COMMUNITY_RULES_STALE_SECONDS: 360
+      COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS: 90
+      COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS: 3600
+      # Rule Trends reuse Action Readiness results and add no Jupiter calls.
+      COMMUNITY_RULES_HISTORY_PATH: /shared/action-rules-history.sqlite3
+      COMMUNITY_RULES_HISTORY_RETENTION_DAYS: 90
+      COMMUNITY_RULES_HISTORY_MAX_POINTS: 480
 
       # --- Simulated Swap Settings ---
 
@@ -292,6 +363,7 @@ You’ll be able to:
 - View real-time buy/sell prices for the active token
 - Add, validate, remove, and switch between multiple tracked tokens from the web UI
 - Keep each token's simulated USD amount, buy/sell alerts, RSI alerts, RSI interval, RSI reset mode, RSI on/off preference, decimals, ntfy topic, and check intervals isolated
+- With the optional feature-only `JUPITER_API_KEY`, configure independent per-coin Action Rules for holders, market cap, liquidity, 24h volume, sell pressure, volume/liquidity, and Jupiter sell-quote price impact, with pass/fail/unknown status and optional confirmed ntfy alerts
 - Enable/disable SolanaTracker globally, choose safe/custom/off rate management, and see the RSI check interval plus monthly call estimate from settings
 - See when each alert was triggered and reset individual alert cooldowns
 - Watch token-scoped chart history with selectable 2h, 4h, 6h, 12h, and 24h windows
@@ -355,6 +427,27 @@ Open the app and **subscribe to your topic** (e.g. `token-alerts`).
 - 🧲 `linux/arm/v7` (Raspberry Pi 3 and older ARM chips)
 
 ---
+
+## v3.3 Production Notes
+
+- Rule history begins with the first fresh evaluation after upgrading; the app does not invent or backfill older readings.
+- `/shared/action-rules-history.sqlite3` is created automatically in the existing persistent volume. No existing JSON migration is required.
+- Current readiness and alerts do not depend on history storage. SQLite write or read failures are isolated and reported without changing rule outcomes.
+- Fresh recent points remain detailed. Points older than 7 days are compacted into 15-minute buckets, points older than 30 days into hourly buckets, and points older than the configured retention are deleted.
+- Each history response is capped and downsampled for responsive mobile charts. Unknown and disabled periods remain explicit gaps.
+- Price-impact trend segments include the configured tracked-USDC or custom-token scenario so different simulated sell amounts are not presented as one continuous series.
+
+---
+
+## v3.2 Production Notes
+
+- Existing `/shared/config.json` and `jupiter-latest.json` data remain compatible. Internal `community_rules_*` keys are intentionally retained so upgrades do not lose saved settings.
+- Add `JUPITER_API_KEY` to Docker Compose and restart the container before enabling Action Rules. The key is not added to existing keyless price requests.
+- Action Rules default to a separate `0.5` requests/second limiter and a 120-second refresh interval. Missing or stale provider data fails safely to **Unknown**.
+- The Action Readiness result is a market snapshot based on user-selected conditions, not financial advice or an execution guarantee.
+
+---
+
 ## v3.1.1 Production Notes
 
 - The web UI now has a settings button next to dark mode for runtime settings. Docker Compose values remain the defaults; UI edits are persisted into `/shared/config.json`.

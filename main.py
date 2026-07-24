@@ -6,7 +6,17 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
-from jupiter_quote import JupiterQuoteError, quote_out_amount_raw
+from jupiter_quote import JupiterQuoteError, get_quote, get_token_information, price_impact_percent
+from community_rules import (
+    advance_alert_state,
+    evaluate_rules,
+    mark_alert_delivery,
+    normalize_rules_config,
+    rules_alert_message,
+    rules_config_signature,
+    rules_require_price_impact,
+)
+from rule_history import record_rule_history
 from rsi_utils import get_latest_rsi
 from solana_rate_limiter import configure_rate_limit
 from typing import Dict, Any, Optional
@@ -25,10 +35,12 @@ def coerce_int(value, default, minimum=None, maximum=None):
 
 def coerce_float(value, default, minimum=None, maximum=None):
     try:
+        if isinstance(value, bool):
+            raise ValueError
         number = float(value)
         if not (number == number) or number in (float("inf"), float("-inf")):
             raise ValueError
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = default
     if minimum is not None:
         number = max(minimum, number)
@@ -101,8 +113,8 @@ apply_solanatracker_rate_limit()
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-shared_json_path = "/shared/jupiter-latest.json"
-config_json_path = "/shared/config.json"
+shared_json_path = os.getenv("SHARED_STATE_PATH", "/shared/jupiter-latest.json")
+config_json_path = os.getenv("CONFIG_PATH", "/shared/config.json")
 
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
@@ -124,6 +136,14 @@ TOKEN_CHANGED_SINCE_LAST_WRITE = False
 TOKEN_RUNTIMES: Dict[str, Dict[str, Any]] = {}
 SCHEDULER_LAST_CHECK: Dict[str, float] = {}
 SCHEDULER_CURSOR = 0
+COMMUNITY_RULES_CHECK_INTERVAL = env_int("COMMUNITY_RULES_CHECK_INTERVAL", 120, minimum=60, maximum=3600)
+COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS", 90, minimum=30, maximum=3600)
+COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS", 3600, minimum=300, maximum=86400)
+LAST_COMMUNITY_RULES_REFRESH = 0.0
+LAST_COMMUNITY_RULES_CONFIG_SIGNATURE = ""
+QUOTE_CACHE: Dict[tuple, Dict[str, Any]] = {}
+ACTIVE_RSI_REFRESH_NONCE = ""
+
 PRICE_HISTORY_RETENTION_HOURS = 24
 PRICE_HISTORY_MAX_POINTS_PER_TOKEN = 3000
 
@@ -149,8 +169,12 @@ def _optional_int(value):
     try:
         if value is None or value == "":
             return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, float) and not value.is_integer():
+            return None
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -211,11 +235,11 @@ def token_label(token_config):
     return str(token_config.get("name") or short_mint(token_config.get("mint"))).strip() or short_mint(token_config.get("mint"))
 
 
-def token_ntfy_topic(token_config):
+def token_ntfy_topic(token_config, inherited_topic=None):
     token_topic = normalize_ntfy_topic((token_config or {}).get("ntfy_topic"))
     if token_topic:
         return token_topic, "custom"
-    global_topic = normalize_ntfy_topic(NTFY_TOPIC)
+    global_topic = normalize_ntfy_topic(NTFY_TOPIC if inherited_topic is None else inherited_topic)
     if global_topic:
         return global_topic, "inherited"
     return "", "disabled"
@@ -346,6 +370,7 @@ def get_token_runtime(mint):
         "rsi_status": token_state.get("rsi_status") or ("waiting" if solanatracker_effective_enabled() else "disabled"),
         "rsi_error": token_state.get("rsi_error"),
         "rsi_last_fetch_at": token_state.get("rsi_last_fetch_at"),
+        "rsi_refresh_nonce": token_state.get("rsi_refresh_nonce", ""),
     }
     TOKEN_RUNTIMES[mint] = runtime
     return runtime
@@ -604,6 +629,8 @@ def load_dynamic_config():
     global USD_AMOUNT, BUY_ALERTS, SELL_ALERTS, ALERT_RESET_MINUTES, CHECK_INTERVAL
     global RSI_ALERTS_RAW, RSI_INTERVAL, RSI_RESET_ENABLED, RSI_CHECK_INTERVAL, RSI_ENABLED
     global SOLANATRACKER_RATE_LIMIT_MODE, SOLANATRACKER_REQUESTS_PER_SECOND, SOLANATRACKER_FEATURES_ENABLED, INPUT_DECIMALS, OUTPUT_DECIMALS, OUTPUT_MINT, ACTIVE_TOKEN_CONFIG, NTFY_TOPIC
+    global ACTIVE_RSI_REFRESH_NONCE, _last_rsi_at
+    global LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT
 
     token_changed = False
 
@@ -656,6 +683,15 @@ def load_dynamic_config():
                 RSI_INTERVAL = token_rsi_interval(active_token, cfg)
                 RSI_RESET_ENABLED = token_rsi_reset_enabled(active_token, cfg)
                 RSI_ENABLED = token_rsi_enabled(active_token, cfg)
+            refresh_nonce = str((active_token or {}).get("rsi_refresh_nonce") or "")
+            if refresh_nonce != ACTIVE_RSI_REFRESH_NONCE:
+                ACTIVE_RSI_REFRESH_NONCE = refresh_nonce
+                _last_rsi_at = None
+                LATEST_RSI = None
+                LATEST_RSI_TIME = None
+                LATEST_RSI_STATUS = "waiting" if not rsi_disabled_reason(active_token, cfg) else "disabled"
+                LATEST_RSI_ERROR = None if LATEST_RSI_STATUS == "waiting" else rsi_disabled_reason(active_token, cfg)
+                LATEST_RSI_LAST_FETCH_AT = None
             parse_rsi_alerts()
 
             state_data = read_json_file(shared_json_path)
@@ -749,27 +785,30 @@ def atomic_to_amount(raw_amount, decimals):
     return int(raw_amount) / (10 ** int(decimals))
 
 
-def send_alert(title, message, token_config=None):
+def send_alert(title, message, token_config=None, inherited_topic=None):
     token_config = token_config or ACTIVE_TOKEN_CONFIG
-    topic, source = token_ntfy_topic(token_config)
+    topic, source = token_ntfy_topic(token_config, inherited_topic=inherited_topic)
     if not topic:
         print("Alert skipped: no ntfy topic configured", flush=True)
-        return
+        return False
     try:
         mint = str((token_config or {}).get("mint") or OUTPUT_MINT)
         label = token_label(token_config)
         scoped_title = f"{title} - {label}"
         scoped_message = f"{message}\nToken: {label} ({mint})\nTopic source: {source}"
         url = f"{NTFY_SERVER.rstrip('/')}/{topic}"
-        requests.post(
+        response = requests.post(
             url,
             data=scoped_message.encode("utf-8"),
             headers={"Title": scoped_title, "Content-Type": "text/plain; charset=utf-8"},
             timeout=10,
         )
+        response.raise_for_status()
+        return True
     except Exception as e:
         print(f"Failed to send alert: {e}", flush=True)
 
+        return False
 
 def notify_backend_trigger(side: str, price: float):
     try:
@@ -797,7 +836,13 @@ def get_out_amount_raw(input_mint, output_mint, amount_lamports):
     The caller is responsible for converting raw token units with the output mint decimals.
     """
     try:
-        return quote_out_amount_raw(input_mint, output_mint, amount_lamports)
+        quote = get_quote(input_mint, output_mint, amount_lamports)
+        key = (str(input_mint), str(output_mint), int(amount_lamports))
+        QUOTE_CACHE[key] = {
+            "quote": quote,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return int(quote.get("outAmount", "0"))
     except JupiterQuoteError as e:
         print(f"Jupiter quote failed after retries: {e}", flush=True)
         return None
@@ -932,6 +977,7 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned, reco
                 active_rsi_triggers = {}
             if OUTPUT_MINT:
                 token_states[OUTPUT_MINT] = {
+                    **active_token_state,
                     "timestamp": timestamp,
                     "buy_price": round(price_buy, 8) if price_buy else None,
                     "sell_price": round(price_sell, 8) if price_sell else None,
@@ -942,6 +988,7 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned, reco
                     "rsi_status": LATEST_RSI_STATUS,
                     "rsi_error": LATEST_RSI_ERROR,
                     "rsi_enabled": RSI_ENABLED,
+                    "rsi_refresh_nonce": str((ACTIVE_TOKEN_CONFIG or {}).get("rsi_refresh_nonce") or ""),
                     "ntfy_topic": normalize_ntfy_topic((ACTIVE_TOKEN_CONFIG or {}).get("ntfy_topic")),
                     "ntfy_effective_topic": ntfy_topic,
                     "ntfy_topic_source": ntfy_source,
@@ -1014,7 +1061,11 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
             ntfy_topic, ntfy_source = token_ntfy_topic(token_config)
             append_token_price_history(existing, mint, timestamp, price_buy, price_sell)
             next_check_at = datetime.fromtimestamp(time.time() + check_interval, timezone.utc).isoformat()
+            current_token_state = token_states.get(mint, {})
+            if not isinstance(current_token_state, dict):
+                current_token_state = {}
             token_states[mint] = {
+                **current_token_state,
                 "timestamp": timestamp,
                 "next_check_at": next_check_at,
                 "name": token_label(token_config),
@@ -1027,6 +1078,7 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
                 "rsi_status": runtime.get("rsi_status"),
                 "rsi_error": runtime.get("rsi_error"),
                 "rsi_enabled": rsi_enabled,
+                "rsi_refresh_nonce": runtime.get("rsi_refresh_nonce", ""),
                 "rsi_last_fetch_at": runtime.get("rsi_last_fetch_at"),
                 "ntfy_topic": normalize_ntfy_topic((token_config or {}).get("ntfy_topic")),
                 "ntfy_effective_topic": ntfy_topic,
@@ -1051,8 +1103,231 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
         print(f"Failed to write scheduled token state for {mint}: {e}", flush=True)
 
 
+def configured_rule_tokens(cfg):
+    if not str(os.getenv("JUPITER_API_KEY") or "").strip():
+        return []
+    if isinstance(cfg, dict) and not coerce_bool(cfg.get("community_rules_enabled"), True):
+        return []
+    tokens = (cfg or {}).get("tokens")
+    if not isinstance(tokens, list):
+        return []
+    result = []
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        mint = str(token.get("mint") or "").strip()
+        config = normalize_rules_config(token.get("rules_config"))
+        if mint and config["enabled"]:
+            next_token = dict(token)
+            next_token["rules_config"] = config
+            result.append(next_token)
+    return result
+
+
+def cached_quote(input_mint, output_mint, amount_atomic, max_age_seconds=COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS):
+    cached = QUOTE_CACHE.get((str(input_mint), str(output_mint), int(amount_atomic)))
+    if not isinstance(cached, dict):
+        return None, None
+    fetched_at = parse_iso_to_utc(cached.get("fetched_at"))
+    if not fetched_at or (datetime.now(timezone.utc) - fetched_at).total_seconds() > max_age_seconds:
+        return None, None
+    quote = cached.get("quote")
+    return (quote, cached.get("fetched_at")) if isinstance(quote, dict) else (None, None)
+
+
+def fetch_rule_price_impact(token, token_info, config):
+    mint = str(token.get("mint") or "").strip()
+    decimals = _optional_decimals((token_info or {}).get("decimals"))
+    if decimals is None:
+        decimals = token_output_decimals(token)
+    if decimals is None:
+        return {"value": None, "error": "Jupiter did not report token decimals"}
+
+    scenario = config.get("sell_amount_mode", "tracked_usdc")
+    token_amount = None
+    if scenario == "token_amount":
+        token_amount = coerce_float(config.get("sell_token_amount"), 0, minimum=0)
+    else:
+        tracked_usdc = token_usd_amount(token)
+        usdc_atomic = amount_to_atomic(tracked_usdc, resolve_token_decimals(INPUT_MINT, token_input_decimals(token)))
+        buy_quote, _buy_checked_at = cached_quote(INPUT_MINT, mint, usdc_atomic)
+        if buy_quote:
+            token_amount_atomic = int(buy_quote.get("outAmount", "0"))
+            token_amount = atomic_to_amount(token_amount_atomic, decimals) if token_amount_atomic > 0 else None
+        else:
+            usd_price = coerce_float((token_info or {}).get("usdPrice"), 0, minimum=0)
+            if usd_price > 0:
+                token_amount = tracked_usdc / usd_price
+
+    if not token_amount or token_amount <= 0:
+        return {"value": None, "error": "Could not determine the sell amount for this rule"}
+    amount_atomic = amount_to_atomic(token_amount, decimals)
+    if amount_atomic <= 0:
+        return {"value": None, "error": "The configured sell amount is below one atomic token unit"}
+
+    quote, checked_at = cached_quote(mint, INPUT_MINT, amount_atomic)
+    if quote is None:
+        try:
+            quote = get_quote(mint, INPUT_MINT, amount_atomic, community_rules_request=True)
+            checked_at = datetime.now(timezone.utc).isoformat()
+            QUOTE_CACHE[(mint, str(INPUT_MINT), amount_atomic)] = {"quote": quote, "fetched_at": checked_at}
+        except JupiterQuoteError as exc:
+            return {"value": None, "error": str(exc)[:180]}
+
+    impact = price_impact_percent(quote)
+    if impact is None:
+        return {"value": None, "error": "Jupiter did not report price impact for this quote"}
+    return {
+        "value": impact,
+        "checked_at": checked_at,
+        "scenario": scenario,
+        "token_amount": token_amount,
+        "tracked_usdc": token_usd_amount(token) if scenario == "tracked_usdc" else None,
+        "estimated_usdc": atomic_to_amount(quote.get("outAmount", 0), resolve_token_decimals(INPUT_MINT, token_input_decimals(token))),
+    }
+
+
+def write_rule_states(updates):
+    if not updates:
+        return
+    try:
+        with json_file_lock(shared_json_path):
+            existing = read_json_file(shared_json_path)
+            token_states = existing.get("token_states", {})
+            if not isinstance(token_states, dict):
+                token_states = {}
+            for mint, rules_state in updates.items():
+                token_state = token_states.get(mint, {})
+                if not isinstance(token_state, dict):
+                    token_state = {}
+                token_state["rules_state"] = rules_state
+                token_states[mint] = token_state
+            existing["token_states"] = token_states
+            atomic_write_json(shared_json_path, existing)
+    except Exception as exc:
+        print(f"Failed to write action rule states: {exc}", flush=True)
+
+
+def refresh_community_rules(cfg, force=False):
+    global LAST_COMMUNITY_RULES_REFRESH, LAST_COMMUNITY_RULES_CONFIG_SIGNATURE
+    tokens = configured_rule_tokens(cfg)
+    if not tokens:
+        LAST_COMMUNITY_RULES_CONFIG_SIGNATURE = ""
+        return False
+
+    config_signature = f"{(cfg or {}).get('community_rules_refresh_nonce', '')}|" + "|".join(sorted(
+        f"{token['mint']}:{rules_config_signature(token['rules_config'])}:{token_usd_amount(token):.12g}"
+        for token in tokens
+    ))
+    now = time.time()
+    unchanged = config_signature == LAST_COMMUNITY_RULES_CONFIG_SIGNATURE
+    if not force and unchanged and now - LAST_COMMUNITY_RULES_REFRESH < COMMUNITY_RULES_CHECK_INTERVAL:
+        return False
+    LAST_COMMUNITY_RULES_REFRESH = now
+    LAST_COMMUNITY_RULES_CONFIG_SIGNATURE = config_signature
+
+    metadata = {}
+    metadata_errors = {}
+    for index in range(0, len(tokens), 100):
+        batch = tokens[index:index + 100]
+        mints = [token["mint"] for token in batch]
+        try:
+            metadata.update(get_token_information(mints))
+        except JupiterQuoteError as exc:
+            message = str(exc)[:180]
+            for mint in mints:
+                metadata_errors[mint] = message
+
+    shared = read_json_file(shared_json_path)
+    token_states = shared.get("token_states", {}) if isinstance(shared, dict) else {}
+    if not isinstance(token_states, dict):
+        token_states = {}
+    updates = {}
+    rules_global_topic = resolve_global_ntfy_topic(cfg)
+
+    for token in tokens:
+        mint = token["mint"]
+        config = token["rules_config"]
+        info = metadata.get(mint)
+        fetch_error = metadata_errors.get(mint, "")
+        if info is None and not fetch_error:
+            fetch_error = "Jupiter did not return token information for this mint"
+        elif isinstance(info, dict) and not info.get("updatedAt") and info.get("lastUpdatedAt"):
+            info = {**info, "updatedAt": info.get("lastUpdatedAt")}
+        price_info = info
+        if isinstance(info, dict):
+            source_updated_at = parse_iso_to_utc(info.get("updatedAt"))
+            if source_updated_at is None:
+                fetch_error = "Jupiter did not report when this token data was updated"
+                price_info = {"decimals": info.get("decimals")}
+                info = None
+            else:
+                source_age = (datetime.now(timezone.utc) - source_updated_at).total_seconds()
+                if source_age < -300:
+                    fetch_error = "Jupiter token data has an invalid future timestamp"
+                    price_info = {"decimals": info.get("decimals")}
+                    info = None
+                elif source_age > COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS:
+                    fetch_error = "Jupiter token data is older than the allowed freshness window"
+                    price_info = {"decimals": info.get("decimals")}
+                    info = None
+
+
+        price_impact = None
+        if rules_require_price_impact(config):
+            price_impact = fetch_rule_price_impact(token, price_info, config)
+        evaluated_at = datetime.now(timezone.utc).isoformat()
+
+        evaluation = evaluate_rules(
+            config,
+            info,
+            price_impact,
+            evaluated_at=evaluated_at,
+            fetch_error=fetch_error,
+        )
+        previous = token_states.get(mint, {})
+        if isinstance(price_info, dict) and price_info.get("updatedAt"):
+            evaluation["source_updated_at"] = price_info.get("updatedAt")
+        previous_rules = previous.get("rules_state", {}) if isinstance(previous, dict) else {}
+        runtime, should_send = advance_alert_state(
+            previous_rules,
+            evaluation,
+            config,
+            now=evaluated_at,
+            max_gap_seconds=max(180, COMMUNITY_RULES_CHECK_INTERVAL * 3),
+        )
+        if should_send:
+            delivered = send_alert(
+                "Action Rules Passed",
+                rules_alert_message(token_label(token), mint, runtime),
+                token_config=token,
+                inherited_topic=rules_global_topic,
+            )
+            runtime = mark_alert_delivery(
+                runtime,
+                success=bool(delivered),
+                error="No ntfy topic is configured or delivery failed",
+                sent_at=evaluated_at,
+            )
+        try:
+            record_rule_history(
+                mint,
+                config,
+                runtime,
+                max_gap_seconds=max(180, COMMUNITY_RULES_CHECK_INTERVAL * 3),
+            )
+        except Exception as exc:
+            print(f"Action rule history write failed for {mint}: {exc}", flush=True)
+        updates[mint] = runtime
+
+    write_rule_states(updates)
+    return True
+
+
 def check_scheduled_token(token_config, cfg=None):
     mint = str((token_config or {}).get("mint") or "").strip()
+
+
     if not mint:
         return
 
@@ -1119,6 +1394,13 @@ def check_scheduled_token(token_config, cfg=None):
 
     raw_rsi_alerts = token_rsi_alerts_raw(token_config)
     rsi_state = sync_runtime_rsi_state(runtime, raw_rsi_alerts)
+    refresh_nonce = str((token_config or {}).get("rsi_refresh_nonce") or "")
+    if refresh_nonce != runtime.get("rsi_refresh_nonce", ""):
+        runtime["rsi_refresh_nonce"] = refresh_nonce
+        runtime["last_rsi_at"] = None
+        runtime["latest_rsi"] = None
+        runtime["latest_rsi_time"] = None
+        runtime["rsi_last_fetch_at"] = None
     now_utc = datetime.now(timezone.utc)
     last_rsi_at = runtime.get("last_rsi_at")
     rsi_enabled_for_token = token_rsi_enabled(token_config, cfg)
@@ -1129,6 +1411,7 @@ def check_scheduled_token(token_config, cfg=None):
         runtime["rsi_status"] = "disabled"
         runtime["rsi_error"] = disabled_reason
         runtime["rsi_last_fetch_at"] = None
+        runtime["last_rsi_at"] = None
     elif last_rsi_at is None or (now_utc - last_rsi_at) >= timedelta(minutes=rsi_interval_minutes):
         runtime["last_rsi_at"] = now_utc
         runtime["rsi_status"] = "waiting"
@@ -1325,6 +1608,7 @@ def check_prices():
         LATEST_RSI_STATUS = "disabled"
         LATEST_RSI_ERROR = disabled_reason
         LATEST_RSI_LAST_FETCH_AT = None
+        _last_rsi_at = None
     elif _last_rsi_at is None or (now_utc - _last_rsi_at) >= timedelta(minutes=RSI_CHECK_INTERVAL):
         _last_rsi_at = now_utc
         LATEST_RSI_STATUS = "waiting"
@@ -1394,6 +1678,16 @@ def check_prices():
         }, timeout=2)
     except Exception as e:
         print(f"Failed to send price to backend: {e}", flush=True)
+
+
+def community_rules_worker():
+    while True:
+        try:
+            cfg = read_json_file(config_json_path)
+            refresh_community_rules(cfg)
+        except Exception as exc:
+            print(f"Action rules worker error: {exc}", flush=True)
+        time.sleep(max(5, min(10, COMMUNITY_RULES_CHECK_INTERVAL)))
 
 
 def background_alert_cleaner():
@@ -1471,6 +1765,7 @@ def reset_alert(data: ResetAlert):
 if __name__ == "__main__":
     print("Jupiter Price Monitor started.", flush=True)
     threading.Thread(target=background_alert_cleaner, daemon=True).start()
+    threading.Thread(target=community_rules_worker, daemon=True, name="community-rules").start()
 
     while True:
         sleep_for = 5

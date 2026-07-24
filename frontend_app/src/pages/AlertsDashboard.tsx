@@ -3,9 +3,10 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RuleTrendCard } from "@/components/RuleTrendCard";
 import { toast } from "sonner";
 import { Line } from "react-chartjs-2";
-import { Cross2Icon, DotFilledIcon, GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
+import { ChevronDownIcon, Cross2Icon, DotFilledIcon, GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import {
   Chart as ChartJS,
   LineElement,
@@ -25,6 +26,16 @@ const safe = (n: any, d: any = 0) => {
   return Number.isFinite(v) ? v : d;
 };
 const fmt = (n: any, digits = 2) => safe(n).toFixed(digits);
+const chartPriceValue = (value: any): number | null => {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+const formatChartPrice = (value: any) => {
+  const parsed = chartPriceValue(value);
+  if (parsed === null) return "Unavailable";
+  return parsed < 0.00000001 ? `$${parsed.toExponential(4)}` : `$${parsed.toFixed(8)}`;
+};
 
 const pnlStatusText = (item: any) => {
   const status = item?.pnl_status;
@@ -119,6 +130,98 @@ function ThemeToggleButton() {
   );
 }
 
+type RuleType =
+  | "min_holders"
+  | "min_market_cap"
+  | "min_liquidity"
+  | "min_volume_24h"
+  | "max_sell_pressure_24h"
+  | "min_volume_liquidity_ratio"
+  | "max_price_impact";
+
+type CommunityRuleItem = {
+  type: RuleType;
+  enabled: boolean;
+  target: number;
+};
+
+type RulesConfig = {
+  enabled: boolean;
+  alert_enabled: boolean;
+  alert_mode: "once" | "rearm";
+  sell_amount_mode: "tracked_usdc" | "token_amount";
+  sell_token_amount: number | null;
+  items: CommunityRuleItem[];
+};
+
+type RuleResult = CommunityRuleItem & {
+  label?: string;
+  description?: string;
+  operator?: ">=" | "<=";
+  unit?: "count" | "usd" | "percent" | "ratio";
+  current?: number | null;
+  status?: "pass" | "fail" | "unknown" | "disabled";
+  reason?: string;
+};
+
+type RulesState = {
+  status?: "global_disabled" | "disabled" | "not_configured" | "waiting" | "pass" | "fail" | "unknown";
+  items?: RuleResult[];
+  evaluated_at?: string | null;
+  source_updated_at?: string | null;
+  confirmed_ready?: boolean;
+  confirmation_required?: number;
+  pass_streak?: number;
+  stale?: boolean;
+  fetch_error?: string | null;
+  alert_enabled?: boolean;
+  alert_mode?: "once" | "rearm";
+  alert_state?: {
+    armed?: boolean;
+    fired?: boolean;
+    last_sent_at?: string | null;
+    last_delivery_error?: string | null;
+  };
+};
+
+const RULE_OPTIONS: Array<{ type: RuleType; label: string; unit: RuleResult["unit"]; operator: ">=" | "<="; defaultTarget: number }> = [
+  { type: "min_holders", label: "Minimum holders", unit: "count", operator: ">=", defaultTarget: 1000 },
+  { type: "min_market_cap", label: "Minimum market cap", unit: "usd", operator: ">=", defaultTarget: 1_000_000 },
+  { type: "min_liquidity", label: "Minimum liquidity", unit: "usd", operator: ">=", defaultTarget: 100_000 },
+  { type: "min_volume_24h", label: "Minimum 24h volume", unit: "usd", operator: ">=", defaultTarget: 100_000 },
+  { type: "max_sell_pressure_24h", label: "Maximum sell pressure", unit: "percent", operator: "<=", defaultTarget: 45 },
+  { type: "min_volume_liquidity_ratio", label: "Minimum volume / liquidity", unit: "ratio", operator: ">=", defaultTarget: 1 },
+  { type: "max_price_impact", label: "Maximum price impact", unit: "percent", operator: "<=", defaultTarget: 0.5 },
+];
+
+const rulesDraft = (raw?: Partial<RulesConfig> | null): RulesConfig => {
+  const existing = new Map((raw?.items || []).map((item) => [item.type, item]));
+  return {
+    enabled: raw?.enabled === true,
+    alert_enabled: raw?.alert_enabled === true,
+    alert_mode: raw?.alert_mode === "rearm" ? "rearm" : "once",
+    sell_amount_mode: raw?.sell_amount_mode === "token_amount" ? "token_amount" : "tracked_usdc",
+    sell_token_amount: Number.isFinite(Number(raw?.sell_token_amount)) ? Number(raw?.sell_token_amount) : null,
+    items: RULE_OPTIONS.map((option) => ({
+      type: option.type,
+      enabled: existing.get(option.type)?.enabled === true,
+      target: Number.isFinite(Number(existing.get(option.type)?.target)) ? Number(existing.get(option.type)?.target) : option.defaultTarget,
+    })),
+  };
+};
+
+const rulesStatusMeta = (state?: RulesState | null, config?: RulesConfig | null) => {
+  if (state?.status === "global_disabled") return { label: "Globally off", dot: "bg-gray-400", badge: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300" };
+  if (!config?.enabled || state?.status === "disabled") return { label: "Rules off", dot: "bg-gray-400", badge: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300" };
+  if (state?.status === "pass") return { label: state.confirmed_ready ? "Ready" : "Confirming", dot: "bg-emerald-500", badge: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300" };
+  if (state?.status === "fail") return { label: "Not ready", dot: "bg-red-500", badge: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300" };
+  if (state?.status === "not_configured") return { label: "Not configured", dot: "bg-gray-400", badge: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300" };
+  if (state?.status === "waiting") return { label: "Waiting", dot: "bg-amber-400", badge: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" };
+  return { label: "Data unavailable", dot: "bg-amber-500", badge: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" };
+};
+
+const RULES_KEY_REQUIRED_META = { label: "Key required", dot: "bg-amber-500", badge: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" };
+
 type TokenConfig = {
   mint: string;
   name?: string;
@@ -131,6 +234,7 @@ type TokenConfig = {
   rsi_reset_enabled?: boolean | null;
   rsi_enabled?: boolean | null;
   wallet_addresses?: string[];
+  rules_config?: RulesConfig;
 };
 
 type TokenSummary = TokenConfig & {
@@ -146,6 +250,7 @@ type TokenSummary = TokenConfig & {
   error?: string | null;
   ntfy_effective_topic?: string;
   ntfy_topic_source?: string;
+  rules_state?: RulesState;
 };
 
 type TokenDraft = {
@@ -154,6 +259,7 @@ type TokenDraft = {
   check_interval: string;
   rsi_check_interval: string;
   rsi_enabled: boolean;
+  rules_config: RulesConfig;
 };
 const formatTokenTime = (value?: string | null) => {
   if (!value) return "";
@@ -348,6 +454,11 @@ export default function AlertsDashboard() {
   const [solanaTrackerApiConfigured, setSolanaTrackerApiConfigured] = useState(false);
   const [ntfyConfigured, setNtfyConfigured] = useState(false);
   const [ntfyTopic, setNtfyTopic] = useState("");
+  const [communityRulesEnabled, setCommunityRulesEnabled] = useState(true);
+  const [communityRulesDraftEnabled, setCommunityRulesDraftEnabled] = useState(true);
+  const [jupiterApiConfigured, setJupiterApiConfigured] = useState(false);
+  const [jupiterRps, setJupiterRps] = useState(0.5);
+  const [communityRulesCheckInterval, setCommunityRulesCheckInterval] = useState(120);
   const [ntfyTopicSaved, setNtfyTopicSaved] = useState("");
   const [ntfyTopicEffective, setNtfyTopicEffective] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -372,6 +483,7 @@ export default function AlertsDashboard() {
   const [sellPercent, setSellPercent] = useState<number>(() => readSellPercent());
   const [tokenOverviewExpanded, setTokenOverviewExpanded] = useState(() => readStoredBool("tokenOverviewExpanded", false));
   const [tokenManagerExpanded, setTokenManagerExpanded] = useState(() => readStoredBool("tokenManagerExpanded", false));
+  const [actionReadinessExpandedByMint, setActionReadinessExpandedByMint] = useState<Record<string, boolean>>({});
   const [addTokenExpanded, setAddTokenExpanded] = useState(false);
   const [editingTokenMint, setEditingTokenMint] = useState<string | null>(null);
 
@@ -391,6 +503,9 @@ export default function AlertsDashboard() {
   const pnlFetchInFlight = useRef(false);
   const outputMintRef = useRef("");
   const ntfyTopicDirty = useRef(false);
+  const communityRulesDraftDirty = useRef(false);
+  const stateFetchRequestId = useRef(0);
+  const settingsSaveInFlight = useRef(false);
 
   const effectiveSolanaTrackerRps = useMemo(() => {
     if (solanaTrackerRateLimitMode === "off") return null;
@@ -411,15 +526,22 @@ export default function AlertsDashboard() {
     setNtfyTopic(ntfyTopicSaved || ntfyTopicEffective);
   };
 
+  const resetCommunityRulesDraft = () => {
+    communityRulesDraftDirty.current = false;
+    setCommunityRulesDraftEnabled(communityRulesEnabled);
+  };
+
   const closeSettingsPanel = () => {
     setSettingsHelpOpen(null);
     resetNtfyTopicDraft();
     setSettingsOpen(false);
+    resetCommunityRulesDraft();
   };
 
   const toggleSettingsPanel = () => {
     setSettingsHelpOpen(null);
     resetNtfyTopicDraft();
+    resetCommunityRulesDraft();
     setSettingsOpen((open) => !open);
   };
 
@@ -459,6 +581,9 @@ export default function AlertsDashboard() {
     () => tokens.find((token) => token.mint === activeTokenMint) || tokens[0] || null,
     [activeTokenMint, tokens]
   );
+  const actionReadinessExpanded = activeTokenMint
+    ? actionReadinessExpandedByMint[activeTokenMint] ?? readStoredBool(scopedPreferenceKey("actionReadinessExpanded", activeTokenMint), false)
+    : false;
 
   useEffect(() => {
     outputMintRef.current = outputMint;
@@ -492,6 +617,13 @@ export default function AlertsDashboard() {
     });
   };
 
+  const toggleActionReadiness = () => {
+    if (!activeTokenMint) return;
+    const next = !actionReadinessExpanded;
+    setStoredValue(scopedPreferenceKey("actionReadinessExpanded", activeTokenMint), String(next));
+    setActionReadinessExpandedByMint((current) => ({ ...current, [activeTokenMint]: next }));
+  };
+
   const tokenRows = useMemo(() => {
     const summaries = new Map(tokenSummaries.map((summary) => [summary.mint, summary]));
     return tokens.map<TokenSummary>((token) => ({
@@ -505,6 +637,20 @@ export default function AlertsDashboard() {
     () => tokenRows.find((row) => row.mint === activeTokenMint) || tokenRows[0] || null,
     [activeTokenMint, tokenRows]
   );
+  const activeRulesConfig = rulesDraft(activeToken?.rules_config || activeTokenSummary?.rules_config);
+  const activeRulesState = activeTokenSummary?.rules_state;
+  const activeRulesMeta = !jupiterApiConfigured
+    ? RULES_KEY_REQUIRED_META
+    : communityRulesEnabled
+      ? rulesStatusMeta(activeRulesState, activeRulesConfig)
+      : { label: "Globally off", dot: "bg-gray-400", badge: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300" };
+  const rulesEvaluationVisible = jupiterApiConfigured && communityRulesEnabled && activeRulesConfig.enabled;
+  const activeRuleRows: RuleResult[] = activeRulesState?.items?.length
+    ? activeRulesState.items.filter((item) => item.status !== "disabled")
+    : activeRulesConfig.items.filter((item) => item.enabled).map((item) => {
+        const option = RULE_OPTIONS.find((candidate) => candidate.type === item.type)!;
+        return { ...item, label: option.label, unit: option.unit, operator: option.operator, current: null, status: "unknown" };
+      });
 
   const activeTokenRsiEnabled = (activeTokenSummary?.rsi_enabled ?? activeToken?.rsi_enabled ?? true) !== false;
   const solanaTrackerUnavailableReason = !solanaTrackerFeaturesEnabled
@@ -549,6 +695,7 @@ export default function AlertsDashboard() {
     total: tokenRows.length,
     issues: tokenRows.filter((row) => row.error).length,
     customTopics: tokenRows.filter((row) => row.ntfy_topic_source === "custom").length,
+    ready: tokenRows.filter((row) => row.rules_state?.status === "pass" && row.rules_state?.confirmed_ready).length,
   }), [tokenRows]);
 
 
@@ -582,9 +729,12 @@ export default function AlertsDashboard() {
   };
 
   const fetchState = async () => {
+    const requestId = ++stateFetchRequestId.current;
     try {
       const res = await fetch("/api/state");
+      if (!res.ok) throw new Error(`State request failed with ${res.status}`);
       const data = await res.json();
+      if (requestId !== stateFetchRequestId.current) return;
       const storedWallets = Array.isArray(data.wallet_addresses) ? data.wallet_addresses : [];
 
       setUsdAmount(safe(data.usd_amount, 100));
@@ -607,6 +757,7 @@ export default function AlertsDashboard() {
           check_interval: intervalDraft(token.check_interval ?? summary?.check_interval),
           rsi_check_interval: intervalDraft(token.rsi_check_interval ?? summary?.rsi_check_interval),
           rsi_enabled: (token.rsi_enabled ?? summary?.rsi_enabled ?? true) !== false,
+          rules_config: rulesDraft(token.rules_config || summary?.rules_config),
         };
         return acc;
       }, {});
@@ -637,6 +788,14 @@ export default function AlertsDashboard() {
       const effectiveNtfyTopic = data.ntfy_effective_topic || savedNtfyTopic || "";
       setNtfyTopicSaved(savedNtfyTopic);
       setNtfyTopicEffective(effectiveNtfyTopic);
+      const nextCommunityRulesEnabled = data.community_rules_enabled !== false;
+      setCommunityRulesEnabled(nextCommunityRulesEnabled);
+      if (!communityRulesDraftDirty.current) {
+        setCommunityRulesDraftEnabled(nextCommunityRulesEnabled);
+      }
+      setJupiterApiConfigured(!!data.jupiter_api_key_configured);
+      setJupiterRps(Math.max(0.1, safe(data.community_rules_jupiter_requests_per_second, 0.5)));
+      setCommunityRulesCheckInterval(Math.max(60, Math.floor(safe(data.community_rules_check_interval, 120))));
       if (!ntfyTopicDirty.current) setNtfyTopic(savedNtfyTopic || effectiveNtfyTopic);
       setNtfyConfigured(!!data.ntfy_configured);
       if (data.rsi_status) setRsiStatus(data.rsi_status);
@@ -651,7 +810,9 @@ export default function AlertsDashboard() {
       setLatestBuyPrice(last?.buy_price ?? null);
       setLatestSellPrice(last?.sell_price ?? null);
     } catch {
-      toast.error("Failed to load state");
+      if (requestId === stateFetchRequestId.current) {
+        toast.error("Failed to load state");
+      }
     }
   };
 
@@ -854,15 +1015,19 @@ export default function AlertsDashboard() {
 
 
   const applyRuntimeSettings = async () => {
+    if (settingsSaveInFlight.current) return;
+    settingsSaveInFlight.current = true;
     setSettingsSaving(true);
     const ntfyDraft = ntfyTopic.trim();
     const inheritedNtfyUnchanged = !ntfyTopicDirty.current && !ntfyTopicSaved && Boolean(ntfyTopicEffective) && ntfyDraft === ntfyTopicEffective;
+    const submittedCommunityRulesEnabled = communityRulesDraftEnabled;
     const payload: Record<string, number | string | boolean | null> = {
       check_interval: Math.max(5, Math.floor(safe(checkInterval, 60))),
       rsi_check_interval: Math.max(1, Math.floor(safe(rsiCheckInterval, 5))),
       solanatracker_rate_limit_mode: solanaTrackerRateLimitMode,
       solanatracker_requests_per_second: Math.max(0.1, safe(solanaTrackerRps, 1)),
       solanatracker_features_enabled: solanaTrackerFeaturesEnabled,
+      community_rules_enabled: submittedCommunityRulesEnabled,
       ntfy_topic: inheritedNtfyUnchanged ? "" : ntfyDraft,
     };
 
@@ -878,11 +1043,15 @@ export default function AlertsDashboard() {
       if (!res.ok) throw new Error();
       toast.success("Settings updated");
       ntfyTopicDirty.current = false;
+      communityRulesDraftDirty.current = false;
+      setCommunityRulesEnabled(submittedCommunityRulesEnabled);
+      setCommunityRulesDraftEnabled(submittedCommunityRulesEnabled);
       fetchState();
     } catch {
       toast.error("Failed to update settings");
     } finally {
       setSettingsSaving(false);
+      settingsSaveInFlight.current = false;
     }
   };
 
@@ -1048,6 +1217,7 @@ export default function AlertsDashboard() {
     check_interval: intervalDraft(row.check_interval),
     rsi_check_interval: intervalDraft(row.rsi_check_interval),
     rsi_enabled: row.rsi_enabled !== false,
+    rules_config: rulesDraft(row.rules_config),
   });
 
   const resetTokenDraft = (row: TokenSummary) => {
@@ -1091,9 +1261,27 @@ export default function AlertsDashboard() {
         check_interval: current[mint]?.check_interval || "",
         rsi_check_interval: current[mint]?.rsi_check_interval || "",
         rsi_enabled: current[mint]?.rsi_enabled ?? true,
+        rules_config: current[mint]?.rules_config || rulesDraft(),
         ...changes,
       },
     }));
+  };
+  const updateRulesConfig = (mint: string, updater: (config: RulesConfig) => RulesConfig) => {
+    tokenDraftDirty.current = true;
+    setTokenDrafts((current) => {
+      const base = current[mint] || {
+        name: "",
+        ntfy_topic: "",
+        check_interval: "",
+        rsi_check_interval: "",
+        rsi_enabled: true,
+        rules_config: rulesDraft(),
+      };
+      return {
+        ...current,
+        [mint]: { ...base, rules_config: updater(rulesDraft(base.rules_config)) },
+      };
+    });
   };
 
   const intervalPayload = (value: string, minimum: number, label: string): number | null | undefined => {
@@ -1114,11 +1302,40 @@ export default function AlertsDashboard() {
       check_interval: intervalDraft(row.check_interval),
       rsi_check_interval: intervalDraft(row.rsi_check_interval),
       rsi_enabled: row.rsi_enabled !== false,
+      rules_config: rulesDraft(row.rules_config),
     };
     const priceInterval = intervalPayload(draft.check_interval, 5, "Price interval seconds");
     if (priceInterval === undefined) return;
     const rsiIntervalValue = intervalPayload(draft.rsi_check_interval, 1, "RSI interval minutes");
     if (rsiIntervalValue === undefined) return;
+    const enabledRules = draft.rules_config.items.filter((item) => item.enabled);
+    if (draft.rules_config.enabled && enabledRules.length === 0) {
+      toast.error("Turn on at least one action rule");
+      return;
+    }
+    for (const item of draft.rules_config.items) {
+      if (!Number.isFinite(item.target)) {
+        toast.error("Every rule target must be a valid number");
+        return;
+      }
+      if (item.type === "min_holders" && (!Number.isInteger(item.target) || item.target < 1)) {
+        toast.error("Minimum holders must be a whole number of at least 1");
+        return;
+      }
+      if ((item.type === "max_sell_pressure_24h" || item.type === "max_price_impact") && (item.target < 0 || item.target > 100)) {
+        toast.error("Percentage targets must be between 0 and 100");
+        return;
+      }
+      if (!["min_holders", "max_sell_pressure_24h", "max_price_impact"].includes(item.type) && item.target <= 0) {
+        toast.error("Minimum targets must be greater than zero");
+        return;
+      }
+    }
+    const customImpact = enabledRules.some((item) => item.type === "max_price_impact") && draft.rules_config.sell_amount_mode === "token_amount";
+    if (customImpact && (!draft.rules_config.sell_token_amount || draft.rules_config.sell_token_amount <= 0)) {
+      toast.error("Enter a token amount for the price impact rule");
+      return;
+    }
 
     setTokenSaving(true);
     try {
@@ -1131,6 +1348,7 @@ export default function AlertsDashboard() {
           check_interval: priceInterval,
           rsi_check_interval: rsiIntervalValue,
           rsi_enabled: draft.rsi_enabled !== false,
+          rules_config: draft.rules_config,
         }),
       });
       if (!res.ok) throw new Error(await responseDetail(res, "Token settings could not be saved"));
@@ -1138,6 +1356,7 @@ export default function AlertsDashboard() {
       setEditingTokenMint(null);
       tokenDraftDirty.current = false;
       await fetchState();
+      fetchRSI();
     } catch (err: any) {
       toast.error(err?.message || "Token settings could not be saved");
     } finally {
@@ -1239,13 +1458,13 @@ export default function AlertsDashboard() {
     datasets: [
       {
         label: "Buy Price",
-        data: filteredHistory.map((h) => (h.buy_price ?? h.buy) == null ? null : safe(h.buy_price ?? h.buy)),
+        data: filteredHistory.map((h) => chartPriceValue(h.buy_price ?? h.buy)),
         borderColor: "#4ade80",
         fill: false,
       },
       {
         label: "Sell Price",
-        data: filteredHistory.map((h) => (h.sell_price ?? h.sell) == null ? null : safe(h.sell_price ?? h.sell)),
+        data: filteredHistory.map((h) => chartPriceValue(h.sell_price ?? h.sell)),
         borderColor: "#f87171",
         fill: false,
       },
@@ -1269,7 +1488,17 @@ export default function AlertsDashboard() {
         bodyColor: isDark ? "#e5e7eb" : "#111827",
         borderColor: isDark ? "#374151" : "#e5e7eb",
         borderWidth: 1,
+        callbacks: {
+          label: function (context: any) {
+            const label = context.dataset?.label || "Price";
+            return `${label}: ${formatChartPrice(context.parsed?.y ?? context.raw)}`;
+          },
+        },
       },
+    },
+    interaction: {
+      mode: "index",
+      intersect: false,
     },
     scales: {
       x: {
@@ -1304,7 +1533,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.1.1</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -1338,6 +1567,31 @@ export default function AlertsDashboard() {
               <SettingsHelpLabel {...settingsHelpProps("price-check")} text="Price check (sec)" help="How often the app checks Jupiter prices for tracked tokens. Minimum is 5 seconds." />
               <Input type="number" min={5} value={checkInterval} onChange={(e) => setCheckInterval(safe(e.target.value, 60))} />
 
+              <SettingsHelpLabel {...settingsHelpProps("community-rules")} text="Action Rules" help="Optional authenticated feature. Its Jupiter API key is never used by the existing keyless price monitor." />
+              <Select
+                aria-label="Global action rules"
+                value={communityRulesDraftEnabled ? "true" : "false"}
+                onChange={(e) => {
+                  const nextEnabled = e.target.value === "true";
+                  communityRulesDraftDirty.current = nextEnabled !== communityRulesEnabled;
+                  setCommunityRulesDraftEnabled(nextEnabled);
+                }}
+                disabled={!jupiterApiConfigured || settingsSaving}
+              >
+                <option value="true">Enabled globally</option>
+                <option value="false">Disabled globally</option>
+              </Select>
+              <div className="-mt-2 text-xs text-gray-500 sm:col-span-2">
+                {!jupiterApiConfigured
+                  ? "Unavailable: add JUPITER_API_KEY in Docker Compose, then restart the app. Existing Jupiter prices and price alerts remain keyless and unchanged."
+                  : communityRulesDraftEnabled !== communityRulesEnabled
+                    ? communityRulesDraftEnabled
+                      ? "Pending: Action Rules will be enabled globally after you save. Until then, the dashboard remains hidden."
+                      : "Pending: Action Rules will be disabled globally after you save. Until then, the dashboard remains active."
+                  : !communityRulesEnabled
+                    ? "Globally disabled: no Action Rules requests or alerts. Per-coin settings are preserved."
+                    : `Feature key configured. Rules refresh every ${communityRulesCheckInterval}s through their isolated ${jupiterRps} request/sec limiter. Rule Trends reuse those checks and add no Jupiter requests.`}
+              </div>
               <SettingsHelpLabel {...settingsHelpProps("solanatracker-features")} text="SolanaTracker" help="Enables SolanaTracker-only features: RSI, wallet info, and the sell simulator. Jupiter price checks and price alerts keep running when this is off." />
               <Select value={solanaTrackerFeaturesEnabled ? "true" : "false"} onChange={(e) => setSolanaTrackerFeaturesEnabled(e.target.value === "true")}>
                 <option value="true">Enabled</option>
@@ -1448,6 +1702,9 @@ export default function AlertsDashboard() {
                   {tokenOverviewStats.issues} issue{tokenOverviewStats.issues === 1 ? "" : "s"}
                 </span>
                 <span className="text-xs text-gray-500">{tokenOverviewStats.customTopics} custom topic{tokenOverviewStats.customTopics === 1 ? "" : "s"}</span>
+                {jupiterApiConfigured && communityRulesEnabled && (
+                  <span className="text-xs text-emerald-600 dark:text-emerald-400">{tokenOverviewStats.ready} rules ready</span>
+                )}
               </div>
               <div className="flex flex-wrap gap-2 text-xs text-gray-500">
                 <span>Active {tokenName(activeTokenSummary || activeToken)}</span>
@@ -1481,6 +1738,7 @@ export default function AlertsDashboard() {
                         : hasRsi
                           ? fmt(row.rsi, 2)
                           : "--";
+                  const rowRulesMeta = jupiterApiConfigured ? rulesStatusMeta(row.rules_state, rulesDraft(row.rules_config)) : RULES_KEY_REQUIRED_META;
                   const nextLabel = formatTokenTime(row.next_check_at);
                   const statusLabel = row.error ? "Issue" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
                   const dotClass = row.error ? "bg-red-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
@@ -1490,7 +1748,7 @@ export default function AlertsDashboard() {
                       type="button"
                       onClick={() => !row.active && switchActiveToken(row.mint)}
                       disabled={tokenSaving || row.active}
-                      className="grid w-full grid-cols-2 gap-2 border-t border-gray-200 p-3 text-left text-sm first:border-t-0 hover:bg-gray-50 disabled:cursor-default disabled:hover:bg-transparent dark:border-gray-700 dark:hover:bg-gray-700/35 dark:disabled:hover:bg-transparent sm:grid-cols-[minmax(0,1.3fr)_repeat(5,minmax(5.2rem,1fr))]"
+                      className="grid w-full grid-cols-2 gap-2 border-t border-gray-200 p-3 text-left text-sm first:border-t-0 hover:bg-gray-50 disabled:cursor-default disabled:hover:bg-transparent dark:border-gray-700 dark:hover:bg-gray-700/35 dark:disabled:hover:bg-transparent sm:grid-cols-[minmax(0,1.3fr)_repeat(6,minmax(5.2rem,1fr))]"
                       title={row.error || row.mint}
                     >
                       <span className="col-span-2 flex min-w-0 items-center gap-2 sm:col-span-1">
@@ -1501,6 +1759,9 @@ export default function AlertsDashboard() {
                       <span className="min-w-0 truncate">Buy <strong>{hasBuy ? fmt(row.buy_price, 8) : "--"}</strong></span>
                       <span className="min-w-0 truncate">Sell <strong>{hasSell ? fmt(row.sell_price, 8) : "--"}</strong></span>
                       <span className="min-w-0 truncate">RSI <strong>{rowRsiText}</strong></span>
+                      {jupiterApiConfigured && communityRulesEnabled && (
+                        <span className="min-w-0 truncate">Rules <strong>{rowRulesMeta.label}</strong></span>
+                      )}
                       <span className="min-w-0 truncate">{topicSourceLabel(row.ntfy_topic_source)}</span>
                       <span className="min-w-0 truncate">{nextLabel ? `Next ${nextLabel}` : statusLabel}</span>
                     </button>
@@ -1529,6 +1790,9 @@ export default function AlertsDashboard() {
                 <span>Buy {latestBuyPrice !== null ? fmt(latestBuyPrice, 8) : "--"}</span>
                 <span>Sell {latestSellPrice !== null ? fmt(latestSellPrice, 8) : "--"}</span>
                 <span>RSI {rsi !== null ? fmt(rsi, 2) : "--"}</span>
+                {jupiterApiConfigured && communityRulesEnabled && (
+                  <span>Rules {activeRulesMeta.label}</span>
+                )}
                 <span>Price check {activeTokenSummary?.effective_check_interval ?? activeTokenSummary?.check_interval ?? checkInterval}s</span>
                 <span>RSI check {activeTokenSummary?.effective_rsi_check_interval ?? activeTokenSummary?.rsi_check_interval ?? rsiCheckInterval}m</span>
               </div>
@@ -1622,6 +1886,7 @@ export default function AlertsDashboard() {
                             : hasRsi
                               ? fmt(row.rsi, 2)
                               : "--";
+                      const rowRulesMeta = jupiterApiConfigured ? rulesStatusMeta(row.rules_state, rulesDraft(row.rules_config)) : RULES_KEY_REQUIRED_META;
                       const isEditing = editingTokenMint === row.mint;
                       const rowStatus = row.error ? "Issue" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
                       const dotClass = row.error ? "bg-red-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
@@ -1638,6 +1903,7 @@ export default function AlertsDashboard() {
                         check_interval: intervalDraft(row.check_interval),
                         rsi_check_interval: intervalDraft(row.rsi_check_interval),
                         rsi_enabled: row.rsi_enabled !== false,
+                        rules_config: rulesDraft(row.rules_config),
                       };
                       const topicTitle = row.ntfy_effective_topic
                         ? `${topicSourceLabel(row.ntfy_topic_source)}: ${row.ntfy_effective_topic}`
@@ -1657,11 +1923,14 @@ export default function AlertsDashboard() {
                                 <span className="min-w-0 truncate font-mono text-xs text-gray-500" title={row.mint}>{shortMint(row.mint)}</span>
                               </div>
 
-                              <div className="grid grid-cols-3 gap-2 text-xs text-gray-500 sm:text-sm">
+                              <div className="grid grid-cols-2 gap-2 text-xs text-gray-500 sm:grid-cols-4 sm:text-sm">
                                 <span>Buy <strong className="text-gray-900 dark:text-gray-100">{hasBuy ? fmt(row.buy_price, 8) : "--"}</strong></span>
                                 <span>Sell <strong className="text-gray-900 dark:text-gray-100">{hasSell ? fmt(row.sell_price, 8) : "--"}</strong></span>
                                 <span>RSI <strong className="text-gray-900 dark:text-gray-100">{rowRsiText}</strong></span>
                               </div>
+                                {jupiterApiConfigured && communityRulesEnabled && (
+                                  <span>Rules <strong className="text-gray-900 dark:text-gray-100">{rowRulesMeta.label}</strong></span>
+                                )}
 
                               <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
                                 <span title={topicTitle}>{topicSourceLabel(row.ntfy_topic_source)}</span>
@@ -1744,6 +2013,137 @@ export default function AlertsDashboard() {
                                   <option value="false">RSI off</option>
                                 </Select>
                               </div>
+                              <div className="mt-4 rounded-lg border border-blue-200 bg-white p-3 dark:border-blue-900 dark:bg-gray-950/40">
+                                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                                  <div>
+                                    <div className="font-semibold">Action rules</div>
+                                    <p className="text-xs text-gray-500">Independent market conditions for this coin. They do not inspect configured wallets.</p>
+                                  </div>
+                                  <Select
+                                    aria-label={`${tokenName(row)} action rules`}
+                                    value={draft.rules_config.enabled ? "true" : "false"}
+                                    disabled={!jupiterApiConfigured}
+                                    onChange={(e) => updateRulesConfig(row.mint, (config) => ({ ...config, enabled: e.target.value === "true" }))}
+                                    className="w-full sm:w-40"
+                                  >
+                                    <option value="false">Rules off</option>
+                                    <option value="true">Rules on</option>
+                                  </Select>
+                                </div>
+                                {!jupiterApiConfigured && (
+                                  <p className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+                                    Add JUPITER_API_KEY in Docker Compose and restart the app before enabling Action Rules. Existing Jupiter prices remain keyless.
+                                  </p>
+                                )}
+                                {jupiterApiConfigured && !communityRulesEnabled && (
+                                  <p className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+                                    Globally disabled in Settings. This coin's configuration is preserved and will resume when the global switch is enabled.
+                                  </p>
+                                )}
+
+                                {draft.rules_config.enabled && (
+                                  <div className="mt-4 space-y-4">
+                                    <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 xl:grid-cols-[0.8fr_1fr_1.35fr_1.15fr]">
+                                      <div className="min-w-0 space-y-1">
+                                        <Label>Ready alert</Label>
+                                        <Select
+                                          className="min-w-0 w-full"
+                                          value={draft.rules_config.alert_enabled ? "true" : "false"}
+                                          onChange={(e) => updateRulesConfig(row.mint, (config) => ({ ...config, alert_enabled: e.target.value === "true" }))}
+                                        >
+                                          <option value="false">Alert off</option>
+                                          <option value="true">Alert on</option>
+                                        </Select>
+                                      </div>
+                                      <div className="min-w-0 space-y-1">
+                                        <Label>Alert behavior</Label>
+                                        <Select
+                                          className="min-w-0 w-full"
+                                          value={draft.rules_config.alert_mode}
+                                          disabled={!draft.rules_config.alert_enabled}
+                                          onChange={(e) => updateRulesConfig(row.mint, (config) => ({ ...config, alert_mode: e.target.value === "rearm" ? "rearm" : "once" }))}
+                                        >
+                                          <option value="once">Send once</option>
+                                          <option value="rearm">Re-arm after failure</option>
+                                        </Select>
+                                      </div>
+                                      <div className="min-w-0 space-y-1">
+                                        <Label>Price impact amount</Label>
+                                        <Select
+                                          className="min-w-0 w-full"
+                                          value={draft.rules_config.sell_amount_mode}
+                                          onChange={(e) => updateRulesConfig(row.mint, (config) => ({ ...config, sell_amount_mode: e.target.value === "token_amount" ? "token_amount" : "tracked_usdc" }))}
+                                        >
+                                          <option value="tracked_usdc">Tracked USDC amount</option>
+                                          <option value="token_amount">Custom token amount</option>
+                                        </Select>
+                                      </div>
+                                      {draft.rules_config.sell_amount_mode === "token_amount" && (
+                                        <div className="min-w-0 space-y-1">
+                                          <Label>Tokens to sell</Label>
+                                          <Input
+                                            className="min-w-0 w-full"
+                                            type="number"
+                                            min={0}
+                                            step="any"
+                                            value={draft.rules_config.sell_token_amount ?? ""}
+                                            onChange={(e) => updateRulesConfig(row.mint, (config) => ({ ...config, sell_token_amount: e.target.value === "" ? null : Number(e.target.value) }))}
+                                            placeholder="Token amount"
+                                          />
+                                        </div>
+                                      )}
+                                    </div>
+
+                                    {draft.rules_config.alert_enabled && row.ntfy_topic_source === "disabled" && !draft.ntfy_topic.trim() && (
+                                      <p className="rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-700 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+                                        Add a coin topic above or a global ntfy topic before this alert can be delivered.
+                                      </p>
+                                    )}
+
+                                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                                      {RULE_OPTIONS.map((option) => {
+                                        const item = draft.rules_config.items.find((candidate) => candidate.type === option.type)!;
+                                        return (
+                                          <label key={option.type} className={`rounded-lg border p-3 ${item.enabled ? "border-blue-300 bg-blue-50/60 dark:border-blue-800 dark:bg-blue-950/20" : "border-gray-200 dark:border-gray-700"}`}>
+                                            <span className="flex items-start gap-2">
+                                              <input
+                                                type="checkbox"
+                                                checked={item.enabled}
+                                                onChange={(e) => updateRulesConfig(row.mint, (config) => ({
+                                                  ...config,
+                                                  items: config.items.map((rule) => rule.type === option.type ? { ...rule, enabled: e.target.checked } : rule),
+                                                }))}
+                                                className="mt-1 h-4 w-4"
+                                              />
+                                              <span className="min-w-0 flex-1">
+                                                <span className="block text-sm font-medium">{option.label}</span>
+                                                <span className="block text-xs text-gray-500">Passes when current value is {option.operator} target</span>
+                                              </span>
+                                            </span>
+                                            <div className="mt-2 flex items-center gap-2">
+                                              <span className="text-xs text-gray-500">Target</span>
+                                              <Input
+                                                type="number"
+                                                min={option.type === "min_holders" ? 1 : 0}
+                                                max={option.unit === "percent" ? 100 : undefined}
+                                                step={option.type === "min_holders" ? 1 : "any"}
+                                                value={Number.isFinite(item.target) ? item.target : ""}
+                                                onChange={(e) => updateRulesConfig(row.mint, (config) => ({
+                                                  ...config,
+                                                  items: config.items.map((rule) => rule.type === option.type ? { ...rule, target: e.target.value === "" ? Number.NaN : Number(e.target.value) } : rule),
+                                                }))}
+                                                className="min-w-0"
+                                              />
+                                              <span className="whitespace-nowrap text-xs text-gray-500">{option.unit === "usd" ? "USD" : option.unit === "percent" ? "%" : option.unit === "ratio" ? "x" : "holders"}</span>
+                                            </div>
+                                          </label>
+                                        );
+                                      })}
+                                    </div>
+                                    <p className="text-xs text-gray-500">Market cap is never replaced with FDV. Missing, zero-denominator, or stale data stays Unknown and cannot trigger a ready alert.</p>
+                                  </div>
+                                )}
+                              </div>
                               <div className="mt-3 flex flex-wrap items-center gap-2">
                                 <Button
                                   size="sm"
@@ -1787,8 +2187,92 @@ export default function AlertsDashboard() {
         </CardContent>
       </Card>
 
+      {jupiterApiConfigured && communityRulesEnabled && (
+        <Card className={rulesEvaluationVisible ? "border-blue-200 dark:border-blue-900/70" : undefined}>
+        <CardContent className="!p-0">
+          <button
+            type="button"
+            className="flex w-full items-center gap-3 rounded-lg p-4 text-left transition-colors hover:bg-gray-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 dark:hover:bg-gray-900/30"
+            onClick={toggleActionReadiness}
+            aria-expanded={actionReadinessExpanded}
+            aria-controls="action-readiness-details"
+            title={actionReadinessExpanded ? "Collapse Action Readiness" : "Expand Action Readiness"}
+          >
+            <span className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+              <span className="text-lg font-semibold sm:text-xl">Action Readiness</span>
+              <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${activeRulesMeta.badge}`}>
+                <span className={`h-2 w-2 rounded-full ${activeRulesMeta.dot}`} />
+                {activeRulesMeta.label}
+              </span>
+            </span>
+            <span className="ml-auto flex flex-shrink-0 items-center gap-2">
+              {rulesEvaluationVisible && activeRulesState?.evaluated_at && (
+                <span className="text-xs text-gray-500" title={activeRulesState.evaluated_at}>
+                  <span className="hidden sm:inline">Checked </span>
+                  {formatChartTime(activeRulesState.evaluated_at)}
+                </span>
+              )}
+              <ChevronDownIcon
+                className={`h-5 w-5 text-gray-500 transition-transform ${actionReadinessExpanded ? "rotate-180" : ""}`}
+                aria-hidden="true"
+              />
+            </span>
+          </button>
+
+          {actionReadinessExpanded && (
+            <div id="action-readiness-details" className="space-y-4 px-4 pb-4">
+              <p className="text-sm text-gray-500">
+                {!jupiterApiConfigured
+                  ? "Action Rules require JUPITER_API_KEY. Existing Jupiter prices and price alerts continue keylessly as before."
+                  : !communityRulesEnabled
+                    ? "Action Rules are globally disabled. Per-coin settings are preserved and no rule alerts can fire."
+                    : activeRulesConfig.enabled
+                    ? `A live Jupiter snapshot for ${tokenName(activeToken)}, independent of wallet tracking. Every enabled rule must pass.`
+                    : `Rules are off for ${tokenName(activeToken)}. Open Manage, then Edit, to configure this coin.`}
+              </p>
+
+              {rulesEvaluationVisible && (
+                <>
+                  {activeRuleRows.length > 0 ? (
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                      {activeRuleRows.map((item) => (
+                        <RuleTrendCard
+                          key={`${activeTokenMint}:${item.type}`}
+                          mint={activeTokenMint}
+                          item={{ ...item, label: item.label || RULE_OPTIONS.find((option) => option.type === item.type)?.label }}
+                          isDark={isDark}
+                          refreshKey={activeRulesState?.evaluated_at}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-dashed border-gray-300 p-4 text-sm text-gray-500 dark:border-gray-700">
+                      Waiting for the first rule snapshot.
+                    </div>
+                  )}
+
+                  <div className="flex flex-col gap-2 rounded-lg bg-gray-50 p-3 text-xs text-gray-600 dark:bg-gray-900/40 dark:text-gray-300 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+                    <div className="flex flex-wrap gap-x-4 gap-y-1">
+                      <span>{activeRulesState?.confirmed_ready ? "Confirmed ready" : `Confirmation ${activeRulesState?.pass_streak || 0}/${activeRulesState?.confirmation_required || 2}`}</span>
+                      <span>{activeRulesConfig.alert_enabled ? `Alert ${activeRulesConfig.alert_mode === "rearm" ? "re-arms after a confirmed failure" : "sends once"}` : "Alerts off"}</span>
+                      {activeRulesState?.alert_state?.last_sent_at && <span>Last alert {formatChartTime(activeRulesState.alert_state.last_sent_at)}</span>}
+                    </div>
+                    <span>Snapshot only - not an execution guarantee.</span>
+                  </div>
+                  {(activeRulesState?.fetch_error || activeRulesState?.alert_state?.last_delivery_error) && (
+                    <p className="break-words text-xs text-red-600 dark:text-red-400">
+                      {activeRulesState.fetch_error || activeRulesState.alert_state?.last_delivery_error}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      )}
       {/* Real-time Prices */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Card>
           <CardContent className="p-4 text-center">
             <h2 className="text-xl font-semibold">Buy Price</h2>
@@ -1832,11 +2316,11 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="space-y-2 p-4">
           <Label>RSI Alerts</Label>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center">
             <Select
               value={newRsiDir}
               onChange={(e) => setNewRsiDir(e.target.value as "above" | "below")}
-              className="flex-shrink-0"
+              className="w-full min-w-0 sm:w-auto"
             >
               <option value="above">Above</option>
               <option value="below">Below</option>
@@ -1860,7 +2344,7 @@ export default function AlertsDashboard() {
                 setNewRsiValue("");
                 fetchRSI();
               }}
-              className="flex-shrink-0"
+              className="w-full sm:w-auto"
             >
               Add
             </Button>
@@ -1869,11 +2353,11 @@ export default function AlertsDashboard() {
             {Object.entries(rsiAlerts).map(([key, { triggered }]) => {
               const status = getRsiStatus(triggered, rsiResetEnabled);
               return (
-                <li key={key} className="flex justify-between items-center gap-2">
-                  <div>
+                <li key={key} className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 break-words">
                     <span>{key}</span> - <span className="font-semibold">{status}</span>
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2 sm:flex-nowrap">
                     <Button
                       size="sm"
                       variant="outline"
@@ -1914,11 +2398,11 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="space-y-2 p-4">
           <Label>RSI Interval</Label>
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <Select
               value={pendingInterval}
               onChange={(e) => setPendingInterval(e.target.value)}
-              className="border p-1 rounded"
+              className="w-full min-w-0 border p-1 rounded sm:w-auto"
             >
               {["1s", "1m", "5m", "15m", "1h", "4h"].map((opt) => (
                 <option key={opt} value={opt}>
@@ -1927,6 +2411,7 @@ export default function AlertsDashboard() {
               ))}
             </Select>
             <Button
+              className="w-full sm:w-auto"
               onClick={async () => {
                 setRsi(null);
                 await fetch("/api/rsi/interval", {
@@ -1948,16 +2433,17 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="space-y-2 p-4">
           <Label>RSI Reset Mode</Label>
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <Select
               value={rsiResetEnabled ? "true" : "false"}
               onChange={(e) => setRsiResetEnabled(e.target.value === "true")}
-              className="border p-1 rounded"
+              className="w-full min-w-0 border p-1 rounded sm:w-auto"
             >
               <option value="true">Re-trigger on cross-back</option>
               <option value="false">One-time only</option>
             </Select>
             <Button
+              className="w-full sm:w-auto"
               onClick={async () => {
                 await fetch("/api/rsi/reset-mode", {
                   method: "POST",
@@ -1980,14 +2466,15 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="space-y-2 p-4">
           <Label>Simulated USD Amount</Label>
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <Input
               type="number"
               value={usdAmount}
               onChange={(e) => setUsdAmount(parseFloat(e.target.value))}
               inputMode="decimal"
+              className="w-full min-w-0 sm:flex-1"
             />
-            <Button onClick={applyUsdAmount}>Update</Button>
+            <Button className="w-full sm:w-auto" onClick={applyUsdAmount}>Update</Button>
           </div>
         </CardContent>
       </Card>
@@ -1996,14 +2483,15 @@ export default function AlertsDashboard() {
       <Card>
         <CardContent className="space-y-2 p-4">
           <Label>Alert Reset Minutes (0 disables reset)</Label>
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <Input
               type="number"
               value={alertResetMinutes}
               onChange={(e) => setAlertResetMinutes(parseInt(e.target.value))}
               inputMode="numeric"
+              className="w-full min-w-0 sm:flex-1"
             />
-            <Button onClick={applyResetMinutes}>Update</Button>
+            <Button className="w-full sm:w-auto" onClick={applyResetMinutes}>Update</Button>
           </div>
         </CardContent>
       </Card>
@@ -2015,13 +2503,14 @@ export default function AlertsDashboard() {
             <Card key={label}>
               <CardContent className="space-y-2 p-4">
                 <Label>{label} Alerts</Label>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                   <Input
                     value={label === "Buy" ? newBuy : newSell}
                     onChange={(e) => (label === "Buy" ? setNewBuy(e.target.value) : setNewSell(e.target.value))}
                     inputMode="decimal"
+                    className="w-full min-w-0 sm:flex-1"
                   />
-                  <Button onClick={() => addAlert(label.toLowerCase(), label === "Buy" ? newBuy : newSell)}>
+                  <Button className="w-full sm:w-auto" onClick={() => addAlert(label.toLowerCase(), label === "Buy" ? newBuy : newSell)}>
                     Add
                   </Button>
                 </div>
@@ -2031,8 +2520,8 @@ export default function AlertsDashboard() {
                     const lastTime = (times as any)[key];
                     const status = getAlertStatusWithCountdown(lastTime, alertResetMinutes);
                     return (
-                      <li key={`${val}-${i}`} className="flex justify-between items-center gap-2">
-                        <div className="flex flex-col">
+                      <li key={`${val}-${i}`} className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0 break-words">
                           <span>
                             {val} - <span className="font-semibold">{status}</span>
                           </span>
@@ -2042,7 +2531,7 @@ export default function AlertsDashboard() {
                             </span>
                           )}
                         </div>
-                        <div className="flex gap-2">
+                        <div className="flex flex-wrap gap-2 sm:flex-nowrap">
                           <Button size="sm" variant="outline" onClick={() => resetAlert(label.toLowerCase(), val)}>
                             Reset
                           </Button>

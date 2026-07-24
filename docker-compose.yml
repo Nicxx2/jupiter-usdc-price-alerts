@@ -31,8 +31,25 @@ services:
       SOLANATRACKER_RATE_LIMIT_MODE: safe
       SOLANATRACKER_REQUESTS_PER_SECOND: 1
 
-      # Jupiter keyless quote limiter. Default matches public keyless access.
+      # Optional and used only by Action Rules. Existing prices remain keyless.
+      # Leave blank to keep Action Rules unavailable; create one at https://portal.jup.ag.
+      JUPITER_API_KEY: ""
+
+      # Existing keyless price-monitor limiter (unchanged by Action Rules).
       JUPITER_REQUESTS_PER_SECOND: 0.5
+
+      # Separate authenticated limiter used only by Action Rules.
+      COMMUNITY_RULES_JUPITER_REQUESTS_PER_SECOND: 0.5
+      # This is forced off automatically while JUPITER_API_KEY is blank.
+      COMMUNITY_RULES_ENABLED: "true"
+      COMMUNITY_RULES_CHECK_INTERVAL: 120
+      COMMUNITY_RULES_STALE_SECONDS: 360
+      COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS: 90
+      COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS: 3600
+      # Rule Trends reuse existing checks and persist locally; they add no Jupiter calls.
+      COMMUNITY_RULES_HISTORY_PATH: /shared/action-rules-history.sqlite3
+      COMMUNITY_RULES_HISTORY_RETENTION_DAYS: 90
+      COMMUNITY_RULES_HISTORY_MAX_POINTS: 480
 
       # --- Simulated Swap Settings ---
 
