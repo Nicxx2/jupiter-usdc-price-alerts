@@ -373,14 +373,63 @@ You’ll be able to:
 
 
 
-Web UI Example:
+## 📸 See It in Action
 
-![Web UI Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/Jupiter_USDC_Price_Alert_Web_UI_with_RSI.png?raw=true)
+> [!NOTE]
+> Market values in the BONK, WIF, and JUP screenshots below are clearly labelled illustrative demo data. They are not live market data or financial advice.
 
+### Multi-token monitoring
 
-Example of Wallet Information:
+![Multi-token monitoring with BONK, WIF, and JUP demo scenarios](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/01-multi-token-overview.png)
 
-![Wallet Information Screenshot](https://github.com/Nicxx2/jupiter-usdc-price-alerts/blob/main/preview-wallet-ui-v2.2.1.png?raw=true)
+### Action Readiness
+
+![Confirmed Action Readiness rules for the BONK demo scenario](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/02-action-readiness-ready.png)
+
+### Alerts and saved price history
+
+![Price alerts and saved price history for the WIF demo scenario](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/07-price-alerts-and-chart.png)
+
+<details>
+<summary><strong>📷 Click here for more screenshots</strong></summary>
+
+### Per-rule trends
+
+Rule Trends reuse saved Action Readiness checks. Gaps remain visible instead of being plotted as zero.
+
+![Thirty-day holder trend with a target line and an honest collection gap](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/03-rule-trend-30d.png)
+
+### Risk thresholds
+
+![A WIF demo scenario where sell pressure, liquidity ratio, and price impact block readiness](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/04-risk-thresholds.png)
+
+### Rule builder
+
+![Per-token Action Rules, alert behavior, targets, and price-impact amount](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/05-rule-builder.png)
+
+### Settings and rate management
+
+![Global Action Rules, isolated Jupiter limiter, SolanaTracker settings, and ntfy topic](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/06-settings-and-rate-limits.png)
+
+### Confirmation protection
+
+![All rules passing while Action Readiness waits for confirmation sample two of two](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/08-confirmation-protection.png)
+
+### Mobile layout
+
+![Compact mobile token and Action Readiness overview](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/09-mobile-overview.png)
+
+![Thirty-day Rule Trend on mobile](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/10-mobile-rule-trend.png)
+
+![Stacked Action Readiness rule cards on mobile](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/11-mobile-rule-cards.png)
+
+![Responsive mobile settings panel](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/docs/screenshots/12-mobile-settings.png)
+
+### Wallet tracking
+
+![Wallet Information Screenshot](https://raw.githubusercontent.com/Nicxx2/jupiter-usdc-price-alerts/main/preview-wallet-ui-v2.2.1.png)
+
+</details>
 
 
 ---
