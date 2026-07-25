@@ -14,7 +14,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v3.3.2
+# 🚀 Jupiter USDC Price Alerts v3.3.3
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -22,7 +22,7 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 
 ---
 
-## ✨ What's New in v3.3.2
+## ✨ What's New in v3.3.3
 
 ### 📈 Per-rule Action Readiness trends
 - Open the dedicated graph button on any enabled rule card to switch safely between its live value and its history.
@@ -477,7 +477,7 @@ Open the app and **subscribe to your topic** (e.g. `token-alerts`).
 
 ---
 
-## v3.3.2 Production Notes
+## v3.3.3 Production Notes
 
 - Rule history begins with the first fresh evaluation after upgrading; the app does not invent or backfill older readings.
 - `/shared/action-rules-history.sqlite3` is created automatically in the existing persistent volume. No existing JSON migration is required.

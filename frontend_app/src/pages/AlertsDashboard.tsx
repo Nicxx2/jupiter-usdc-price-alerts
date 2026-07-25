@@ -1533,7 +1533,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.2</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.3</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button

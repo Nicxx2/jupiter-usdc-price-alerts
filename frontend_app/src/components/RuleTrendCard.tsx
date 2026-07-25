@@ -50,6 +50,13 @@ type RuleTrendCardProps = {
 };
 
 const WINDOWS: TrendWindow[] = ["24h", "7d", "30d", "90d"];
+const WINDOW_DURATION_MS: Record<TrendWindow, number> = {
+  "24h": 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+  "30d": 30 * 24 * 60 * 60 * 1000,
+  "90d": 90 * 24 * 60 * 60 * 1000,
+};
+const MIN_TIMELINE_SPAN_MS = 60 * 1000;
 
 const localKey = (mint: string, ruleType: string, name: string) =>
   `ruleTrend:${name}:${mint}:${ruleType}`;
@@ -73,6 +80,12 @@ const writeStored = (key: string, value: string) => {
 const finite = (value: unknown): number | null => {
   if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
   const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const timestampMs = (value?: string | null): number | null => {
+  if (!value) return null;
+  const parsed = new Date(value).getTime();
   return Number.isFinite(parsed) ? parsed : null;
 };
 
@@ -196,23 +209,76 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
   }, [item.type, mint, refreshKey, retryNonce, trendOpen, window]);
 
   const points = Array.isArray(payload?.points) ? payload!.points : [];
-  const validPointCount = points.filter(isValidTrendPoint).length;
-  const hasValidPoints = validPointCount > 0;
-  const latestScenario = [...points].reverse().find((point) => point.scenario_label)?.scenario_label
+  const timelinePoints = useMemo(
+    () => points.filter((point) => timestampMs(point.timestamp) !== null),
+    [points],
+  );
+  const latestScenario = [...timelinePoints].reverse().find((point) => point.scenario_label)?.scenario_label
     || payload?.latest_valid?.scenario_label
     || "";
+  const timelineEndMs = useMemo(() => {
+    const latestEventMs = timelinePoints.reduce(
+      (latest, point) => Math.max(latest, timestampMs(point.timestamp) ?? 0),
+      0,
+    );
+    return Math.max(Date.now(), latestEventMs);
+  }, [timelinePoints]);
+  const requestedStartMs = timelineEndMs - WINDOW_DURATION_MS[window];
+  const earliestEventMs = timelinePoints.reduce(
+    (earliest, point) => Math.min(earliest, timestampMs(point.timestamp) ?? timelineEndMs),
+    timelineEndMs,
+  );
+  const timelineStartMs = timelinePoints.length > 0
+    ? Math.max(requestedStartMs, Math.min(earliestEventMs, timelineEndMs - MIN_TIMELINE_SPAN_MS))
+    : requestedStartMs;
+  const chartPoints = useMemo(() => {
+    const latest = timelinePoints[timelinePoints.length - 1];
+    const latestMs = timestampMs(latest?.timestamp);
+    if (!latest || latestMs === null || timelineEndMs - latestMs <= 1000) return timelinePoints;
+
+    const currentStatus: "pass" | "fail" | null = item.status === "pass"
+      ? "pass"
+      : item.status === "fail"
+        ? "fail"
+        : null;
+    const currentValue = finite(item.current);
+    const currentIsValid = currentStatus !== null && currentValue !== null;
+    if (currentIsValid && latest.kind !== "point") return timelinePoints;
+
+    // This boundary is display-only: it makes valid unchanged data reach "now",
+    // while an unavailable current state remains a real null gap.
+    const boundary: TrendPoint = {
+      ...latest,
+      kind: currentIsValid ? "point" : "gap",
+      timestamp: new Date(timelineEndMs).toISOString(),
+      source_timestamp: currentIsValid ? latest.source_timestamp : null,
+      value: currentIsValid ? currentValue : null,
+      target: finite(item.target) ?? latest.target,
+      status: currentStatus,
+      operator: item.operator || latest.operator,
+      unit: item.unit || latest.unit,
+      reason: currentIsValid
+        ? null
+        : item.reason || (latest.kind === "gap" ? latest.reason : "Current rule data is unavailable"),
+    };
+    return [...timelinePoints, boundary];
+  }, [item.current, item.operator, item.reason, item.status, item.target, item.unit, timelineEndMs, timelinePoints]);
+  const validPointCount = chartPoints.filter(isValidTrendPoint).length;
+  const hasValidPoints = validPointCount > 0;
 
   const chartData = useMemo(() => ({
-    labels: points.map((point) => formatTime(point.timestamp, window)),
     datasets: [
       {
         label: "Actual",
-        data: points.map((point) => point.kind === "point" ? finite(point.value) : null),
+        data: chartPoints.map((point) => ({
+          x: timestampMs(point.timestamp),
+          y: point.kind === "point" ? finite(point.value) : null,
+        })),
         borderColor: "#3b82f6",
         backgroundColor: "#3b82f6",
         borderWidth: 2,
         pointRadius: (context: any) =>
-          trendPointRadius(points, Number(context.dataIndex), validPointCount),
+          trendPointRadius(chartPoints, Number(context.dataIndex), validPointCount),
         pointHoverRadius: 4,
         pointHitRadius: 8,
         spanGaps: false,
@@ -220,7 +286,10 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
       },
       {
         label: "Target",
-        data: points.map((point) => finite(point.target)),
+        data: chartPoints.map((point) => ({
+          x: timestampMs(point.timestamp),
+          y: finite(point.target),
+        })),
         borderColor: isDark ? "#cbd5e1" : "#64748b",
         backgroundColor: isDark ? "#cbd5e1" : "#64748b",
         borderWidth: 1.5,
@@ -230,13 +299,12 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
         stepped: true as const,
       },
     ],
-  }), [isDark, points, validPointCount, window]);
+  }), [chartPoints, isDark, validPointCount]);
 
   const chartOptions = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
     animation: false as const,
-    normalized: true,
     interaction: {
       mode: "index" as const,
       intersect: false,
@@ -262,14 +330,19 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
         borderColor: isDark ? "#374151" : "#d1d5db",
         borderWidth: 1,
         callbacks: {
+          title: (contexts: any[]) => {
+            const index = contexts?.[0]?.dataIndex;
+            const point = Number.isInteger(index) ? chartPoints[index] : null;
+            return point?.timestamp ? formatTime(point.timestamp, window) : "";
+          },
           label: (context: any) => {
-            const point = points[context.dataIndex];
-            const value = context.parsed?.y ?? context.raw;
+            const point = chartPoints[context.dataIndex];
+            const value = context.parsed?.y;
             return `${context.dataset?.label || "Value"}: ${formatValue(value, point?.unit || item.unit)}`;
           },
           footer: (contexts: any[]) => {
             const index = contexts?.[0]?.dataIndex;
-            const point = Number.isInteger(index) ? points[index] : null;
+            const point = Number.isInteger(index) ? chartPoints[index] : null;
             if (!point) return "";
             const notes = [];
             if (point.source_timestamp) notes.push(`Source: ${fullTime(point.source_timestamp)}`);
@@ -282,12 +355,19 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
     },
     scales: {
       x: {
+        type: "linear" as const,
+        min: timelineStartMs,
+        max: timelineEndMs,
         ticks: {
           color: isDark ? "#9ca3af" : "#6b7280",
           autoSkip: true,
           maxTicksLimit: 4,
           maxRotation: 0,
           font: { size: 10 },
+          callback: (value: string | number) => {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? formatTime(new Date(parsed).toISOString(), window) : "-";
+          },
         },
         grid: { display: false },
       },
@@ -304,7 +384,7 @@ export function RuleTrendCard({ mint, item, isDark, refreshKey }: RuleTrendCardP
         },
       },
     },
-  }), [isDark, item.unit, points]);
+  }), [chartPoints, isDark, item.unit, timelineEndMs, timelineStartMs, window]);
 
   const itemStyle = item.status === "pass"
     ? "border-emerald-200 bg-emerald-50/70 dark:border-emerald-900 dark:bg-emerald-950/20"
