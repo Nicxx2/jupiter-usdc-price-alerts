@@ -6,7 +6,7 @@ import { Label } from "@/components/ui/label";
 import { RuleTrendCard } from "@/components/RuleTrendCard";
 import { toast } from "sonner";
 import { Line } from "react-chartjs-2";
-import { ChevronDownIcon, Cross2Icon, DotFilledIcon, GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
+import { CheckCircledIcon, ChevronDownIcon, ClockIcon, Cross2Icon, DotFilledIcon, GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import {
   Chart as ChartJS,
   LineElement,
@@ -265,7 +265,28 @@ const formatTokenTime = (value?: string | null) => {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const today = new Date();
+  return date.toDateString() === today.toDateString()
+    ? time
+    : `${date.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
+};
+
+const formatTokenSchedule = (value?: string | null) => {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  if (date.getTime() < Date.now() - 5_000) {
+    return "Due/checking";
+  }
+  const formatted = formatTokenTime(value);
+  return formatted ? `Next ${formatted}` : "";
+};
+
+const formatAlertTimestamp = (value: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Unknown time";
+  return date.toLocaleString();
 };
 
 const formatChartTime = (value?: string | null) => {
@@ -1533,7 +1554,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.3</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.4</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -1739,22 +1760,33 @@ export default function AlertsDashboard() {
                           ? fmt(row.rsi, 2)
                           : "--";
                   const rowRulesMeta = jupiterApiConfigured ? rulesStatusMeta(row.rules_state, rulesDraft(row.rules_config)) : RULES_KEY_REQUIRED_META;
-                  const nextLabel = formatTokenTime(row.next_check_at);
+                  const scheduleLabel = formatTokenSchedule(row.next_check_at);
                   const statusLabel = row.error ? "Issue" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
                   const dotClass = row.error ? "bg-red-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
                   return (
                     <button
                       key={row.mint}
                       type="button"
+                      aria-current={row.active ? "true" : undefined}
                       onClick={() => !row.active && switchActiveToken(row.mint)}
                       disabled={tokenSaving || row.active}
-                      className="grid w-full grid-cols-2 gap-2 border-t border-gray-200 p-3 text-left text-sm first:border-t-0 hover:bg-gray-50 disabled:cursor-default disabled:hover:bg-transparent dark:border-gray-700 dark:hover:bg-gray-700/35 dark:disabled:hover:bg-transparent sm:grid-cols-[minmax(0,1.3fr)_repeat(6,minmax(5.2rem,1fr))]"
+                      className={`grid w-full grid-cols-2 gap-2 border-t border-gray-200 p-3 text-left text-sm first:border-t-0 hover:bg-gray-50 disabled:cursor-default disabled:hover:bg-transparent dark:border-gray-700 dark:hover:bg-gray-700/35 dark:disabled:hover:bg-transparent ${
+                        jupiterApiConfigured && communityRulesEnabled
+                          ? "md:grid-cols-[minmax(0,1.65fr)_repeat(6,minmax(4.75rem,1fr))]"
+                          : "md:grid-cols-[minmax(0,1.65fr)_repeat(5,minmax(4.75rem,1fr))]"
+                      }`}
                       title={row.error || row.mint}
                     >
-                      <span className="col-span-2 flex min-w-0 items-center gap-2 sm:col-span-1">
+                      <span className="col-span-2 flex min-w-0 items-center gap-1.5 md:col-span-1">
                         <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${dotClass}`} />
-                        <span className="min-w-0 truncate font-medium">{tokenName(row)}</span>
-                        <span className="flex-shrink-0 font-mono text-xs text-gray-500">{shortMint(row.mint)}</span>
+                        {row.active && (
+                          <span className="inline-flex flex-shrink-0 text-blue-600 dark:text-blue-400" title="Selected active token">
+                            <CheckCircledIcon className="h-4 w-4" aria-hidden="true" />
+                            <span className="sr-only">Selected active token</span>
+                          </span>
+                        )}
+                        <span className="min-w-[2.5rem] max-w-[5.5rem] truncate font-medium" title={tokenName(row)}>{tokenName(row)}</span>
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-gray-500">{shortMint(row.mint)}</span>
                       </span>
                       <span className="min-w-0 truncate">Buy <strong>{hasBuy ? fmt(row.buy_price, 8) : "--"}</strong></span>
                       <span className="min-w-0 truncate">Sell <strong>{hasSell ? fmt(row.sell_price, 8) : "--"}</strong></span>
@@ -1763,7 +1795,7 @@ export default function AlertsDashboard() {
                         <span className="min-w-0 truncate">Rules <strong>{rowRulesMeta.label}</strong></span>
                       )}
                       <span className="min-w-0 truncate">{topicSourceLabel(row.ntfy_topic_source)}</span>
-                      <span className="min-w-0 truncate">{nextLabel ? `Next ${nextLabel}` : statusLabel}</span>
+                      <span className="min-w-0 truncate" title={row.next_check_at || undefined}>{scheduleLabel || statusLabel}</span>
                     </button>
                   );
                 })
@@ -1911,7 +1943,7 @@ export default function AlertsDashboard() {
                       const effectivePriceInterval = row.effective_check_interval ?? safe(draft.check_interval || checkInterval, checkInterval);
                       const effectiveRsiInterval = row.effective_rsi_check_interval ?? safe(draft.rsi_check_interval || rsiCheckInterval, rsiCheckInterval);
                       const lastCheckedLabel = formatTokenTime(row.last_checked);
-                      const nextCheckLabel = formatTokenTime(row.next_check_at);
+                      const nextCheckLabel = formatTokenSchedule(row.next_check_at);
                       return (
                         <div key={row.mint} className="border-t border-gray-200 p-3 first:border-t-0 dark:border-gray-700">
                           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -1945,7 +1977,7 @@ export default function AlertsDashboard() {
                                 )}
                                 <span>Alert reset {row.alert_reset_minutes ?? alertResetMinutes}m</span>
                                 {lastCheckedLabel && <span title={row.last_checked || undefined}>Last {lastCheckedLabel}</span>}
-                                {nextCheckLabel && <span title={row.next_check_at || undefined}>Next {nextCheckLabel}</span>}
+                                {nextCheckLabel && <span title={row.next_check_at || undefined}>{nextCheckLabel}</span>}
                               </div>
                             </div>
 
@@ -2521,14 +2553,15 @@ export default function AlertsDashboard() {
                     const status = getAlertStatusWithCountdown(lastTime, alertResetMinutes);
                     return (
                       <li key={`${val}-${i}`} className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
-                        <div className="min-w-0 break-words">
-                          <span>
+                        <div className="min-w-0 space-y-0.5 break-words">
+                          <div>
                             {val} - <span className="font-semibold">{status}</span>
-                          </span>
+                          </div>
                           {lastTime && (
-                            <span className="text-xs text-gray-500">
-                              Last triggered: {new Date(lastTime).toLocaleString()}
-                            </span>
+                            <div className="flex items-center gap-1 text-xs text-gray-500">
+                              <ClockIcon className="h-3 w-3 flex-shrink-0" aria-hidden="true" />
+                              <span>Last triggered: {formatAlertTimestamp(lastTime)}</span>
+                            </div>
                           )}
                         </div>
                         <div className="flex flex-wrap gap-2 sm:flex-nowrap">

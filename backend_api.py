@@ -388,6 +388,7 @@ def normalize_token_entry(entry, fallback=None):
         "rsi_reset_enabled": coerce_bool(entry.get("rsi_reset_enabled", fallback.get("rsi_reset_enabled", state.get("rsi_reset_enabled", False))), state.get("rsi_reset_enabled", False)),
         "rsi_enabled": coerce_bool(entry.get("rsi_enabled", fallback.get("rsi_enabled", state.get("rsi_enabled", True))), True),
         "rsi_refresh_nonce": str(entry.get("rsi_refresh_nonce", fallback.get("rsi_refresh_nonce", "")) or ""),
+        "runtime_nonce": str(entry.get("runtime_nonce", fallback.get("runtime_nonce", "")) or ""),
         "rules_config": normalize_rules_config(entry.get("rules_config", fallback.get("rules_config", default_rules_config()))),
         "ntfy_topic": safe_ntfy_topic(entry.get("ntfy_topic", fallback.get("ntfy_topic", ""))),
         "wallet_addresses": normalize_wallet_addresses(entry.get("wallet_addresses", fallback.get("wallet_addresses", []))),
@@ -569,6 +570,14 @@ def is_rsi_warmup_message(message):
         "no non-zero volume bars",
     ))
 
+
+def derived_next_check_at(last_checked, interval_seconds, fallback=None):
+    checked = parse_iso_to_utc(last_checked)
+    if not checked:
+        return fallback
+    return (checked + timedelta(seconds=interval_seconds)).isoformat()
+
+
 def get_token_state_summary():
     latest = read_json_file(STATE_PATH)
     token_states = latest.get("token_states", {}) if isinstance(latest, dict) else {}
@@ -585,6 +594,7 @@ def get_token_state_summary():
         )
         effective_check_interval = optional_bounded_int(token.get("check_interval"), 5, 86400) or state["check_interval"]
         effective_rsi_check_interval = optional_bounded_int(token.get("rsi_check_interval"), 1, 43200) or state["rsi_check_interval"]
+        last_checked = token_state.get("last_checked_at") or token_state.get("timestamp")
         rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
         rsi_error = token_state.get("rsi_error")
         rsi_status = token_state.get("rsi_status")
@@ -612,8 +622,8 @@ def get_token_state_summary():
             "rules_state": rules_state,
             "rsi": rsi_value,
             "rsi_status": rsi_status,
-            "last_checked": token_state.get("timestamp"),
-            "next_check_at": token_state.get("next_check_at"),
+            "last_checked": last_checked,
+            "next_check_at": derived_next_check_at(last_checked, effective_check_interval, token_state.get("next_check_at")),
             "error": token_state.get("error") or (None if rsi_status == "disabled" or is_rsi_warmup_message(rsi_error) else rsi_error),
             "ntfy_topic": token.get("ntfy_topic", ""),
             "ntfy_effective_topic": effective_ntfy_topic(token),
@@ -920,7 +930,7 @@ def write_state(include_triggers=True):
 
 
 
-def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, rules_global_enabled=None):
+def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, rules_global_enabled=None, reset_runtime=False):
     """Make config transitions visible immediately without replacing unrelated runtime state."""
     mint = str((token or {}).get("mint") or "").strip()
     if not mint:
@@ -934,6 +944,16 @@ def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, r
             token_state = token_states.get(mint, {})
             if not isinstance(token_state, dict):
                 token_state = {}
+            incoming_nonce = str((token or {}).get("runtime_nonce") or "")
+            persisted_nonce = str(token_state.get("runtime_nonce") or "")
+            if reset_runtime and incoming_nonce and persisted_nonce != incoming_nonce:
+                token_state = {}
+                histories = existing.get("token_price_history", {})
+                if isinstance(histories, dict):
+                    histories.pop(mint, None)
+                    existing["token_price_history"] = histories
+            if incoming_nonce:
+                token_state["runtime_nonce"] = incoming_nonce
 
             if rsi_status in {"waiting", "disabled"}:
                 rsi_error = None if rsi_status == "waiting" else "RSI disabled for this token"
@@ -1382,6 +1402,7 @@ async def add_token(payload: TokenPayload):
         "rsi_interval": state["rsi_interval"],
         "rsi_reset_enabled": state["rsi_reset_enabled"],
         "rsi_enabled": coerce_bool(payload.rsi_enabled, True),
+        "runtime_nonce": datetime.now(timezone.utc).isoformat(),
         "rules_config": clean_rules_config,
         "ntfy_topic": clean_ntfy_topic,
         "check_interval": payload.check_interval,
@@ -1394,7 +1415,7 @@ async def add_token(payload: TokenPayload):
         state["active_token_mint"] = token["mint"]
         apply_active_token_to_legacy()
     write_config()
-    update_token_cached_states(token, rules_changed=True)
+    update_token_cached_states(token, rules_changed=True, reset_runtime=True)
     return {"success": True, "token": token}
 
 

@@ -1,18 +1,50 @@
+import atexit
 import asyncio
 import copy
 from datetime import datetime, timedelta, timezone
 import importlib
+import importlib.util
 import os
+from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
+_TEST_ROOT = Path(__file__).resolve().parent.parent
+_TEST_PREFIX = _TEST_ROOT / f".jupiter-alert-tests-{os.getpid()}"
+_TEST_CONFIG_PATH = Path(f"{_TEST_PREFIX}-config.json")
+_TEST_STATE_PATH = Path(f"{_TEST_PREFIX}-state.json")
+_TEST_HISTORY_PATH = Path(f"{_TEST_PREFIX}-history.sqlite3")
+
+
+def cleanup_test_paths():
+    base_paths = [_TEST_CONFIG_PATH, _TEST_STATE_PATH, _TEST_HISTORY_PATH]
+    sidecars = [Path(f"{path}{suffix}") for path in base_paths for suffix in (".lock", "-wal", "-shm")]
+    for path in base_paths + sidecars:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+atexit.register(cleanup_test_paths)
+
+
+def configure_test_paths():
+    os.environ["CONFIG_PATH"] = str(_TEST_CONFIG_PATH)
+    os.environ["SHARED_STATE_PATH"] = str(_TEST_STATE_PATH)
+    os.environ["COMMUNITY_RULES_HISTORY_PATH"] = str(_TEST_HISTORY_PATH)
 
 
 def install_dependency_stubs():
-    sys.modules.setdefault("pandas", types.SimpleNamespace(DataFrame=object, Series=object))
+    if "pandas" not in sys.modules and importlib.util.find_spec("pandas") is None:
+        pandas = types.ModuleType("pandas")
+        pandas.DataFrame = object
+        pandas.Series = object
+        sys.modules["pandas"] = pandas
 
     if "pydantic" not in sys.modules:
         pydantic = types.ModuleType("pydantic")
@@ -81,6 +113,7 @@ def install_dependency_stubs():
 
 
 def import_main_module():
+    configure_test_paths()
     install_dependency_stubs()
     os.environ.setdefault("INPUT_MINT", USDC_MINT)
     os.environ.setdefault("OUTPUT_MINT", SOL_MINT)
@@ -90,6 +123,7 @@ def import_main_module():
 
 
 def import_backend_module():
+    configure_test_paths()
     install_dependency_stubs()
     os.environ.setdefault("INPUT_MINT", USDC_MINT)
     os.environ.setdefault("OUTPUT_MINT", SOL_MINT)
@@ -106,6 +140,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
 
     def setUp(self):
         self.main.SCHEDULER_LAST_CHECK.clear()
+        self.main.SCHEDULER_TOKEN_NONCES.clear()
         self.main.SCHEDULER_CURSOR = 0
 
     def test_token_intervals_inherit_global_defaults(self):
@@ -137,6 +172,169 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.main.SCHEDULER_LAST_CHECK["TokenA"] = self.main.time.time()
         second = self.main.pick_due_scheduler_token(tokens, cfg)
         self.assertEqual(second["mint"], "TokenB")
+
+    def test_scheduler_restart_uses_last_real_check_timestamp(self):
+        original_read = self.main.read_json_file
+        checked_at = "2026-07-28T12:00:00+00:00"
+        try:
+            self.main.read_json_file = lambda path: {
+                "token_states": {
+                    "TokenA": {
+                        "timestamp": "2026-07-28T12:30:00+00:00",
+                        "last_checked_at": checked_at,
+                    }
+                }
+            }
+
+            restored = self.main.scheduler_last_check_for("TokenA")
+
+            self.assertEqual(restored, self.main.parse_iso_to_utc(checked_at).timestamp())
+        finally:
+            self.main.read_json_file = original_read
+
+    def test_explicit_all_disabled_config_schedules_no_tokens(self):
+        tokens = self.main.get_enabled_token_configs({
+            "tokens": [
+                {"mint": "TokenA", "enabled": False},
+                {"mint": "TokenB", "enabled": False},
+            ]
+        })
+
+        self.assertEqual(tokens, [])
+        self.assertIsNone(self.main.pick_due_scheduler_token(tokens, {"check_interval": 60}))
+        self.assertEqual(self.main.scheduler_sleep_seconds(tokens, {"check_interval": 60}), 30)
+
+    def test_active_switch_invalidates_alert_runtime_without_moving_schedule(self):
+        previous_mint = "TokenPrevious"
+        next_mint = "TokenNext"
+        originals = {
+            "output_mint": self.main.OUTPUT_MINT,
+            "runtimes": copy.deepcopy(self.main.TOKEN_RUNTIMES),
+            "scheduler": dict(self.main.SCHEDULER_LAST_CHECK),
+            "last_buy": dict(self.main.last_buy_alert),
+            "last_sell": dict(self.main.last_sell_alert),
+            "rsi_state": copy.deepcopy(self.main.RSI_STATE),
+            "last_rsi_at": self.main._last_rsi_at,
+            "latest_rsi": self.main.LATEST_RSI,
+            "latest_rsi_time": self.main.LATEST_RSI_TIME,
+            "latest_rsi_status": self.main.LATEST_RSI_STATUS,
+            "latest_rsi_error": self.main.LATEST_RSI_ERROR,
+            "latest_rsi_last_fetch_at": self.main.LATEST_RSI_LAST_FETCH_AT,
+            "token_changed": self.main.TOKEN_CHANGED_SINCE_LAST_WRITE,
+        }
+        try:
+            self.main.OUTPUT_MINT = previous_mint
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update({previous_mint: {"runtime_nonce": "a"}, next_mint: {"runtime_nonce": "b"}})
+            self.main.SCHEDULER_LAST_CHECK.clear()
+            self.main.SCHEDULER_LAST_CHECK.update({previous_mint: 100.0, next_mint: 200.0})
+
+            changed = self.main.reset_active_token_runtime(next_mint)
+
+            self.assertTrue(changed)
+            self.assertNotIn(previous_mint, self.main.TOKEN_RUNTIMES)
+            self.assertNotIn(next_mint, self.main.TOKEN_RUNTIMES)
+            self.assertEqual(self.main.SCHEDULER_LAST_CHECK, {previous_mint: 100.0, next_mint: 200.0})
+        finally:
+            self.main.OUTPUT_MINT = originals["output_mint"]
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(originals["runtimes"])
+            self.main.SCHEDULER_LAST_CHECK.clear()
+            self.main.SCHEDULER_LAST_CHECK.update(originals["scheduler"])
+            self.main.last_buy_alert.clear()
+            self.main.last_buy_alert.update(originals["last_buy"])
+            self.main.last_sell_alert.clear()
+            self.main.last_sell_alert.update(originals["last_sell"])
+            self.main.RSI_STATE.clear()
+            self.main.RSI_STATE.update(originals["rsi_state"])
+            self.main._last_rsi_at = originals["last_rsi_at"]
+            self.main.LATEST_RSI = originals["latest_rsi"]
+            self.main.LATEST_RSI_TIME = originals["latest_rsi_time"]
+            self.main.LATEST_RSI_STATUS = originals["latest_rsi_status"]
+            self.main.LATEST_RSI_ERROR = originals["latest_rsi_error"]
+            self.main.LATEST_RSI_LAST_FETCH_AT = originals["latest_rsi_last_fetch_at"]
+            self.main.TOKEN_CHANGED_SINCE_LAST_WRITE = originals["token_changed"]
+
+    def test_readded_token_nonce_invalidates_alert_and_scheduler_caches(self):
+        mint = "TokenReadded"
+        stale_key = "1.00000000"
+        original_runtime = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        original_reader = self.main.token_state_from_shared
+        try:
+            self.main.TOKEN_RUNTIMES[mint] = {
+                "runtime_nonce": "old-generation",
+                "last_buy_alert": {stale_key: datetime.now(timezone.utc)},
+            }
+            self.main.SCHEDULER_LAST_CHECK[mint] = 123.0
+            self.main.SCHEDULER_TOKEN_NONCES[mint] = "old-generation"
+            stale_checked_at = "2026-07-28T12:00:00+00:00"
+            self.main.token_state_from_shared = lambda token_mint: (
+                {"last_triggered_buy": {stale_key: stale_checked_at}},
+                {
+                    "runtime_nonce": "old-generation",
+                    "last_triggered_buy": {stale_key: stale_checked_at},
+                    "last_checked_at": stale_checked_at,
+                },
+            )
+            readded = {"mint": mint, "runtime_nonce": "new-generation"}
+
+            runtime = self.main.get_token_runtime(mint, readded)
+            last_check = self.main.scheduler_last_check_for(mint, readded)
+
+            self.assertEqual(runtime["runtime_nonce"], "new-generation")
+            self.assertNotIn(stale_key, runtime["last_buy_alert"])
+            self.assertEqual(last_check, 0.0)
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(original_runtime)
+            self.main.token_state_from_shared = original_reader
+
+    def test_stale_inflight_write_cannot_overwrite_readded_token(self):
+        mint = "TokenReaddedDuringCheck"
+        store = {
+            "token_states": {
+                mint: {
+                    "runtime_nonce": "new-generation",
+                    "last_triggered_buy": {},
+                }
+            },
+            "token_price_history": {},
+        }
+        writer = mock.Mock()
+
+        class DummyLock:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.multiple(
+            self.main,
+            read_json_file=mock.Mock(side_effect=lambda _path: copy.deepcopy(store)),
+            atomic_write_json=writer,
+            json_file_lock=mock.Mock(side_effect=lambda _path: DummyLock()),
+        ):
+            wrote = self.main.write_scheduled_token_status(
+                {"mint": mint, "name": "Old generation", "runtime_nonce": "old-generation"},
+                {
+                    "last_buy_alert": {"1.00000000": datetime.now(timezone.utc)},
+                    "last_sell_alert": {},
+                    "last_triggered_rsi": {},
+                },
+                1.0,
+                1.0,
+                100.0,
+                100.0,
+                60,
+                5,
+                rsi_enabled=False,
+            )
+
+        self.assertFalse(wrote)
+        writer.assert_not_called()
+        self.assertEqual(store["token_states"][mint]["runtime_nonce"], "new-generation")
+        self.assertEqual(store["token_states"][mint]["last_triggered_buy"], {})
 
     def test_rate_limit_mode_off_bypasses_limiter(self):
         self.main.SOLANATRACKER_RATE_LIMIT_MODE = "off"
@@ -214,6 +412,297 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.main.send_alert = originals["send_alert"]
             self.main.TOKEN_RUNTIMES.clear()
             self.main.TOKEN_RUNTIMES.update(originals["runtime"])
+
+    def test_scheduled_price_alerts_continue_when_rsi_is_forbidden(self):
+        token = {"mint": "TokenRsi403", "name": "RSI 403", "buy_alerts": [2.0], "rsi_enabled": True}
+        cfg = {"rsi_enabled": True, "rsi_check_interval": 5, "check_interval": 60}
+        sent_titles = []
+        status_writer = mock.Mock()
+        runtime_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+
+        try:
+            self.main.TOKEN_RUNTIMES.pop(token["mint"], None)
+            with mock.patch.multiple(
+                self.main,
+                SOLANATRACKER_API_KEY="key",
+                SOLANATRACKER_FEATURES_ENABLED=True,
+                RSI_ENABLED=True,
+                resolve_token_decimals=mock.Mock(return_value=6),
+                get_out_amount_raw=mock.Mock(side_effect=[100_000_000, 100_000_000]),
+                get_latest_rsi=mock.Mock(side_effect=RuntimeError("403 Forbidden")),
+                send_alert=mock.Mock(side_effect=lambda title, *args, **kwargs: sent_titles.append(title) or True),
+                write_scheduled_token_status=status_writer,
+            ):
+                self.main.check_scheduled_token(token, cfg)
+
+            runtime = self.main.TOKEN_RUNTIMES[token["mint"]]
+            self.assertIn("Buy Price Alert", sent_titles)
+            self.assertEqual(runtime["rsi_status"], "error")
+            self.assertIn("403 Forbidden", runtime["rsi_error"])
+            self.assertTrue(status_writer.called)
+            self.assertIsNone(status_writer.call_args.kwargs["error"])
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtime_before)
+
+    def test_failed_price_notification_retries_before_recording_trigger(self):
+        token = {
+            "mint": "TokenDeliveryRetry",
+            "name": "Delivery retry",
+            "buy_alerts": [2.0],
+            "sell_alerts": [],
+            "rsi_enabled": False,
+            "runtime_nonce": "delivery-generation",
+        }
+        cfg = {"check_interval": 60, "rsi_enabled": False}
+        send = mock.Mock(side_effect=[False, True])
+        runtime_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES.pop(token["mint"], None)
+            with mock.patch.multiple(
+                self.main,
+                resolve_token_decimals=mock.Mock(return_value=6),
+                get_out_amount_raw=mock.Mock(return_value=100_000_000),
+                send_alert=send,
+                write_scheduled_token_status=mock.Mock(),
+            ):
+                self.main.check_scheduled_token(token, cfg)
+                runtime = self.main.TOKEN_RUNTIMES[token["mint"]]
+                self.assertNotIn("2.00000000", runtime["last_buy_alert"])
+
+                self.main.check_scheduled_token(token, cfg)
+
+            self.assertEqual(send.call_count, 2)
+            self.assertIn("2.00000000", self.main.TOKEN_RUNTIMES[token["mint"]]["last_buy_alert"])
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtime_before)
+
+    def test_failed_rsi_notification_retries_before_recording_trigger(self):
+        token = {
+            "mint": "TokenRsiDeliveryRetry",
+            "name": "RSI delivery retry",
+            "buy_alerts": [],
+            "sell_alerts": [],
+            "rsi_alerts": ["above:50"],
+            "rsi_enabled": True,
+            "runtime_nonce": "rsi-delivery-generation",
+        }
+        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_enabled": True}
+        send = mock.Mock(side_effect=[False, True])
+        runtime_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES.pop(token["mint"], None)
+            with mock.patch.multiple(
+                self.main,
+                SOLANATRACKER_API_KEY="key",
+                SOLANATRACKER_FEATURES_ENABLED=True,
+                RSI_ENABLED=True,
+                resolve_token_decimals=mock.Mock(return_value=6),
+                get_out_amount_raw=mock.Mock(return_value=100_000_000),
+                get_latest_rsi=mock.Mock(return_value=(80.0, "2026-07-28T16:00:00+00:00")),
+                send_alert=send,
+                write_scheduled_token_status=mock.Mock(),
+            ):
+                self.main.check_scheduled_token(token, cfg)
+                runtime = self.main.TOKEN_RUNTIMES[token["mint"]]
+                self.assertNotIn("above:50.00", runtime["last_triggered_rsi"])
+                runtime["last_rsi_at"] = None
+
+                self.main.check_scheduled_token(token, cfg)
+
+            self.assertEqual(send.call_count, 2)
+            self.assertIn("above:50.00", self.main.TOKEN_RUNTIMES[token["mint"]]["last_triggered_rsi"])
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtime_before)
+
+    def test_failed_active_price_notification_retries_before_recording_trigger(self):
+        send = mock.Mock(side_effect=[False, True])
+        notify = mock.Mock()
+        status_writer = mock.Mock(return_value="2026-07-28T16:00:00+00:00")
+
+        with mock.patch.multiple(
+            self.main,
+            load_dynamic_config=mock.Mock(),
+            resolve_token_decimals=mock.Mock(return_value=6),
+            get_out_amount_raw=mock.Mock(return_value=100_000_000),
+            send_alert=send,
+            notify_backend_trigger=notify,
+            write_status_json=status_writer,
+            USD_AMOUNT=100.0,
+            BUY_ALERTS=[2.0],
+            SELL_ALERTS=[],
+            ALERT_RESET_MINUTES=0,
+            INPUT_DECIMALS=6,
+            OUTPUT_DECIMALS=6,
+            ACTIVE_TOKEN_CONFIG={"mint": SOL_MINT, "rsi_enabled": False},
+            last_buy_alert={},
+            last_sell_alert={},
+            RSI_STATE={},
+            _last_rsi_at=None,
+            LATEST_RSI=None,
+            LATEST_RSI_TIME=None,
+            LATEST_RSI_STATUS="disabled",
+            LATEST_RSI_ERROR=None,
+            LATEST_RSI_LAST_FETCH_AT=None,
+        ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)):
+            self.main.check_prices()
+
+            self.assertNotIn("2.00000000", self.main.last_buy_alert)
+            notify.assert_not_called()
+
+            self.main.check_prices()
+
+            self.assertEqual(send.call_count, 2)
+            self.assertIn("2.00000000", self.main.last_buy_alert)
+            notify.assert_called_once_with("buy", 2.0)
+
+    def test_active_rsi_trigger_persists_when_backend_callback_fails(self):
+        trigger_key = "above:50.00"
+        trigger_time = "2026-07-28T16:00:00+00:00"
+        existing = {
+            "token_states": {
+                SOL_MINT: {
+                    "runtime_nonce": "active-generation",
+                    "last_triggered_rsi": {},
+                }
+            },
+            "token_price_history": {},
+            "last_triggered_rsi": {},
+        }
+        captured = {}
+        callback = mock.Mock(return_value=False)
+
+        class DummyLock:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.multiple(
+            self.main,
+            load_dynamic_config=mock.Mock(),
+            resolve_token_decimals=mock.Mock(return_value=6),
+            get_out_amount_raw=mock.Mock(return_value=100_000_000),
+            get_latest_rsi=mock.Mock(return_value=(80.0, trigger_time)),
+            send_alert=mock.Mock(return_value=True),
+            notify_backend_rsi_trigger=callback,
+            read_json_file=mock.Mock(side_effect=lambda _path: copy.deepcopy(existing)),
+            atomic_write_json=mock.Mock(side_effect=lambda _path, data: captured.update(data=copy.deepcopy(data))),
+            json_file_lock=mock.Mock(side_effect=lambda _path: DummyLock()),
+            OUTPUT_MINT=SOL_MINT,
+            ACTIVE_TOKEN_CONFIG={"mint": SOL_MINT, "runtime_nonce": "active-generation", "rsi_enabled": True},
+            USD_AMOUNT=100.0,
+            BUY_ALERTS=[],
+            SELL_ALERTS=[],
+            ALERT_RESET_MINUTES=0,
+            CHECK_INTERVAL=60,
+            RSI_CHECK_INTERVAL=5,
+            RSI_INTERVAL="1m",
+            RSI_RESET_ENABLED=False,
+            RSI_ENABLED=True,
+            SOLANATRACKER_API_KEY="key",
+            SOLANATRACKER_FEATURES_ENABLED=True,
+            RSI_STATE={trigger_key: {"triggered": False}},
+            last_buy_alert={},
+            last_sell_alert={},
+            _last_rsi_at=None,
+            LATEST_RSI=None,
+            LATEST_RSI_TIME=None,
+            LATEST_RSI_STATUS="waiting",
+            LATEST_RSI_ERROR=None,
+            LATEST_RSI_LAST_FETCH_AT=None,
+            TOKEN_CHANGED_SINCE_LAST_WRITE=False,
+        ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)):
+            self.main.check_prices()
+
+        callback.assert_called_once_with(trigger_key, trigger_time)
+        self.assertEqual(captured["data"]["last_triggered_rsi"], {trigger_key: trigger_time})
+        self.assertEqual(
+            captured["data"]["token_states"][SOL_MINT]["last_triggered_rsi"],
+            {trigger_key: trigger_time},
+        )
+
+    def test_backend_preserves_token_runtime_nonce(self):
+        backend = import_backend_module()
+
+        token = backend.normalize_token_entry({"mint": SOL_MINT, "runtime_nonce": "generation-2"})
+
+        self.assertIsNotNone(token)
+        self.assertEqual(token["runtime_nonce"], "generation-2")
+
+    def test_backend_readd_clears_stale_generation_state(self):
+        backend = import_backend_module()
+        mint = "TokenReaddedBeforeOldWriteFinished"
+        existing = {
+            "token_states": {
+                mint: {
+                    "runtime_nonce": "old-generation",
+                    "last_triggered_buy": {"1.00000000": "2026-07-28T12:00:00+00:00"},
+                    "last_triggered_rsi": {"above:70.00": "2026-07-28T12:00:00+00:00"},
+                }
+            },
+            "token_price_history": {mint: [{"timestamp": "2026-07-28T12:00:00+00:00", "buy_price": 1.0}]},
+        }
+        captured = {}
+
+        class DummyLock:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.multiple(
+            backend,
+            read_json_file=mock.Mock(return_value=copy.deepcopy(existing)),
+            atomic_write_json=mock.Mock(side_effect=lambda _path, data: captured.update(data=copy.deepcopy(data))),
+            json_file_lock=mock.Mock(side_effect=lambda _path: DummyLock()),
+        ):
+            backend.update_token_cached_states(
+                {"mint": mint, "runtime_nonce": "new-generation"},
+                reset_runtime=True,
+            )
+
+        token_state = captured["data"]["token_states"][mint]
+        self.assertEqual(token_state, {"runtime_nonce": "new-generation"})
+        self.assertNotIn(mint, captured["data"]["token_price_history"])
+
+    def test_backend_summary_derives_next_from_actual_check_and_current_interval(self):
+        backend = import_backend_module()
+        checked_at = "2026-07-28T12:00:00+00:00"
+        originals = {
+            "tokens": copy.deepcopy(backend.state.get("tokens", [])),
+            "active_token_mint": backend.state.get("active_token_mint"),
+            "check_interval": backend.state.get("check_interval"),
+            "read_json_file": backend.read_json_file,
+        }
+        try:
+            backend.state["tokens"] = [{"mint": SOL_MINT, "name": "SOL", "enabled": True, "check_interval": 120}]
+            backend.state["active_token_mint"] = SOL_MINT
+            backend.state["check_interval"] = 60
+            backend.read_json_file = lambda path: {
+                "token_states": {
+                    SOL_MINT: {
+                        "timestamp": "2026-07-28T12:05:00+00:00",
+                        "last_checked_at": checked_at,
+                        "next_check_at": "2026-07-28T11:00:00+00:00",
+                    }
+                }
+            }
+
+            summary = backend.get_token_state_summary()[0]
+            expected_next = (backend.parse_iso_to_utc(checked_at) + timedelta(seconds=120)).isoformat()
+
+            self.assertEqual(summary["last_checked"], checked_at)
+            self.assertEqual(summary["next_check_at"], expected_next)
+        finally:
+            backend.state["tokens"] = originals["tokens"]
+            backend.state["active_token_mint"] = originals["active_token_mint"]
+            backend.state["check_interval"] = originals["check_interval"]
+            backend.read_json_file = originals["read_json_file"]
 
     def test_backend_token_summary_suppresses_rsi_when_solanatracker_disabled(self):
         backend = import_backend_module()
@@ -355,6 +844,84 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.main.OUTPUT_MINT = originals["output_mint"]
             self.main.ACTIVE_TOKEN_CONFIG = originals["active_token_config"]
             self.main.TOKEN_CHANGED_SINCE_LAST_WRITE = originals["token_changed"]
+
+    def test_active_status_schedule_only_advances_on_completed_checks(self):
+        old_checked = "2026-07-28T12:00:00+00:00"
+        old_next = "2026-07-28T12:01:00+00:00"
+        store = {
+            "data": {
+                "token_states": {
+                    SOL_MINT: {
+                        "timestamp": old_checked,
+                        "last_checked_at": old_checked,
+                        "next_check_at": old_next,
+                        "buy_price": 0.9,
+                        "sell_price": 0.8,
+                        "error": "old price failure",
+                    }
+                },
+                "scheduler": {"last_checked_mint": SOL_MINT, "last_checked_at": old_checked},
+            }
+        }
+
+        class DummyLock:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        originals = {
+            "read_json_file": self.main.read_json_file,
+            "atomic_write_json": self.main.atomic_write_json,
+            "json_file_lock": self.main.json_file_lock,
+            "resolve_token_decimals": self.main.resolve_token_decimals,
+            "output_mint": self.main.OUTPUT_MINT,
+            "active_token_config": self.main.ACTIVE_TOKEN_CONFIG,
+            "check_interval": self.main.CHECK_INTERVAL,
+            "last_buy": dict(self.main.last_buy_alert),
+            "last_sell": dict(self.main.last_sell_alert),
+        }
+        try:
+            self.main.OUTPUT_MINT = SOL_MINT
+            self.main.ACTIVE_TOKEN_CONFIG = {"mint": SOL_MINT, "name": "SOL", "ntfy_topic": ""}
+            self.main.CHECK_INTERVAL = 60
+            self.main.last_buy_alert.clear()
+            self.main.last_sell_alert.clear()
+            self.main.read_json_file = lambda path: copy.deepcopy(store["data"])
+            self.main.atomic_write_json = lambda path, data: store.update(data=copy.deepcopy(data))
+            self.main.json_file_lock = lambda path: DummyLock()
+            self.main.resolve_token_decimals = lambda mint, configured_decimals=None: 6
+
+            self.main.write_status_json(1.25, 1.2, 80, 96, record_history=False, error=None)
+            completed = copy.deepcopy(store["data"])
+            token_state = completed["token_states"][SOL_MINT]
+            checked = self.main.parse_iso_to_utc(token_state["last_checked_at"])
+            next_check = self.main.parse_iso_to_utc(token_state["next_check_at"])
+
+            self.assertAlmostEqual((next_check - checked).total_seconds(), 60, delta=1)
+            self.assertIsNone(token_state["error"])
+            self.assertEqual(token_state["buy_price"], 1.25)
+
+            self.main.write_status_json(None, None, None, None, check_completed=False)
+            non_check = store["data"]
+            non_check_state = non_check["token_states"][SOL_MINT]
+
+            for field in ("timestamp", "last_checked_at", "next_check_at", "buy_price", "sell_price", "error"):
+                self.assertEqual(non_check_state[field], token_state[field])
+            self.assertEqual(non_check["scheduler"], completed["scheduler"])
+        finally:
+            self.main.read_json_file = originals["read_json_file"]
+            self.main.atomic_write_json = originals["atomic_write_json"]
+            self.main.json_file_lock = originals["json_file_lock"]
+            self.main.resolve_token_decimals = originals["resolve_token_decimals"]
+            self.main.OUTPUT_MINT = originals["output_mint"]
+            self.main.ACTIVE_TOKEN_CONFIG = originals["active_token_config"]
+            self.main.CHECK_INTERVAL = originals["check_interval"]
+            self.main.last_buy_alert.clear()
+            self.main.last_buy_alert.update(originals["last_buy"])
+            self.main.last_sell_alert.clear()
+            self.main.last_sell_alert.update(originals["last_sell"])
 
     def test_backend_trigger_reset_syncs_active_token_cache(self):
         backend = import_backend_module()

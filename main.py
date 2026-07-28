@@ -135,6 +135,7 @@ last_sell_alert = {}
 TOKEN_CHANGED_SINCE_LAST_WRITE = False
 TOKEN_RUNTIMES: Dict[str, Dict[str, Any]] = {}
 SCHEDULER_LAST_CHECK: Dict[str, float] = {}
+SCHEDULER_TOKEN_NONCES: Dict[str, str] = {}
 SCHEDULER_CURSOR = 0
 COMMUNITY_RULES_CHECK_INTERVAL = env_int("COMMUNITY_RULES_CHECK_INTERVAL", 120, minimum=60, maximum=3600)
 COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS", 90, minimum=30, maximum=3600)
@@ -337,8 +338,7 @@ def get_enabled_token_configs(cfg):
             mint = str(token.get("mint") or "").strip()
             if mint:
                 enabled.append(dict(token))
-        if enabled:
-            return enabled
+        return enabled
     return [dict(ACTIVE_TOKEN_CONFIG or {"mint": OUTPUT_MINT, "name": short_mint(OUTPUT_MINT), "ntfy_topic": ""})]
 
 
@@ -349,12 +349,23 @@ def token_state_from_shared(mint):
     return state_data, token_state if isinstance(token_state, dict) else {}
 
 
-def get_token_runtime(mint):
+def token_state_matches_generation(token_state, token_config):
+    expected_nonce = str((token_config or {}).get("runtime_nonce") or "")
+    persisted_nonce = str((token_state or {}).get("runtime_nonce") or "")
+    # Empty nonces are allowed for state created before generation tracking.
+    return not expected_nonce or not persisted_nonce or expected_nonce == persisted_nonce
+
+
+def get_token_runtime(mint, token_config=None):
+    runtime_nonce = str((token_config or {}).get("runtime_nonce") or "")
     runtime = TOKEN_RUNTIMES.get(mint)
-    if runtime is not None:
+    if runtime is not None and str(runtime.get("runtime_nonce") or "") == runtime_nonce:
         return runtime
 
     state_data, token_state = token_state_from_shared(mint)
+    if not token_state_matches_generation(token_state, token_config):
+        state_data = {}
+        token_state = {}
     buy_triggers = token_state.get("last_triggered_buy") or (state_data.get("last_triggered_buy", {}) if mint == OUTPUT_MINT else {})
     sell_triggers = token_state.get("last_triggered_sell") or (state_data.get("last_triggered_sell", {}) if mint == OUTPUT_MINT else {})
     rsi_triggers = token_state.get("last_triggered_rsi") or (state_data.get("last_triggered_rsi", {}) if mint == OUTPUT_MINT else {})
@@ -371,6 +382,7 @@ def get_token_runtime(mint):
         "rsi_error": token_state.get("rsi_error"),
         "rsi_last_fetch_at": token_state.get("rsi_last_fetch_at"),
         "rsi_refresh_nonce": token_state.get("rsi_refresh_nonce", ""),
+        "runtime_nonce": runtime_nonce,
     }
     TOKEN_RUNTIMES[mint] = runtime
     return runtime
@@ -399,11 +411,19 @@ def sync_runtime_rsi_state(runtime, raw_alerts):
     return next_state
 
 
-def scheduler_last_check_for(mint):
+def scheduler_last_check_for(mint, token_config=None):
+    if token_config is not None:
+        runtime_nonce = str((token_config or {}).get("runtime_nonce") or "")
+        previous_nonce = SCHEDULER_TOKEN_NONCES.get(mint)
+        if previous_nonce is not None and previous_nonce != runtime_nonce:
+            SCHEDULER_LAST_CHECK.pop(mint, None)
+        SCHEDULER_TOKEN_NONCES[mint] = runtime_nonce
     if mint in SCHEDULER_LAST_CHECK:
         return SCHEDULER_LAST_CHECK[mint]
     _state_data, token_state = token_state_from_shared(mint)
-    checked = parse_iso_to_utc(token_state.get("timestamp"))
+    if not token_state_matches_generation(token_state, token_config):
+        return 0.0
+    checked = parse_iso_to_utc(token_state.get("last_checked_at") or token_state.get("timestamp"))
     if checked:
         SCHEDULER_LAST_CHECK[mint] = checked.timestamp()
         return SCHEDULER_LAST_CHECK[mint]
@@ -576,7 +596,10 @@ try:
         shared = json.load(sf)
     persisted = shared.get("last_triggered_rsi", {})
     for k in RSI_STATE:
-        RSI_STATE[k]["triggered"] = (k in persisted)
+        triggered_at = persisted.get(k)
+        RSI_STATE[k]["triggered"] = triggered_at is not None
+        if triggered_at is not None:
+            RSI_STATE[k]["triggered_at"] = triggered_at
 except Exception:
     pass
 
@@ -610,7 +633,10 @@ def reset_active_token_runtime(new_mint):
     if not new_mint or new_mint == OUTPUT_MINT:
         return False
 
-    print(f"Active token changed: {OUTPUT_MINT} -> {new_mint}", flush=True)
+    previous_mint = OUTPUT_MINT
+    print(f"Active token changed: {previous_mint} -> {new_mint}", flush=True)
+    TOKEN_RUNTIMES.pop(previous_mint, None)
+    TOKEN_RUNTIMES.pop(new_mint, None)
     OUTPUT_MINT = new_mint
     last_buy_alert.clear()
     last_sell_alert.clear()
@@ -702,7 +728,12 @@ def load_dynamic_config():
             else:
                 persisted_rsi = state_data.get("last_triggered_rsi", {}) if isinstance(state_data, dict) else {}
             for k in RSI_STATE:
-                RSI_STATE[k]["triggered"] = (k in persisted_rsi)
+                triggered_at = persisted_rsi.get(k)
+                RSI_STATE[k]["triggered"] = triggered_at is not None
+                if triggered_at is not None:
+                    RSI_STATE[k]["triggered_at"] = triggered_at
+                else:
+                    RSI_STATE[k].pop("triggered_at", None)
 
         except Exception as e:
             print(f"Failed to load config.json: {e}", flush=True)
@@ -822,13 +853,16 @@ def notify_backend_trigger(side: str, price: float):
 
 def notify_backend_rsi_trigger(key: str, timestamp: str):
     try:
-        requests.post(
+        response = requests.post(
             "http://127.0.0.1:8000/api/rsi/trigger",
             json={"key": key, "timestamp": timestamp},
             timeout=2,
         )
+        response.raise_for_status()
+        return True
     except Exception as e:
         print(f"Failed to notify backend of RSI trigger: {e}", flush=True)
+        return False
 
 def get_out_amount_raw(input_mint, output_mint, amount_lamports):
     """
@@ -954,7 +988,30 @@ def get_token_price_history(source, mint):
         return prune_history_points(histories.get(mint, []))
     return prune_history_points(source.get("latest_prices", [])) if isinstance(source, dict) else []
 
-def write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=True):
+
+def merge_active_rsi_triggers(persisted_triggers):
+    merged = dict(persisted_triggers) if isinstance(persisted_triggers, dict) else {}
+    for key, info in RSI_STATE.items():
+        if not isinstance(info, dict):
+            continue
+        if info.get("triggered"):
+            triggered_at = info.get("triggered_at") or merged.get(key)
+            if triggered_at:
+                merged[key] = triggered_at
+        else:
+            merged.pop(key, None)
+    return merged
+
+
+def write_status_json(
+    price_buy,
+    price_sell,
+    token_received,
+    usdc_returned,
+    record_history=True,
+    check_completed=True,
+    error=None,
+):
     global TOKEN_CHANGED_SINCE_LAST_WRITE
 
     try:
@@ -965,24 +1022,24 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned, reco
             token_states = existing.get("token_states", {})
             if not isinstance(token_states, dict):
                 token_states = {}
-            if record_history:
-                active_history = append_token_price_history(existing, OUTPUT_MINT, timestamp, price_buy, price_sell)
-            else:
-                active_history = get_token_price_history(existing, OUTPUT_MINT)
             active_token_state = token_states.get(OUTPUT_MINT, {}) if OUTPUT_MINT else {}
             if not isinstance(active_token_state, dict):
                 active_token_state = {}
+            runtime_nonce = str((ACTIVE_TOKEN_CONFIG or {}).get("runtime_nonce") or "")
+            persisted_nonce = str(active_token_state.get("runtime_nonce") or "")
+            if runtime_nonce and persisted_nonce and runtime_nonce != persisted_nonce:
+                print(f"Skipped stale active token state write for {OUTPUT_MINT}", flush=True)
+                return None
+            if check_completed and record_history:
+                active_history = append_token_price_history(existing, OUTPUT_MINT, timestamp, price_buy, price_sell)
+            else:
+                active_history = get_token_price_history(existing, OUTPUT_MINT)
             active_rsi_triggers = active_token_state.get("last_triggered_rsi", {}) if TOKEN_CHANGED_SINCE_LAST_WRITE else existing.get("last_triggered_rsi", {})
-            if not isinstance(active_rsi_triggers, dict):
-                active_rsi_triggers = {}
+            active_rsi_triggers = merge_active_rsi_triggers(active_rsi_triggers)
             if OUTPUT_MINT:
-                token_states[OUTPUT_MINT] = {
+                next_token_state = {
                     **active_token_state,
-                    "timestamp": timestamp,
-                    "buy_price": round(price_buy, 8) if price_buy else None,
-                    "sell_price": round(price_sell, 8) if price_sell else None,
-                    "token_received": round(token_received, 8) if token_received else None,
-                    "usdc_returned": round(usdc_returned, 8) if usdc_returned else None,
+                    "runtime_nonce": runtime_nonce or persisted_nonce,
                     "latest_rsi": LATEST_RSI,
                     "latest_rsi_time": LATEST_RSI_TIME,
                     "rsi_status": LATEST_RSI_STATUS,
@@ -999,17 +1056,25 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned, reco
                     "last_triggered_rsi": active_rsi_triggers,
                     "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
                 }
-            existing.update({
+                if check_completed:
+                    next_token_state.update({
+                        "timestamp": timestamp,
+                        "last_checked_at": timestamp,
+                        "next_check_at": datetime.fromtimestamp(time.time() + CHECK_INTERVAL, timezone.utc).isoformat(),
+                        "buy_price": round(price_buy, 8) if price_buy else None,
+                        "sell_price": round(price_sell, 8) if price_sell else None,
+                        "token_received": round(token_received, 8) if token_received else None,
+                        "usdc_returned": round(usdc_returned, 8) if usdc_returned else None,
+                        "error": error,
+                    })
+                token_states[OUTPUT_MINT] = next_token_state
+            next_existing = {
                 "timestamp": timestamp,
                 "active_token_mint": OUTPUT_MINT,
                 "token_states": token_states,
                 "token_price_history": existing.get("token_price_history", {}),
                 "latest_prices": active_history,
                 "usd_amount": USD_AMOUNT,
-                "price_per_token_buy": round(price_buy, 8) if price_buy else None,
-                "price_per_token_sell": round(price_sell, 8) if price_sell else None,
-                "token_received": round(token_received, 8) if token_received else None,
-                "usdc_returned": round(usdc_returned, 8) if usdc_returned else None,
                 "buy_alerts": BUY_ALERTS,
                 "sell_alerts": SELL_ALERTS,
                 "last_triggered_buy": {k: v.isoformat() for k, v in last_buy_alert.items()},
@@ -1030,13 +1095,22 @@ def write_status_json(price_buy, price_sell, token_received, usdc_returned, reco
                 "rsi_error": LATEST_RSI_ERROR,
                 "rsi_enabled": RSI_ENABLED,
                 "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
-            })
-            existing["scheduler"] = {
-                "enabled": True,
-                "last_checked_mint": OUTPUT_MINT,
-                "last_checked_at": timestamp,
-                "token_count": len(token_states),
             }
+            if check_completed:
+                next_existing.update({
+                    "price_per_token_buy": round(price_buy, 8) if price_buy else None,
+                    "price_per_token_sell": round(price_sell, 8) if price_sell else None,
+                    "token_received": round(token_received, 8) if token_received else None,
+                    "usdc_returned": round(usdc_returned, 8) if usdc_returned else None,
+                })
+            existing.update(next_existing)
+            if check_completed:
+                existing["scheduler"] = {
+                    "enabled": True,
+                    "last_checked_mint": OUTPUT_MINT,
+                    "last_checked_at": timestamp,
+                    "token_count": len(token_states),
+                }
             atomic_write_json(shared_json_path, existing)
             TOKEN_CHANGED_SINCE_LAST_WRITE = False
             return timestamp
@@ -1050,7 +1124,7 @@ def serialize_trigger_times(trigger_map):
 def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, token_received, usdc_returned, check_interval, rsi_check_interval, error=None, rsi_enabled=True):
     mint = str((token_config or {}).get("mint") or "").strip()
     if not mint:
-        return
+        return False
     try:
         with json_file_lock(shared_json_path):
             existing = read_json_file(shared_json_path)
@@ -1059,14 +1133,21 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
             if not isinstance(token_states, dict):
                 token_states = {}
             ntfy_topic, ntfy_source = token_ntfy_topic(token_config)
-            append_token_price_history(existing, mint, timestamp, price_buy, price_sell)
-            next_check_at = datetime.fromtimestamp(time.time() + check_interval, timezone.utc).isoformat()
             current_token_state = token_states.get(mint, {})
             if not isinstance(current_token_state, dict):
                 current_token_state = {}
+            runtime_nonce = str((token_config or {}).get("runtime_nonce") or "")
+            persisted_nonce = str(current_token_state.get("runtime_nonce") or "")
+            if runtime_nonce and persisted_nonce and runtime_nonce != persisted_nonce:
+                print(f"Skipped stale scheduled token state write for {mint}", flush=True)
+                return False
+            append_token_price_history(existing, mint, timestamp, price_buy, price_sell)
+            next_check_at = datetime.fromtimestamp(time.time() + check_interval, timezone.utc).isoformat()
             token_states[mint] = {
                 **current_token_state,
+                "runtime_nonce": runtime_nonce or persisted_nonce,
                 "timestamp": timestamp,
+                "last_checked_at": timestamp,
                 "next_check_at": next_check_at,
                 "name": token_label(token_config),
                 "buy_price": round(price_buy, 8) if price_buy else None,
@@ -1099,8 +1180,10 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
                 "token_count": len(token_states),
             }
             atomic_write_json(shared_json_path, existing)
+            return True
     except Exception as e:
         print(f"Failed to write scheduled token state for {mint}: {e}", flush=True)
+        return False
 
 
 def configured_rule_tokens(cfg):
@@ -1114,6 +1197,8 @@ def configured_rule_tokens(cfg):
     result = []
     for token in tokens:
         if not isinstance(token, dict):
+            continue
+        if not coerce_bool(token.get("enabled"), True):
             continue
         mint = str(token.get("mint") or "").strip()
         config = normalize_rules_config(token.get("rules_config"))
@@ -1331,7 +1416,7 @@ def check_scheduled_token(token_config, cfg=None):
     if not mint:
         return
 
-    runtime = get_token_runtime(mint)
+    runtime = get_token_runtime(mint, token_config)
     usd_amount = token_usd_amount(token_config)
     price_interval = token_check_interval(token_config, cfg)
     rsi_interval_minutes = token_rsi_check_interval(token_config, cfg)
@@ -1370,8 +1455,9 @@ def check_scheduled_token(token_config, cfg=None):
                 price_key = f"{alert_price:.8f}"
                 trigger_ready, trigger_time = should_alert(runtime["last_buy_alert"], price_key, alert_reset_minutes)
                 if trigger_ready and price_buy <= alert_price:
-                    runtime["last_buy_alert"][price_key] = trigger_time
-                    send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}", token_config=token_config)
+                    delivered = send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}", token_config=token_config)
+                    if delivered:
+                        runtime["last_buy_alert"][price_key] = trigger_time
             except ValueError:
                 continue
     else:
@@ -1385,8 +1471,9 @@ def check_scheduled_token(token_config, cfg=None):
                 price_key = f"{alert_price:.8f}"
                 trigger_ready, trigger_time = should_alert(runtime["last_sell_alert"], price_key, alert_reset_minutes)
                 if trigger_ready and price_sell >= alert_price:
-                    runtime["last_sell_alert"][price_key] = trigger_time
-                    send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}", token_config=token_config)
+                    delivered = send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}", token_config=token_config)
+                    if delivered:
+                        runtime["last_sell_alert"][price_key] = trigger_time
             except ValueError:
                 continue
     elif not error:
@@ -1448,9 +1535,10 @@ def check_scheduled_token(token_config, cfg=None):
                     (direction == "below" and rsi_value < threshold)
                 )
                 if should_fire:
-                    info["triggered"] = True
-                    runtime["last_triggered_rsi"][key] = rsi_time
-                    send_alert("RSI Alert", f"RSI({rsi_interval}) = {rsi_value:.2f} {direction} {threshold}", token_config=token_config)
+                    delivered = send_alert("RSI Alert", f"RSI({rsi_interval}) = {rsi_value:.2f} {direction} {threshold}", token_config=token_config)
+                    if delivered:
+                        info["triggered"] = True
+                        runtime["last_triggered_rsi"][key] = rsi_time
         except Exception as e:
             runtime["rsi_status"] = "error"
             runtime["rsi_error"] = str(e)[:180]
@@ -1484,7 +1572,7 @@ def pick_due_scheduler_token(tokens, cfg):
         if not mint:
             continue
         interval = token_check_interval(token, cfg)
-        if now - scheduler_last_check_for(mint) >= interval:
+        if now - scheduler_last_check_for(mint, token) >= interval:
             SCHEDULER_CURSOR = (index + 1) % token_count
             return token
     return None
@@ -1500,7 +1588,7 @@ def scheduler_sleep_seconds(tokens, cfg):
         if not mint:
             continue
         interval = token_check_interval(token, cfg)
-        waits.append(max(0, interval - (now - scheduler_last_check_for(mint))))
+        waits.append(max(0, interval - (now - scheduler_last_check_for(mint, token))))
     if not waits:
         return 30
     return max(5, min(30, min(waits)))
@@ -1555,6 +1643,7 @@ def check_prices():
     usdc_returned = atomic_to_amount(usdc_returned_raw, input_decimals) if usdc_returned_raw else None
 
     price_buy = price_sell = None
+    price_error = None
 
     if token_received:
         price_buy = USD_AMOUNT / token_received
@@ -1569,13 +1658,15 @@ def check_prices():
                 trigger_ready, trigger_time = should_alert(last_buy_alert, price_key)
 
                 if trigger_ready and price_buy <= alert_price:
-                    send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}")
-                    notify_backend_trigger("buy", alert_price)
-                    last_buy_alert[price_key] = trigger_time
-                    status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False)
+                    delivered = send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}")
+                    if delivered:
+                        notify_backend_trigger("buy", alert_price)
+                        last_buy_alert[price_key] = trigger_time
+                        status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False, check_completed=False)
             except ValueError:
                 continue
     else:
+        price_error = "Could not fetch USDC -> token quote"
         print("Could not fetch USDC -> token quote.", flush=True)
 
     if usdc_returned and token_received:
@@ -1591,13 +1682,16 @@ def check_prices():
                 trigger_ready, trigger_time = should_alert(last_sell_alert, price_key)
 
                 if trigger_ready and price_sell >= alert_price:
-                    send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}")
-                    notify_backend_trigger("sell", alert_price)
-                    last_sell_alert[price_key] = trigger_time
-                    status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False)
+                    delivered = send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}")
+                    if delivered:
+                        notify_backend_trigger("sell", alert_price)
+                        last_sell_alert[price_key] = trigger_time
+                        status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False, check_completed=False)
             except ValueError:
                 continue
     else:
+        if not price_error:
+            price_error = "Could not fetch token -> USDC quote"
         print("Could not fetch token -> USDC quote.", flush=True)
 
     now_utc = datetime.now(timezone.utc)
@@ -1639,6 +1733,7 @@ def check_prices():
                         )
                         if crossed_back:
                             info["triggered"] = False
+                            info.pop("triggered_at", None)
                             try:
                                 requests.post(
                                     "http://127.0.0.1:8000/api/rsi/reset-alert",
@@ -1654,11 +1749,13 @@ def check_prices():
                     (direction == "below" and rsi_value < threshold)
                 )
                 if should_fire:
-                    info["triggered"] = True
                     msg = f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} {direction} {threshold}"
                     print(f"RSI Alert: {msg}", flush=True)
-                    send_alert("RSI Alert", msg)
-                    notify_backend_rsi_trigger(key, rsi_time)
+                    delivered = send_alert("RSI Alert", msg)
+                    if delivered:
+                        info["triggered"] = True
+                        info["triggered_at"] = rsi_time
+                        notify_backend_rsi_trigger(key, rsi_time)
 
         except Exception as e:
             LATEST_RSI_STATUS = "error"
@@ -1666,7 +1763,13 @@ def check_prices():
             LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
             print(f"RSI check failed: {e}", flush=True)
 
-    status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned)
+    status_timestamp = write_status_json(
+        price_buy,
+        price_sell,
+        token_received,
+        usdc_returned,
+        error=price_error,
+    )
     print(f"Tracked BUY cooldowns: {list(last_buy_alert.keys())}", flush=True)
     print(f"Tracked SELL cooldowns: {list(last_sell_alert.keys())}", flush=True)
 
@@ -1712,7 +1815,7 @@ def background_alert_cleaner():
                             )
                             if resp.ok:
                                 alert_dict.pop(key, None)
-                                write_status_json(None, None, None, None)
+                                write_status_json(None, None, None, None, check_completed=False)
                         except Exception as e:
                             print(f"Failed to auto-reset {label.upper()} alert {key}: {e}", flush=True)
 
@@ -1758,7 +1861,7 @@ def reset_alert(data: ResetAlert):
         return {"success": False, "error": "Invalid side"}
 
     # Immediately write updated config so it is saved.
-    write_status_json(None, None, None, None)
+    write_status_json(None, None, None, None, check_completed=False)
     return {"success": True}
     
 

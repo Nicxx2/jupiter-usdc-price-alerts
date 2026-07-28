@@ -333,7 +333,7 @@ class CommunityRuleTests(unittest.TestCase):
         stale_wait = stale_rules_state(waiting, config, stale_after_seconds=60, now=now)
         self.assertEqual(stale_wait["status"], "unknown")
 
-    def test_rule_tokens_are_independent_and_have_no_active_fallback(self):
+    def test_rule_tokens_exclude_disabled_and_have_no_active_fallback(self):
         enabled_rules = config_for(("min_holders", 1000))
         cfg = {
             "tokens": [
@@ -343,7 +343,7 @@ class CommunityRuleTests(unittest.TestCase):
         }
         result = self.main.configured_rule_tokens(cfg)
 
-        self.assertEqual([token["mint"] for token in result], [MINT])
+        self.assertEqual(result, [])
         self.assertEqual(self.main.configured_rule_tokens({"tokens": []}), [])
         self.assertEqual(self.main.configured_rule_tokens({
             "community_rules_enabled": False,
