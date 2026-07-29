@@ -245,6 +245,9 @@ type TokenSummary = TokenConfig & {
   rsi_status?: string | null;
   last_checked?: string | null;
   next_check_at?: string | null;
+  price_status?: string | null;
+  price_message?: string | null;
+  price_verification_due_at?: string | null;
   effective_check_interval?: number | null;
   effective_rsi_check_interval?: number | null;
   error?: string | null;
@@ -1554,7 +1557,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.4</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.5</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -1760,9 +1763,10 @@ export default function AlertsDashboard() {
                           ? fmt(row.rsi, 2)
                           : "--";
                   const rowRulesMeta = jupiterApiConfigured ? rulesStatusMeta(row.rules_state, rulesDraft(row.rules_config)) : RULES_KEY_REQUIRED_META;
-                  const scheduleLabel = formatTokenSchedule(row.next_check_at);
-                  const statusLabel = row.error ? "Issue" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
-                  const dotClass = row.error ? "bg-red-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
+                  const isPriceVerifying = row.price_status === "verifying";
+                  const scheduleLabel = isPriceVerifying ? "Verifying move" : formatTokenSchedule(row.next_check_at);
+                  const statusLabel = row.error ? "Issue" : isPriceVerifying ? "Verifying move" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
+                  const dotClass = row.error ? "bg-red-500" : isPriceVerifying ? "bg-yellow-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
                   return (
                     <button
                       key={row.mint}
@@ -1775,7 +1779,7 @@ export default function AlertsDashboard() {
                           ? "md:grid-cols-[minmax(0,1.65fr)_repeat(6,minmax(4.75rem,1fr))]"
                           : "md:grid-cols-[minmax(0,1.65fr)_repeat(5,minmax(4.75rem,1fr))]"
                       }`}
-                      title={row.error || row.mint}
+                      title={row.error || row.price_message || row.mint}
                     >
                       <span className="col-span-2 flex min-w-0 items-center gap-1.5 md:col-span-1">
                         <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${dotClass}`} />
@@ -1795,7 +1799,7 @@ export default function AlertsDashboard() {
                         <span className="min-w-0 truncate">Rules <strong>{rowRulesMeta.label}</strong></span>
                       )}
                       <span className="min-w-0 truncate">{topicSourceLabel(row.ntfy_topic_source)}</span>
-                      <span className="min-w-0 truncate" title={row.next_check_at || undefined}>{scheduleLabel || statusLabel}</span>
+                      <span className="min-w-0 truncate" title={row.price_message || row.next_check_at || undefined}>{scheduleLabel || statusLabel}</span>
                     </button>
                   );
                 })
@@ -1920,15 +1924,18 @@ export default function AlertsDashboard() {
                               : "--";
                       const rowRulesMeta = jupiterApiConfigured ? rulesStatusMeta(row.rules_state, rulesDraft(row.rules_config)) : RULES_KEY_REQUIRED_META;
                       const isEditing = editingTokenMint === row.mint;
-                      const rowStatus = row.error ? "Issue" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
-                      const dotClass = row.error ? "bg-red-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
+                      const isPriceVerifying = row.price_status === "verifying";
+                      const rowStatus = row.error ? "Issue" : isPriceVerifying ? "Verifying move" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
+                      const dotClass = row.error ? "bg-red-500" : isPriceVerifying ? "bg-yellow-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
                       const statusClass = row.error
                         ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
-                        : row.active
-                          ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300"
-                          : row.rsi_status === "stale"
-                            ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300"
-                            : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300";
+                        : isPriceVerifying
+                          ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300"
+                          : row.active
+                            ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300"
+                            : row.rsi_status === "stale"
+                              ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300"
+                              : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300";
                       const draft = tokenDrafts[row.mint] || {
                         name: row.name || "",
                         ntfy_topic: row.ntfy_topic || "",
@@ -1943,13 +1950,13 @@ export default function AlertsDashboard() {
                       const effectivePriceInterval = row.effective_check_interval ?? safe(draft.check_interval || checkInterval, checkInterval);
                       const effectiveRsiInterval = row.effective_rsi_check_interval ?? safe(draft.rsi_check_interval || rsiCheckInterval, rsiCheckInterval);
                       const lastCheckedLabel = formatTokenTime(row.last_checked);
-                      const nextCheckLabel = formatTokenSchedule(row.next_check_at);
+                      const nextCheckLabel = isPriceVerifying ? "Verifying move" : formatTokenSchedule(row.next_check_at);
                       return (
                         <div key={row.mint} className="border-t border-gray-200 p-3 first:border-t-0 dark:border-gray-700">
                           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                             <div className="min-w-0 space-y-2">
                               <div className="flex min-w-0 flex-wrap items-center gap-2">
-                                <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${dotClass}`} title={row.error || row.rsi_status || undefined} />
+                                <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${dotClass}`} title={row.error || row.price_message || row.rsi_status || undefined} />
                                 <span className="truncate font-medium">{tokenName(row)}</span>
                                 <span className={`rounded px-2 py-0.5 text-xs ${statusClass}`}>{rowStatus}</span>
                                 <span className="min-w-0 truncate font-mono text-xs text-gray-500" title={row.mint}>{shortMint(row.mint)}</span>
@@ -1977,7 +1984,7 @@ export default function AlertsDashboard() {
                                 )}
                                 <span>Alert reset {row.alert_reset_minutes ?? alertResetMinutes}m</span>
                                 {lastCheckedLabel && <span title={row.last_checked || undefined}>Last {lastCheckedLabel}</span>}
-                                {nextCheckLabel && <span title={row.next_check_at || undefined}>{nextCheckLabel}</span>}
+                                {nextCheckLabel && <span title={row.price_message || row.next_check_at || undefined}>{nextCheckLabel}</span>}
                               </div>
                             </div>
 

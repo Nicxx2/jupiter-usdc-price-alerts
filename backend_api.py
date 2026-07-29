@@ -596,6 +596,10 @@ def get_token_state_summary():
         effective_rsi_check_interval = optional_bounded_int(token.get("rsi_check_interval"), 1, 43200) or state["rsi_check_interval"]
         last_checked = token_state.get("last_checked_at") or token_state.get("timestamp")
         rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
+        token_enabled = coerce_bool(token.get("enabled"), True)
+        price_status = token_state.get("price_status") if token_enabled else None
+        price_message = token_state.get("price_message") if token_enabled else None
+        price_verification_due_at = token_state.get("price_verification_due_at") if price_status == "verifying" else None
         rsi_error = token_state.get("rsi_error")
         rsi_status = token_state.get("rsi_status")
         rsi_value = token_state.get("latest_rsi")
@@ -623,7 +627,10 @@ def get_token_state_summary():
             "rsi": rsi_value,
             "rsi_status": rsi_status,
             "last_checked": last_checked,
-            "next_check_at": derived_next_check_at(last_checked, effective_check_interval, token_state.get("next_check_at")),
+            "next_check_at": price_verification_due_at or derived_next_check_at(last_checked, effective_check_interval, token_state.get("next_check_at")),
+            "price_status": price_status,
+            "price_message": price_message,
+            "price_verification_due_at": price_verification_due_at,
             "error": token_state.get("error") or (None if rsi_status == "disabled" or is_rsi_warmup_message(rsi_error) else rsi_error),
             "ntfy_topic": token.get("ntfy_topic", ""),
             "ntfy_effective_topic": effective_ntfy_topic(token),

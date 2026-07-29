@@ -141,6 +141,8 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
     def setUp(self):
         self.main.SCHEDULER_LAST_CHECK.clear()
         self.main.SCHEDULER_TOKEN_NONCES.clear()
+        self.main.PRICE_CONFIRMATIONS.clear()
+        self.main.QUOTE_CACHE.clear()
         self.main.SCHEDULER_CURSOR = 0
 
     def test_token_intervals_inherit_global_defaults(self):
@@ -204,6 +206,242 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.assertIsNone(self.main.pick_due_scheduler_token(tokens, {"check_interval": 60}))
         self.assertEqual(self.main.scheduler_sleep_seconds(tokens, {"check_interval": 60}), 30)
 
+    def test_background_token_never_uses_active_tokens_legacy_history_as_baseline(self):
+        now = datetime.now(timezone.utc).isoformat()
+        active_history = [
+            {"timestamp": now, "buy_price": 1.0, "sell_price": 0.9},
+            {"timestamp": now, "buy_price": 1.01, "sell_price": 0.91},
+            {"timestamp": now, "buy_price": 0.99, "sell_price": 0.89},
+        ]
+        with mock.patch.object(
+            self.main,
+            "token_state_from_shared",
+            return_value=({"active_token_mint": "ActiveToken", "latest_prices": active_history}, {}),
+        ):
+            baseline = self.main.recent_price_baseline("BackgroundToken")
+
+        self.assertEqual(baseline, {})
+    def test_price_confirmation_threshold_and_tolerance_boundaries_are_inclusive(self):
+        with mock.patch.multiple(
+            self.main,
+            PRICE_MOVE_CONFIRMATION_THRESHOLD_PERCENT=50.0,
+            PRICE_MOVE_CONFIRMATION_TOLERANCE_PERCENT=15.0,
+        ):
+            self.assertTrue(self.main.price_sample_is_extreme({"buy": 0.5}, {"buy": 1.0}))
+            self.assertTrue(self.main.price_sample_is_extreme({"buy": 1.5}, {"buy": 1.0}))
+            self.assertFalse(self.main.price_sample_is_extreme({"buy": 0.5001}, {"buy": 1.0}))
+            self.assertTrue(self.main.price_samples_are_close({"buy": 100.0}, {"buy": 115.0}))
+            self.assertFalse(self.main.price_samples_are_close({"buy": 100.0}, {"buy": 115.01}))
+    def test_extreme_price_sample_recovers_without_accepting_the_outlier(self):
+        token = {"mint": "TokenMove", "runtime_nonce": "generation-a"}
+        with mock.patch.object(self.main, "recent_price_baseline", return_value={"buy": 1.0, "sell": 0.9}):
+            first = self.main.assess_price_sample(token, 0.1, 0.09, now=100.0)
+            second = self.main.assess_price_sample(token, 0.99, 0.89, now=105.0)
+
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(first["due_at"], 105.0)
+        self.assertEqual(second, {"status": "accepted", "reason": "recovered"})
+        self.assertNotIn(token["mint"], self.main.PRICE_CONFIRMATIONS)
+
+    def test_two_similar_extreme_samples_confirm_a_real_move(self):
+        token = {"mint": "TokenConfirmedMove", "runtime_nonce": "generation-a"}
+        with mock.patch.object(self.main, "recent_price_baseline", return_value={"buy": 1.0, "sell": 0.9}):
+            first = self.main.assess_price_sample(token, 0.1, 0.09, now=100.0)
+            second = self.main.assess_price_sample(token, 0.105, 0.094, now=105.0)
+
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second, {"status": "accepted", "reason": "confirmed"})
+        self.assertNotIn(token["mint"], self.main.PRICE_CONFIRMATIONS)
+
+    def test_confirmation_is_bounded_when_follow_up_quotes_are_unavailable(self):
+        token = {"mint": "TokenAmbiguousMove", "runtime_nonce": "generation-a"}
+        with mock.patch.object(self.main, "recent_price_baseline", return_value={"buy": 1.0, "sell": 0.9}):
+            first = self.main.assess_price_sample(token, 0.1, 0.09, now=100.0)
+            second = self.main.assess_price_sample(token, None, None, now=105.0)
+            third = self.main.assess_price_sample(token, None, None, now=110.0)
+
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(third["status"], "rejected")
+        self.assertNotIn(token["mint"], self.main.PRICE_CONFIRMATIONS)
+
+    def test_changed_token_generation_invalidates_pending_confirmation(self):
+        original = {"mint": "TokenReaddedMove", "runtime_nonce": "old"}
+        replacement = {"mint": "TokenReaddedMove", "runtime_nonce": "new"}
+        with mock.patch.object(self.main, "recent_price_baseline", return_value={"buy": 1.0, "sell": 0.9}):
+            self.main.assess_price_sample(original, 0.1, 0.09, now=100.0)
+
+        self.assertIsNone(self.main.valid_price_confirmation(replacement))
+        self.assertNotIn(original["mint"], self.main.PRICE_CONFIRMATIONS)
+
+    def test_quote_amount_change_invalidates_pending_confirmation(self):
+        original = {"mint": "TokenSettingsMove", "runtime_nonce": "same", "usd_amount": 100}
+        changed = {"mint": "TokenSettingsMove", "runtime_nonce": "same", "usd_amount": 250}
+        with mock.patch.object(self.main, "recent_price_baseline", return_value={"buy": 1.0, "sell": 0.9}):
+            self.main.assess_price_sample(original, 0.1, 0.09, now=100.0)
+        self.main.SCHEDULER_LAST_CHECK[original["mint"]] = 100.0
+
+        self.assertIsNone(self.main.valid_price_confirmation(changed))
+        self.assertNotIn(original["mint"], self.main.PRICE_CONFIRMATIONS)
+        self.assertNotIn(original["mint"], self.main.SCHEDULER_LAST_CHECK)
+
+    def test_scheduler_sleep_uses_pending_confirmation_deadline(self):
+        token = {"mint": "TokenSleepMove", "runtime_nonce": "sleep"}
+        self.main.PRICE_CONFIRMATIONS[token["mint"]] = {
+            "signature": self.main.price_confirmation_signature(token),
+            "due_at": 107.0,
+            "other_token_needed": False,
+            "samples": [],
+            "attempts": 1,
+        }
+        with mock.patch.object(self.main.time, "time", return_value=100.0):
+            sleep_for = self.main.scheduler_sleep_seconds([token], {"check_interval": 60})
+
+        self.assertEqual(sleep_for, 7.0)
+    def test_due_confirmation_gives_one_other_due_token_a_turn(self):
+        tokens = [
+            {"mint": "TokenPending", "runtime_nonce": "pending"},
+            {"mint": "TokenOther", "runtime_nonce": "other"},
+        ]
+        pending = tokens[0]
+        self.main.PRICE_CONFIRMATIONS[pending["mint"]] = {
+            "signature": self.main.price_confirmation_signature(pending),
+            "due_at": 90.0,
+            "other_token_needed": True,
+            "samples": [],
+            "attempts": 1,
+        }
+        with mock.patch.object(self.main.time, "time", return_value=100.0), mock.patch.object(
+            self.main, "scheduler_last_check_for", return_value=0.0
+        ):
+            other = self.main.pick_due_scheduler_token(tokens, {"check_interval": 60})
+            self.main.note_scheduler_token_processed(other["mint"])
+            confirmation = self.main.pick_due_scheduler_token(tokens, {"check_interval": 60})
+
+        self.assertEqual(other["mint"], "TokenOther")
+        self.assertFalse(other.get("_price_confirmation", False))
+        self.assertEqual(confirmation["mint"], "TokenPending")
+        self.assertTrue(confirmation["_price_confirmation"])
+
+    def test_single_token_confirmation_does_not_wait_for_a_nonexistent_peer(self):
+        token = {"mint": "OnlyToken", "runtime_nonce": "only"}
+        self.main.PRICE_CONFIRMATIONS[token["mint"]] = {
+            "signature": self.main.price_confirmation_signature(token),
+            "due_at": 90.0,
+            "other_token_needed": True,
+            "samples": [],
+            "attempts": 1,
+        }
+        with mock.patch.object(self.main.time, "time", return_value=100.0):
+            selected = self.main.pick_due_scheduler_token([token], {"check_interval": 60})
+
+        self.assertEqual(selected["mint"], token["mint"])
+        self.assertTrue(selected["_price_confirmation"])
+
+    def test_suspicious_scheduled_quote_cannot_alert_or_write_history_until_confirmed(self):
+        token = {
+            "mint": "TokenIntegratedMove",
+            "name": "Integrated move",
+            "runtime_nonce": "move-generation",
+            "buy_alerts": [0.5],
+            "sell_alerts": [0.05],
+            "rsi_enabled": True,
+        }
+        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_enabled": True}
+        send = mock.Mock(return_value=True)
+        full_writer = mock.Mock(return_value=True)
+        marker_writer = mock.Mock(return_value=True)
+        rsi = mock.Mock(return_value=(50.0, "2026-07-29T12:00:00+00:00"))
+        quote_outputs = iter([1_000_000_000, 100_000_000, 1_050_000_000, 105_000_000])
+
+        def staged_quote(input_mint, output_mint, amount, cache_result=True, quote_capture=None):
+            out_amount = next(quote_outputs)
+            key = (str(input_mint), str(output_mint), int(amount))
+            entry = {"quote": {"outAmount": str(out_amount)}, "fetched_at": "2026-07-29T12:00:00+00:00"}
+            if cache_result:
+                self.main.QUOTE_CACHE[key] = entry
+            if isinstance(quote_capture, dict):
+                quote_capture[key] = entry
+            return out_amount
+
+        runtime_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES.pop(token["mint"], None)
+            with mock.patch.multiple(
+                self.main,
+                SOLANATRACKER_API_KEY="key",
+                SOLANATRACKER_FEATURES_ENABLED=True,
+                resolve_token_decimals=mock.Mock(return_value=6),
+                get_out_amount_raw=mock.Mock(side_effect=staged_quote),
+                get_latest_rsi=rsi,
+                recent_price_baseline=mock.Mock(return_value={"buy": 1.0, "sell": 0.9}),
+                send_alert=send,
+                write_scheduled_token_status=full_writer,
+                write_price_verification_state=marker_writer,
+            ):
+                first = self.main.check_scheduled_token(token, cfg)
+                self.assertEqual(first["status"], "pending")
+                send.assert_not_called()
+                full_writer.assert_not_called()
+                marker_writer.assert_called_once()
+                self.assertEqual(rsi.call_count, 1)
+                self.assertEqual(self.main.QUOTE_CACHE, {})
+
+                second = self.main.check_scheduled_token(token, cfg, price_only=True)
+
+            self.assertEqual(second, {"status": "accepted", "reason": "confirmed"})
+            self.assertEqual(send.call_count, 2)
+            full_writer.assert_called_once()
+            self.assertEqual(rsi.call_count, 1)
+            self.assertEqual(len(self.main.QUOTE_CACHE), 2)
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtime_before)
+
+    def test_verification_marker_preserves_last_trusted_price_and_history(self):
+        mint = "TokenPersistedMove"
+        token = {"mint": mint, "runtime_nonce": "persisted-generation"}
+        existing = {
+            "token_states": {
+                mint: {
+                    "runtime_nonce": "persisted-generation",
+                    "buy_price": 1.0,
+                    "sell_price": 0.9,
+                    "last_checked_at": "2026-07-29T11:00:00+00:00",
+                }
+            },
+            "token_price_history": {mint: [{"timestamp": "2026-07-29T11:00:00+00:00", "buy_price": 1.0, "sell_price": 0.9}]},
+        }
+        captured = {}
+
+        class DummyLock:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.multiple(
+            self.main,
+            read_json_file=mock.Mock(return_value=copy.deepcopy(existing)),
+            atomic_write_json=mock.Mock(side_effect=lambda _path, data: captured.update(data=copy.deepcopy(data))),
+            json_file_lock=mock.Mock(side_effect=lambda _path: DummyLock()),
+        ):
+            wrote = self.main.write_price_verification_state(
+                token,
+                "verifying",
+                "Verifying an unusual Jupiter price move",
+                due_at=100.0,
+            )
+
+        state = captured["data"]["token_states"][mint]
+        self.assertTrue(wrote)
+        self.assertEqual(state["buy_price"], 1.0)
+        self.assertEqual(state["sell_price"], 0.9)
+        self.assertEqual(state["last_checked_at"], "2026-07-29T11:00:00+00:00")
+        self.assertEqual(captured["data"]["token_price_history"], existing["token_price_history"])
+        self.assertEqual(state["price_status"], "verifying")
+        self.assertIsNone(state["error"])
     def test_active_switch_invalidates_alert_runtime_without_moving_schedule(self):
         previous_mint = "TokenPrevious"
         next_mint = "TokenNext"
@@ -336,6 +574,64 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.assertEqual(store["token_states"][mint]["runtime_nonce"], "new-generation")
         self.assertEqual(store["token_states"][mint]["last_triggered_buy"], {})
 
+    def test_stale_verification_write_cannot_overwrite_readded_token(self):
+        mint = "TokenReaddedDuringVerification"
+        existing = {"token_states": {mint: {"runtime_nonce": "new-generation", "buy_price": 1.0}}}
+        writer = mock.Mock()
+
+        class DummyLock:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch.multiple(
+            self.main,
+            read_json_file=mock.Mock(return_value=copy.deepcopy(existing)),
+            atomic_write_json=writer,
+            json_file_lock=mock.Mock(side_effect=lambda _path: DummyLock()),
+        ):
+            wrote = self.main.write_price_verification_state(
+                {"mint": mint, "runtime_nonce": "old-generation"},
+                "verifying",
+                "Verifying an unusual Jupiter price move",
+                due_at=100.0,
+            )
+
+        self.assertFalse(wrote)
+        writer.assert_not_called()
+    def test_price_quote_can_be_staged_without_leaking_into_shared_cache(self):
+        capture = {}
+        with mock.patch.object(self.main, "get_quote", return_value={"outAmount": "12345"}):
+            out_amount = self.main.get_out_amount_raw(
+                "InputMint",
+                "OutputMint",
+                1000,
+                cache_result=False,
+                quote_capture=capture,
+            )
+
+        key = ("InputMint", "OutputMint", 1000)
+        self.assertEqual(out_amount, 12345)
+        self.assertNotIn(key, self.main.QUOTE_CACHE)
+        self.assertEqual(capture[key]["quote"]["outAmount"], "12345")
+
+    def test_disabled_pending_token_is_removed_and_rechecks_immediately_if_reenabled(self):
+        mint = "TokenTemporarilyDisabled"
+        token = {"mint": mint, "runtime_nonce": "same"}
+        self.main.PRICE_CONFIRMATIONS[mint] = {
+            "signature": self.main.price_confirmation_signature(token),
+            "due_at": 100.0,
+            "other_token_needed": True,
+            "samples": [],
+            "attempts": 1,
+        }
+        self.main.SCHEDULER_LAST_CHECK[mint] = 100.0
+
+        self.assertIsNone(self.main.pick_due_scheduler_token([], {"check_interval": 60}))
+        self.assertNotIn(mint, self.main.PRICE_CONFIRMATIONS)
+        self.assertNotIn(mint, self.main.SCHEDULER_LAST_CHECK)
     def test_rate_limit_mode_off_bypasses_limiter(self):
         self.main.SOLANATRACKER_RATE_LIMIT_MODE = "off"
         self.main.SOLANATRACKER_REQUESTS_PER_SECOND = 50
@@ -558,6 +854,57 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.assertIn("2.00000000", self.main.last_buy_alert)
             notify.assert_called_once_with("buy", 2.0)
 
+    def test_suspicious_active_quote_is_not_published_until_confirmed(self):
+        send = mock.Mock(return_value=True)
+        notify = mock.Mock()
+        status_writer = mock.Mock(return_value="2026-07-29T12:00:00+00:00")
+        marker_writer = mock.Mock(return_value=True)
+        with mock.patch.multiple(
+            self.main,
+            load_dynamic_config=mock.Mock(),
+            resolve_token_decimals=mock.Mock(return_value=6),
+            get_out_amount_raw=mock.Mock(side_effect=[1_000_000_000, 100_000_000, 1_050_000_000, 105_000_000]),
+            recent_price_baseline=mock.Mock(return_value={"buy": 1.0, "sell": 0.9}),
+            send_alert=send,
+            notify_backend_trigger=notify,
+            write_status_json=status_writer,
+            write_price_verification_state=marker_writer,
+            OUTPUT_MINT=SOL_MINT,
+            USD_AMOUNT=100.0,
+            BUY_ALERTS=[0.5],
+            SELL_ALERTS=[],
+            ALERT_RESET_MINUTES=0,
+            INPUT_DECIMALS=6,
+            OUTPUT_DECIMALS=6,
+            CHECK_INTERVAL=60,
+            ACTIVE_TOKEN_CONFIG={"mint": SOL_MINT, "runtime_nonce": "active-move", "rsi_enabled": False},
+            last_buy_alert={},
+            last_sell_alert={},
+            RSI_STATE={},
+            _last_rsi_at=None,
+            LATEST_RSI=None,
+            LATEST_RSI_TIME=None,
+            LATEST_RSI_STATUS="disabled",
+            LATEST_RSI_ERROR=None,
+            LATEST_RSI_LAST_FETCH_AT=None,
+        ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)) as post:
+            first = self.main.check_prices()
+            self.assertEqual(first["status"], "pending")
+            send.assert_not_called()
+            status_writer.assert_not_called()
+            post.assert_not_called()
+
+            second = self.main.check_prices(price_only=True)
+
+        self.assertEqual(second, {"status": "accepted", "reason": "confirmed"})
+        send.assert_called_once()
+        notify.assert_called_once_with("buy", 0.5)
+        completed_writes = [
+            call for call in status_writer.call_args_list
+            if call.kwargs.get("check_completed", True)
+        ]
+        self.assertEqual(len(completed_writes), 1)
+        post.assert_called_once()
     def test_active_rsi_trigger_persists_when_backend_callback_fails(self):
         trigger_key = "above:50.00"
         trigger_time = "2026-07-28T16:00:00+00:00"
@@ -670,6 +1017,41 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.assertEqual(token_state, {"runtime_nonce": "new-generation"})
         self.assertNotIn(mint, captured["data"]["token_price_history"])
 
+    def test_backend_summary_exposes_price_verification_due_time(self):
+        backend = import_backend_module()
+        due_at = "2026-07-29T12:00:05+00:00"
+        originals = {
+            "tokens": copy.deepcopy(backend.state.get("tokens", [])),
+            "active_token_mint": backend.state.get("active_token_mint"),
+            "solanatracker_features_enabled": backend.state.get("solanatracker_features_enabled"),
+            "read_json_file": backend.read_json_file,
+        }
+        try:
+            backend.state["tokens"] = [{"mint": SOL_MINT, "name": "SOL", "enabled": True}]
+            backend.state["active_token_mint"] = SOL_MINT
+            backend.state["solanatracker_features_enabled"] = False
+            backend.read_json_file = lambda _path: {
+                "token_states": {
+                    SOL_MINT: {
+                        "last_checked_at": "2026-07-29T11:59:00+00:00",
+                        "price_status": "verifying",
+                        "price_message": "Verifying an unusual Jupiter price move",
+                        "price_verification_due_at": due_at,
+                    }
+                }
+            }
+
+            summary = backend.get_token_state_summary()[0]
+
+            self.assertEqual(summary["price_status"], "verifying")
+            self.assertEqual(summary["price_verification_due_at"], due_at)
+            self.assertEqual(summary["next_check_at"], due_at)
+            self.assertIsNone(summary["error"])
+        finally:
+            backend.state["tokens"] = originals["tokens"]
+            backend.state["active_token_mint"] = originals["active_token_mint"]
+            backend.state["solanatracker_features_enabled"] = originals["solanatracker_features_enabled"]
+            backend.read_json_file = originals["read_json_file"]
     def test_backend_summary_derives_next_from_actual_check_and_current_interval(self):
         backend = import_backend_module()
         checked_at = "2026-07-28T12:00:00+00:00"

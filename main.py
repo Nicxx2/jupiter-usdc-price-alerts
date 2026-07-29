@@ -6,6 +6,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
+from statistics import median
 from jupiter_quote import JupiterQuoteError, get_quote, get_token_information, price_impact_percent
 from community_rules import (
     advance_alert_state,
@@ -137,6 +138,20 @@ TOKEN_RUNTIMES: Dict[str, Dict[str, Any]] = {}
 SCHEDULER_LAST_CHECK: Dict[str, float] = {}
 SCHEDULER_TOKEN_NONCES: Dict[str, str] = {}
 SCHEDULER_CURSOR = 0
+PRICE_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+PRICE_MOVE_CONFIRMATION_ENABLED = coerce_bool(os.getenv("PRICE_MOVE_CONFIRMATION_ENABLED"), True)
+PRICE_MOVE_CONFIRMATION_THRESHOLD_PERCENT = env_float(
+    "PRICE_MOVE_CONFIRMATION_THRESHOLD_PERCENT", 50.0, minimum=5.0, maximum=1000.0
+)
+PRICE_MOVE_CONFIRMATION_TOLERANCE_PERCENT = env_float(
+    "PRICE_MOVE_CONFIRMATION_TOLERANCE_PERCENT", 15.0, minimum=1.0, maximum=100.0
+)
+PRICE_MOVE_CONFIRMATION_DELAY_SECONDS = env_int(
+    "PRICE_MOVE_CONFIRMATION_DELAY_SECONDS", 5, minimum=5, maximum=60
+)
+PRICE_MOVE_CONFIRMATION_MAX_SAMPLES = 3
+PRICE_MOVE_CONFIRMATION_BASELINE_POINTS = 7
+PRICE_MOVE_CONFIRMATION_MIN_BASELINE_POINTS = 3
 COMMUNITY_RULES_CHECK_INTERVAL = env_int("COMMUNITY_RULES_CHECK_INTERVAL", 120, minimum=60, maximum=3600)
 COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS", 90, minimum=30, maximum=3600)
 COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS", 3600, minimum=300, maximum=86400)
@@ -864,18 +879,23 @@ def notify_backend_rsi_trigger(key: str, timestamp: str):
         print(f"Failed to notify backend of RSI trigger: {e}", flush=True)
         return False
 
-def get_out_amount_raw(input_mint, output_mint, amount_lamports):
+def get_out_amount_raw(input_mint, output_mint, amount_lamports, cache_result=True, quote_capture=None):
     """
     Uses Jupiter Swap V2 order in quote-only mode and returns raw outAmount.
     The caller is responsible for converting raw token units with the output mint decimals.
+    Price checks can stage quotes in quote_capture so unconfirmed samples never enter shared caches.
     """
     try:
         quote = get_quote(input_mint, output_mint, amount_lamports)
         key = (str(input_mint), str(output_mint), int(amount_lamports))
-        QUOTE_CACHE[key] = {
+        cache_entry = {
             "quote": quote,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
+        if cache_result:
+            QUOTE_CACHE[key] = cache_entry
+        if isinstance(quote_capture, dict):
+            quote_capture[key] = cache_entry
         return int(quote.get("outAmount", "0"))
     except JupiterQuoteError as e:
         print(f"Jupiter quote failed after retries: {e}", flush=True)
@@ -989,6 +1009,163 @@ def get_token_price_history(source, mint):
     return prune_history_points(source.get("latest_prices", [])) if isinstance(source, dict) else []
 
 
+
+def valid_price_sample(value):
+    try:
+        number = float(value)
+        return number if number > 0 and number == number and number not in (float("inf"), float("-inf")) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def price_confirmation_signature(token_config):
+    token_config = token_config or {}
+    return (
+        str(token_config.get("mint") or "").strip(),
+        str(token_config.get("runtime_nonce") or ""),
+        round(token_usd_amount(token_config), 12),
+        token_input_decimals(token_config),
+        token_output_decimals(token_config),
+    )
+
+
+def recent_price_baseline(mint):
+    state_data, _token_state = token_state_from_shared(mint)
+    histories = state_data.get("token_price_history", {}) if isinstance(state_data, dict) else {}
+    if isinstance(histories, dict) and mint in histories:
+        candidate_points = histories.get(mint, [])
+    else:
+        legacy_active_mint = str(state_data.get("active_token_mint") or "") if isinstance(state_data, dict) else ""
+        use_legacy_history = legacy_active_mint == mint or (not legacy_active_mint and mint == OUTPUT_MINT)
+        candidate_points = state_data.get("latest_prices", []) if use_legacy_history else []
+    if not isinstance(candidate_points, list):
+        candidate_points = []
+    recent_candidates = candidate_points[-(PRICE_MOVE_CONFIRMATION_BASELINE_POINTS * 3):]
+    points = prune_history_points(recent_candidates)[-PRICE_MOVE_CONFIRMATION_BASELINE_POINTS:]
+    baseline = {}
+    for side, field in (("buy", "buy_price"), ("sell", "sell_price")):
+        values = [valid_price_sample(point.get(field)) for point in points if isinstance(point, dict)]
+        values = [value for value in values if value is not None]
+        if len(values) >= PRICE_MOVE_CONFIRMATION_MIN_BASELINE_POINTS:
+            baseline[side] = median(values)
+    return baseline
+
+
+def price_change_percent(value, baseline):
+    value = valid_price_sample(value)
+    baseline = valid_price_sample(baseline)
+    if value is None or baseline is None:
+        return None
+    return abs(value - baseline) / baseline * 100.0
+
+
+def price_sample_is_extreme(sample, baseline):
+    for side in ("buy", "sell"):
+        change = price_change_percent(sample.get(side), baseline.get(side))
+        if change is not None and change >= PRICE_MOVE_CONFIRMATION_THRESHOLD_PERCENT:
+            return True
+    return False
+
+
+def price_samples_are_close(first, second):
+    compared = 0
+    for side in ("buy", "sell"):
+        first_value = valid_price_sample(first.get(side))
+        second_value = valid_price_sample(second.get(side))
+        if first_value is None or second_value is None:
+            continue
+        compared += 1
+        if abs(first_value - second_value) / first_value * 100.0 > PRICE_MOVE_CONFIRMATION_TOLERANCE_PERCENT:
+            return False
+    return compared > 0
+
+
+def assess_price_sample(token_config, price_buy, price_sell, now=None):
+    """Quarantine a large move until a bounded, rate-limited follow-up confirms it."""
+    mint = str((token_config or {}).get("mint") or "").strip()
+    if not mint or not PRICE_MOVE_CONFIRMATION_ENABLED:
+        if mint:
+            PRICE_CONFIRMATIONS.pop(mint, None)
+        return {"status": "accepted", "reason": "disabled"}
+
+    now = time.time() if now is None else float(now)
+    signature = price_confirmation_signature(token_config)
+    pending = PRICE_CONFIRMATIONS.get(mint)
+    if pending and pending.get("signature") != signature:
+        PRICE_CONFIRMATIONS.pop(mint, None)
+        SCHEDULER_LAST_CHECK.pop(mint, None)
+        pending = None
+
+    sample = {
+        "buy": valid_price_sample(price_buy),
+        "sell": valid_price_sample(price_sell),
+        "sampled_at": now,
+    }
+
+    if pending:
+        pending["attempts"] = int(pending.get("attempts", 1)) + 1
+        baseline = pending.get("baseline") or {}
+        has_price = sample["buy"] is not None or sample["sell"] is not None
+        if has_price and not price_sample_is_extreme(sample, baseline):
+            PRICE_CONFIRMATIONS.pop(mint, None)
+            return {"status": "accepted", "reason": "recovered"}
+        if has_price and any(price_samples_are_close(previous, sample) for previous in pending.get("samples", [])):
+            PRICE_CONFIRMATIONS.pop(mint, None)
+            return {"status": "accepted", "reason": "confirmed"}
+        if has_price:
+            pending.setdefault("samples", []).append(sample)
+        if pending["attempts"] >= PRICE_MOVE_CONFIRMATION_MAX_SAMPLES:
+            PRICE_CONFIRMATIONS.pop(mint, None)
+            return {
+                "status": "rejected",
+                "reason": "ambiguous",
+                "message": "Price move could not be confirmed; keeping the last trusted price",
+            }
+        pending["due_at"] = now + PRICE_MOVE_CONFIRMATION_DELAY_SECONDS
+        pending["other_token_needed"] = True
+        return {
+            "status": "pending",
+            "reason": "retry",
+            "due_at": pending["due_at"],
+            "message": "Verifying an unusual Jupiter price move",
+        }
+
+    baseline = recent_price_baseline(mint)
+    if not baseline or not price_sample_is_extreme(sample, baseline):
+        return {"status": "accepted", "reason": "normal"}
+
+    due_at = now + PRICE_MOVE_CONFIRMATION_DELAY_SECONDS
+    PRICE_CONFIRMATIONS[mint] = {
+        "signature": signature,
+        "baseline": baseline,
+        "samples": [sample],
+        "attempts": 1,
+        "due_at": due_at,
+        "other_token_needed": True,
+    }
+    return {
+        "status": "pending",
+        "reason": "unusual_move",
+        "due_at": due_at,
+        "message": "Verifying an unusual Jupiter price move",
+    }
+
+
+def valid_price_confirmation(token_config):
+    mint = str((token_config or {}).get("mint") or "").strip()
+    pending = PRICE_CONFIRMATIONS.get(mint)
+    if pending and pending.get("signature") != price_confirmation_signature(token_config):
+        PRICE_CONFIRMATIONS.pop(mint, None)
+        SCHEDULER_LAST_CHECK.pop(mint, None)
+        return None
+    return pending
+
+
+def note_scheduler_token_processed(mint):
+    for pending_mint, pending in PRICE_CONFIRMATIONS.items():
+        if pending_mint != mint:
+            pending["other_token_needed"] = False
+
 def merge_active_rsi_triggers(persisted_triggers):
     merged = dict(persisted_triggers) if isinstance(persisted_triggers, dict) else {}
     for key, info in RSI_STATE.items():
@@ -1066,6 +1243,9 @@ def write_status_json(
                         "token_received": round(token_received, 8) if token_received else None,
                         "usdc_returned": round(usdc_returned, 8) if usdc_returned else None,
                         "error": error,
+                        "price_status": "error" if error else "ok",
+                        "price_message": error,
+                        "price_verification_due_at": None,
                     })
                 token_states[OUTPUT_MINT] = next_token_state
             next_existing = {
@@ -1170,6 +1350,9 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
                 "last_triggered_sell": serialize_trigger_times(runtime.get("last_sell_alert")),
                 "last_triggered_rsi": dict(runtime.get("last_triggered_rsi") or {}),
                 "error": error,
+                "price_status": "error" if error else "ok",
+                "price_message": error,
+                "price_verification_due_at": None,
             }
             existing["token_states"] = token_states
             existing["token_price_history"] = existing.get("token_price_history", {})
@@ -1185,6 +1368,106 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
         print(f"Failed to write scheduled token state for {mint}: {e}", flush=True)
         return False
 
+
+def write_price_verification_state(
+    token_config,
+    status,
+    message,
+    due_at=None,
+    advance_schedule=False,
+    check_interval=None,
+    runtime=None,
+    rsi_enabled=None,
+):
+    mint = str((token_config or {}).get("mint") or "").strip()
+    if not mint:
+        return False
+    try:
+        with json_file_lock(shared_json_path):
+            existing = read_json_file(shared_json_path)
+            token_states = existing.get("token_states", {})
+            if not isinstance(token_states, dict):
+                token_states = {}
+            current = token_states.get(mint, {})
+            if not isinstance(current, dict):
+                current = {}
+            runtime_nonce = str((token_config or {}).get("runtime_nonce") or "")
+            persisted_nonce = str(current.get("runtime_nonce") or "")
+            if runtime_nonce and persisted_nonce and runtime_nonce != persisted_nonce:
+                print(f"Skipped stale price verification write for {mint}", flush=True)
+                return False
+
+            now = time.time()
+            timestamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+            next_state = {
+                **current,
+                "runtime_nonce": runtime_nonce or persisted_nonce,
+                "name": token_label(token_config),
+                "price_status": status,
+                "price_message": message,
+                "price_verification_due_at": (
+                    datetime.fromtimestamp(due_at, timezone.utc).isoformat() if due_at else None
+                ),
+                "error": message if status == "error" else None,
+            }
+            if runtime is not None:
+                next_state.update({
+                    "latest_rsi": runtime.get("latest_rsi"),
+                    "latest_rsi_time": runtime.get("latest_rsi_time"),
+                    "rsi_status": runtime.get("rsi_status"),
+                    "rsi_error": runtime.get("rsi_error"),
+                    "rsi_enabled": rsi_enabled,
+                    "rsi_refresh_nonce": runtime.get("rsi_refresh_nonce", ""),
+                    "rsi_last_fetch_at": runtime.get("rsi_last_fetch_at"),
+                    "last_triggered_buy": serialize_trigger_times(runtime.get("last_buy_alert")),
+                    "last_triggered_sell": serialize_trigger_times(runtime.get("last_sell_alert")),
+                    "last_triggered_rsi": dict(runtime.get("last_triggered_rsi") or {}),
+                })
+            elif mint == OUTPUT_MINT:
+                active_rsi_triggers = merge_active_rsi_triggers(current.get("last_triggered_rsi", {}))
+                next_state.update({
+                    "latest_rsi": LATEST_RSI,
+                    "latest_rsi_time": LATEST_RSI_TIME,
+                    "rsi_status": LATEST_RSI_STATUS,
+                    "rsi_error": LATEST_RSI_ERROR,
+                    "rsi_enabled": RSI_ENABLED,
+                    "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+                    "last_triggered_buy": serialize_trigger_times(last_buy_alert),
+                    "last_triggered_sell": serialize_trigger_times(last_sell_alert),
+                    "last_triggered_rsi": active_rsi_triggers,
+                })
+                existing.update({
+                    "latest_rsi": LATEST_RSI,
+                    "latest_rsi_time": LATEST_RSI_TIME,
+                    "rsi_status": LATEST_RSI_STATUS,
+                    "rsi_error": LATEST_RSI_ERROR,
+                    "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+                    "last_triggered_buy": serialize_trigger_times(last_buy_alert),
+                    "last_triggered_sell": serialize_trigger_times(last_sell_alert),
+                    "last_triggered_rsi": active_rsi_triggers,
+                })
+
+            token_states[mint] = next_state
+            if advance_schedule:
+                interval = check_interval or token_check_interval(token_config)
+                next_state.update({
+                    "timestamp": timestamp,
+                    "last_checked_at": timestamp,
+                    "next_check_at": datetime.fromtimestamp(now + interval, timezone.utc).isoformat(),
+                })
+                existing["scheduler"] = {
+                    "enabled": True,
+                    "last_checked_mint": mint,
+                    "last_checked_at": timestamp,
+                    "token_count": len(token_states),
+                }
+            existing["token_states"] = token_states
+
+            atomic_write_json(shared_json_path, existing)
+            return True
+    except Exception as exc:
+        print(f"Failed to write price verification state for {mint}: {exc}", flush=True)
+        return False
 
 def configured_rule_tokens(cfg):
     if not str(os.getenv("JUPITER_API_KEY") or "").strip():
@@ -1409,7 +1692,7 @@ def refresh_community_rules(cfg, force=False):
     return True
 
 
-def check_scheduled_token(token_config, cfg=None):
+def check_scheduled_token(token_config, cfg=None, price_only=False):
     mint = str((token_config or {}).get("mint") or "").strip()
 
 
@@ -1441,110 +1724,136 @@ def check_scheduled_token(token_config, cfg=None):
             runtime["last_sell_alert"].pop(k, None)
 
     print(f"\nScheduler token check: {label} ({short_mint(mint)})", flush=True)
-    token_received_raw = get_out_amount_raw(INPUT_MINT, mint, usdc_lamports)
+    staged_quote_cache = {}
+    token_received_raw = get_out_amount_raw(
+        INPUT_MINT, mint, usdc_lamports, cache_result=False, quote_capture=staged_quote_cache
+    )
     token_received = atomic_to_amount(token_received_raw, output_decimals) if token_received_raw else None
-    usdc_returned_raw = get_out_amount_raw(mint, INPUT_MINT, token_received_raw) if token_received_raw else None
+    usdc_returned_raw = get_out_amount_raw(
+        mint, INPUT_MINT, token_received_raw, cache_result=False, quote_capture=staged_quote_cache
+    ) if token_received_raw else None
     usdc_returned = atomic_to_amount(usdc_returned_raw, input_decimals) if usdc_returned_raw else None
 
     price_buy = price_sell = None
     if token_received:
         price_buy = usd_amount / token_received
-        for target in buy_alerts:
-            try:
-                alert_price = float(str(target).strip())
-                price_key = f"{alert_price:.8f}"
-                trigger_ready, trigger_time = should_alert(runtime["last_buy_alert"], price_key, alert_reset_minutes)
-                if trigger_ready and price_buy <= alert_price:
-                    delivered = send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}", token_config=token_config)
-                    if delivered:
-                        runtime["last_buy_alert"][price_key] = trigger_time
-            except ValueError:
-                continue
     else:
         error = "Could not fetch USDC -> token quote"
 
     if usdc_returned and token_received:
         price_sell = usdc_returned / token_received
-        for target in sell_alerts:
-            try:
-                alert_price = float(str(target).strip())
-                price_key = f"{alert_price:.8f}"
-                trigger_ready, trigger_time = should_alert(runtime["last_sell_alert"], price_key, alert_reset_minutes)
-                if trigger_ready and price_sell >= alert_price:
-                    delivered = send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}", token_config=token_config)
-                    if delivered:
-                        runtime["last_sell_alert"][price_key] = trigger_time
-            except ValueError:
-                continue
     elif not error:
         error = "Could not fetch token -> USDC quote"
 
-    raw_rsi_alerts = token_rsi_alerts_raw(token_config)
-    rsi_state = sync_runtime_rsi_state(runtime, raw_rsi_alerts)
-    refresh_nonce = str((token_config or {}).get("rsi_refresh_nonce") or "")
-    if refresh_nonce != runtime.get("rsi_refresh_nonce", ""):
-        runtime["rsi_refresh_nonce"] = refresh_nonce
-        runtime["last_rsi_at"] = None
-        runtime["latest_rsi"] = None
-        runtime["latest_rsi_time"] = None
-        runtime["rsi_last_fetch_at"] = None
-    now_utc = datetime.now(timezone.utc)
-    last_rsi_at = runtime.get("last_rsi_at")
-    rsi_enabled_for_token = token_rsi_enabled(token_config, cfg)
-    disabled_reason = rsi_disabled_reason(token_config, cfg)
-    if disabled_reason:
-        runtime["latest_rsi"] = None
-        runtime["latest_rsi_time"] = None
-        runtime["rsi_status"] = "disabled"
-        runtime["rsi_error"] = disabled_reason
-        runtime["rsi_last_fetch_at"] = None
-        runtime["last_rsi_at"] = None
-    elif last_rsi_at is None or (now_utc - last_rsi_at) >= timedelta(minutes=rsi_interval_minutes):
-        runtime["last_rsi_at"] = now_utc
-        runtime["rsi_status"] = "waiting"
-        runtime["rsi_error"] = None
-        try:
-            rsi_value, rsi_time = get_latest_rsi(
-                api_key=SOLANATRACKER_API_KEY,
-                token=mint,
-                period=14,
-                interval=rsi_interval,
-            )
-            runtime["latest_rsi"] = round(float(rsi_value), 2)
-            runtime["latest_rsi_time"] = rsi_time
-            runtime["rsi_status"] = "ok"
-            runtime["rsi_error"] = None
-            runtime["rsi_last_fetch_at"] = datetime.now(timezone.utc).isoformat()
-
-            for key, info in rsi_state.items():
-                direction, val_str = key.split(":", 1)
-                threshold = float(val_str)
-                if info.get("triggered"):
-                    if rsi_reset_enabled:
-                        crossed_back = (
-                            (direction == "above" and rsi_value < threshold) or
-                            (direction == "below" and rsi_value > threshold)
-                        )
-                        if crossed_back:
-                            info["triggered"] = False
-                            runtime["last_triggered_rsi"].pop(key, None)
+    price_decision = assess_price_sample(token_config, price_buy, price_sell)
+    if price_decision["status"] == "accepted":
+        QUOTE_CACHE.update(staged_quote_cache)
+        if price_buy is not None:
+            for target in buy_alerts:
+                try:
+                    alert_price = float(str(target).strip())
+                    price_key = f"{alert_price:.8f}"
+                    trigger_ready, trigger_time = should_alert(runtime["last_buy_alert"], price_key, alert_reset_minutes)
+                    if trigger_ready and price_buy <= alert_price:
+                        delivered = send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}", token_config=token_config)
+                        if delivered:
+                            runtime["last_buy_alert"][price_key] = trigger_time
+                except ValueError:
                     continue
 
-                should_fire = (
-                    (direction == "above" and rsi_value > threshold) or
-                    (direction == "below" and rsi_value < threshold)
+        if price_sell is not None:
+            for target in sell_alerts:
+                try:
+                    alert_price = float(str(target).strip())
+                    price_key = f"{alert_price:.8f}"
+                    trigger_ready, trigger_time = should_alert(runtime["last_sell_alert"], price_key, alert_reset_minutes)
+                    if trigger_ready and price_sell >= alert_price:
+                        delivered = send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}", token_config=token_config)
+                        if delivered:
+                            runtime["last_sell_alert"][price_key] = trigger_time
+                except ValueError:
+                    continue
+    rsi_enabled_for_token = token_rsi_enabled(token_config, cfg)
+    if not price_only:
+        raw_rsi_alerts = token_rsi_alerts_raw(token_config)
+        rsi_state = sync_runtime_rsi_state(runtime, raw_rsi_alerts)
+        refresh_nonce = str((token_config or {}).get("rsi_refresh_nonce") or "")
+        if refresh_nonce != runtime.get("rsi_refresh_nonce", ""):
+            runtime["rsi_refresh_nonce"] = refresh_nonce
+            runtime["last_rsi_at"] = None
+            runtime["latest_rsi"] = None
+            runtime["latest_rsi_time"] = None
+            runtime["rsi_last_fetch_at"] = None
+        now_utc = datetime.now(timezone.utc)
+        last_rsi_at = runtime.get("last_rsi_at")
+        disabled_reason = rsi_disabled_reason(token_config, cfg)
+        if disabled_reason:
+            runtime["latest_rsi"] = None
+            runtime["latest_rsi_time"] = None
+            runtime["rsi_status"] = "disabled"
+            runtime["rsi_error"] = disabled_reason
+            runtime["rsi_last_fetch_at"] = None
+            runtime["last_rsi_at"] = None
+        elif last_rsi_at is None or (now_utc - last_rsi_at) >= timedelta(minutes=rsi_interval_minutes):
+            runtime["last_rsi_at"] = now_utc
+            runtime["rsi_status"] = "waiting"
+            runtime["rsi_error"] = None
+            try:
+                rsi_value, rsi_time = get_latest_rsi(
+                    api_key=SOLANATRACKER_API_KEY,
+                    token=mint,
+                    period=14,
+                    interval=rsi_interval,
                 )
-                if should_fire:
-                    delivered = send_alert("RSI Alert", f"RSI({rsi_interval}) = {rsi_value:.2f} {direction} {threshold}", token_config=token_config)
-                    if delivered:
-                        info["triggered"] = True
-                        runtime["last_triggered_rsi"][key] = rsi_time
-        except Exception as e:
-            runtime["rsi_status"] = "error"
-            runtime["rsi_error"] = str(e)[:180]
-            runtime["rsi_last_fetch_at"] = datetime.now(timezone.utc).isoformat()
-            print(f"RSI check failed for {label}: {e}", flush=True)
+                runtime["latest_rsi"] = round(float(rsi_value), 2)
+                runtime["latest_rsi_time"] = rsi_time
+                runtime["rsi_status"] = "ok"
+                runtime["rsi_error"] = None
+                runtime["rsi_last_fetch_at"] = datetime.now(timezone.utc).isoformat()
 
+                for key, info in rsi_state.items():
+                    direction, val_str = key.split(":", 1)
+                    threshold = float(val_str)
+                    if info.get("triggered"):
+                        if rsi_reset_enabled:
+                            crossed_back = (
+                                (direction == "above" and rsi_value < threshold) or
+                                (direction == "below" and rsi_value > threshold)
+                            )
+                            if crossed_back:
+                                info["triggered"] = False
+                                runtime["last_triggered_rsi"].pop(key, None)
+                        continue
+
+                    should_fire = (
+                        (direction == "above" and rsi_value > threshold) or
+                        (direction == "below" and rsi_value < threshold)
+                    )
+                    if should_fire:
+                        delivered = send_alert("RSI Alert", f"RSI({rsi_interval}) = {rsi_value:.2f} {direction} {threshold}", token_config=token_config)
+                        if delivered:
+                            info["triggered"] = True
+                            runtime["last_triggered_rsi"][key] = rsi_time
+            except Exception as e:
+                runtime["rsi_status"] = "error"
+                runtime["rsi_error"] = str(e)[:180]
+                runtime["rsi_last_fetch_at"] = datetime.now(timezone.utc).isoformat()
+                print(f"RSI check failed for {label}: {e}", flush=True)
+
+    if price_decision["status"] != "accepted":
+        rejected = price_decision["status"] == "rejected"
+        write_price_verification_state(
+            token_config,
+            "error" if rejected else "verifying",
+            price_decision.get("message") or "Verifying an unusual Jupiter price move",
+            due_at=price_decision.get("due_at"),
+            advance_schedule=rejected,
+            check_interval=price_interval,
+            runtime=runtime,
+            rsi_enabled=rsi_enabled_for_token,
+        )
+        print(f"Price sample for {label}: {price_decision['status']} ({price_decision['reason']})", flush=True)
+        return price_decision
     write_scheduled_token_status(
         token_config,
         runtime,
@@ -1557,43 +1866,96 @@ def check_scheduled_token(token_config, cfg=None):
         error=error,
         rsi_enabled=rsi_enabled_for_token,
     )
-
+    return price_decision
 
 def pick_due_scheduler_token(tokens, cfg):
     global SCHEDULER_CURSOR
-    if not tokens:
+    token_by_mint = {
+        str(token.get("mint") or "").strip(): token
+        for token in (tokens or [])
+        if isinstance(token, dict) and str(token.get("mint") or "").strip()
+    }
+    for mint in list(PRICE_CONFIRMATIONS):
+        token = token_by_mint.get(mint)
+        if token is None:
+            PRICE_CONFIRMATIONS.pop(mint, None)
+            SCHEDULER_LAST_CHECK.pop(mint, None)
+        elif valid_price_confirmation(token) is None:
+            PRICE_CONFIRMATIONS.pop(mint, None)
+    if not token_by_mint:
         return None
+
     now = time.time()
-    token_count = len(tokens)
+    ordered_tokens = list(token_by_mint.values())
+    token_count = len(ordered_tokens)
+    normal_due = None
+    normal_index = None
     for offset in range(token_count):
         index = (SCHEDULER_CURSOR + offset) % token_count
-        token = tokens[index]
+        token = ordered_tokens[index]
         mint = str(token.get("mint") or "").strip()
-        if not mint:
+        if mint in PRICE_CONFIRMATIONS:
             continue
         interval = token_check_interval(token, cfg)
         if now - scheduler_last_check_for(mint, token) >= interval:
-            SCHEDULER_CURSOR = (index + 1) % token_count
-            return token
+            normal_due = token
+            normal_index = index
+            break
+
+    due_confirmations = []
+    for mint, pending in PRICE_CONFIRMATIONS.items():
+        token = token_by_mint.get(mint)
+        if token is not None and float(pending.get("due_at") or 0) <= now:
+            due_confirmations.append((float(pending.get("due_at") or 0), mint, token, pending))
+    due_confirmations.sort(key=lambda item: (item[0], item[1]))
+
+    if due_confirmations:
+        _due_at, mint, token, pending = due_confirmations[0]
+        if not pending.get("other_token_needed") or normal_due is None:
+            result = dict(token)
+            result["_price_confirmation"] = True
+            try:
+                index = next(i for i, row in enumerate(ordered_tokens) if str(row.get("mint") or "").strip() == mint)
+                SCHEDULER_CURSOR = (index + 1) % token_count
+            except StopIteration:
+                pass
+            return result
+
+    if normal_due is not None:
+        SCHEDULER_CURSOR = (normal_index + 1) % token_count
+        return normal_due
     return None
 
 
 def scheduler_sleep_seconds(tokens, cfg):
     if not tokens:
+        for mint in list(PRICE_CONFIRMATIONS):
+            SCHEDULER_LAST_CHECK.pop(mint, None)
+        PRICE_CONFIRMATIONS.clear()
         return 30
     now = time.time()
     waits = []
+    valid_mints = set()
     for token in tokens:
         mint = str(token.get("mint") or "").strip()
         if not mint:
             continue
+        valid_mints.add(mint)
+        pending = valid_price_confirmation(token)
+        if pending is not None:
+            waits.append(max(0, float(pending.get("due_at") or now) - now))
+            continue
         interval = token_check_interval(token, cfg)
         waits.append(max(0, interval - (now - scheduler_last_check_for(mint, token))))
+    for mint in list(PRICE_CONFIRMATIONS):
+        if mint not in valid_mints:
+            PRICE_CONFIRMATIONS.pop(mint, None)
+            SCHEDULER_LAST_CHECK.pop(mint, None)
     if not waits:
         return 30
     return max(5, min(30, min(waits)))
 
-def check_prices():
+def check_prices(price_only=False):
     global _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT
 
     load_dynamic_config()
@@ -1637,9 +1999,14 @@ def check_prices():
         if ready and key in last_sell_alert:
             del last_sell_alert[key]
 
-    token_received_raw = get_out_amount_raw(INPUT_MINT, OUTPUT_MINT, usdc_lamports)
+    staged_quote_cache = {}
+    token_received_raw = get_out_amount_raw(
+        INPUT_MINT, OUTPUT_MINT, usdc_lamports, cache_result=False, quote_capture=staged_quote_cache
+    )
     token_received = atomic_to_amount(token_received_raw, output_decimals) if token_received_raw else None
-    usdc_returned_raw = get_out_amount_raw(OUTPUT_MINT, INPUT_MINT, token_received_raw) if token_received_raw else None
+    usdc_returned_raw = get_out_amount_raw(
+        OUTPUT_MINT, INPUT_MINT, token_received_raw, cache_result=False, quote_capture=staged_quote_cache
+    ) if token_received_raw else None
     usdc_returned = atomic_to_amount(usdc_returned_raw, input_decimals) if usdc_returned_raw else None
 
     price_buy = price_sell = None
@@ -1650,21 +2017,6 @@ def check_prices():
         print(f"Buying token with ${USD_AMOUNT} USDC:")
         print(f"   Price per token: ${price_buy:.8f}")
         print(f"   Token received: {token_received:.8f}")
-
-        for target in BUY_ALERTS:
-            try:
-                alert_price = float(str(target).strip())
-                price_key = f"{alert_price:.8f}"
-                trigger_ready, trigger_time = should_alert(last_buy_alert, price_key)
-
-                if trigger_ready and price_buy <= alert_price:
-                    delivered = send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}")
-                    if delivered:
-                        notify_backend_trigger("buy", alert_price)
-                        last_buy_alert[price_key] = trigger_time
-                        status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False, check_completed=False)
-            except ValueError:
-                continue
     else:
         price_error = "Could not fetch USDC -> token quote"
         print("Could not fetch USDC -> token quote.", flush=True)
@@ -1674,95 +2026,127 @@ def check_prices():
         print(f"\nSelling ${USD_AMOUNT} worth of token:")
         print(f"   Price per token: ${price_sell:.8f}")
         print(f"   USDC received: {usdc_returned:.8f}")
-
-        for target in SELL_ALERTS:
-            try:
-                alert_price = float(str(target).strip())
-                price_key = f"{alert_price:.8f}"
-                trigger_ready, trigger_time = should_alert(last_sell_alert, price_key)
-
-                if trigger_ready and price_sell >= alert_price:
-                    delivered = send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}")
-                    if delivered:
-                        notify_backend_trigger("sell", alert_price)
-                        last_sell_alert[price_key] = trigger_time
-                        status_timestamp = write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False, check_completed=False)
-            except ValueError:
-                continue
     else:
         if not price_error:
             price_error = "Could not fetch token -> USDC quote"
         print("Could not fetch token -> USDC quote.", flush=True)
 
-    now_utc = datetime.now(timezone.utc)
-    disabled_reason = rsi_disabled_reason(ACTIVE_TOKEN_CONFIG or {"rsi_enabled": RSI_ENABLED})
-    if disabled_reason:
-        LATEST_RSI = None
-        LATEST_RSI_TIME = None
-        LATEST_RSI_STATUS = "disabled"
-        LATEST_RSI_ERROR = disabled_reason
-        LATEST_RSI_LAST_FETCH_AT = None
-        _last_rsi_at = None
-    elif _last_rsi_at is None or (now_utc - _last_rsi_at) >= timedelta(minutes=RSI_CHECK_INTERVAL):
-        _last_rsi_at = now_utc
-        LATEST_RSI_STATUS = "waiting"
-        LATEST_RSI_ERROR = None
-        try:
-            rsi_value, rsi_time = get_latest_rsi(
-                api_key=SOLANATRACKER_API_KEY,
-                token=OUTPUT_MINT,
-                period=14,
-                interval=RSI_INTERVAL
-            )
-            LATEST_RSI = round(float(rsi_value), 2)
-            LATEST_RSI_TIME = rsi_time
-            LATEST_RSI_STATUS = "ok"
-            LATEST_RSI_ERROR = None
-            LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
-            print(f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} at {rsi_time}", flush=True)
-
-            for key, info in RSI_STATE.items():
-                direction, val_str = key.split(":")
-                threshold = float(val_str)
-
-                if info["triggered"]:
-                    if RSI_RESET_ENABLED:
-                        crossed_back = (
-                            (direction == "above" and rsi_value < threshold) or
-                            (direction == "below" and rsi_value > threshold)
-                        )
-                        if crossed_back:
-                            info["triggered"] = False
-                            info.pop("triggered_at", None)
-                            try:
-                                requests.post(
-                                    "http://127.0.0.1:8000/api/rsi/reset-alert",
-                                    json={"key": key},
-                                    timeout=2
-                                )
-                            except Exception:
-                                pass
+    confirmation_token = dict(ACTIVE_TOKEN_CONFIG or {"mint": OUTPUT_MINT})
+    confirmation_token["mint"] = OUTPUT_MINT
+    price_decision = assess_price_sample(confirmation_token, price_buy, price_sell)
+    if price_decision["status"] == "accepted":
+        QUOTE_CACHE.update(staged_quote_cache)
+        if price_buy is not None:
+            for target in BUY_ALERTS:
+                try:
+                    alert_price = float(str(target).strip())
+                    price_key = f"{alert_price:.8f}"
+                    trigger_ready, trigger_time = should_alert(last_buy_alert, price_key)
+                    if trigger_ready and price_buy <= alert_price:
+                        delivered = send_alert("Buy Price Alert", f"Buy price ${price_buy:.8f} is <= target ${alert_price}")
+                        if delivered:
+                            notify_backend_trigger("buy", alert_price)
+                            last_buy_alert[price_key] = trigger_time
+                            write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False, check_completed=False)
+                except ValueError:
                     continue
 
-                should_fire = (
-                    (direction == "above" and rsi_value > threshold) or
-                    (direction == "below" and rsi_value < threshold)
+        if price_sell is not None:
+            for target in SELL_ALERTS:
+                try:
+                    alert_price = float(str(target).strip())
+                    price_key = f"{alert_price:.8f}"
+                    trigger_ready, trigger_time = should_alert(last_sell_alert, price_key)
+                    if trigger_ready and price_sell >= alert_price:
+                        delivered = send_alert("Sell Price Alert", f"Sell price ${price_sell:.8f} is >= target ${alert_price}")
+                        if delivered:
+                            notify_backend_trigger("sell", alert_price)
+                            last_sell_alert[price_key] = trigger_time
+                            write_status_json(price_buy, price_sell, token_received, usdc_returned, record_history=False, check_completed=False)
+                except ValueError:
+                    continue
+    if not price_only:
+        now_utc = datetime.now(timezone.utc)
+        disabled_reason = rsi_disabled_reason(ACTIVE_TOKEN_CONFIG or {"rsi_enabled": RSI_ENABLED})
+        if disabled_reason:
+            LATEST_RSI = None
+            LATEST_RSI_TIME = None
+            LATEST_RSI_STATUS = "disabled"
+            LATEST_RSI_ERROR = disabled_reason
+            LATEST_RSI_LAST_FETCH_AT = None
+            _last_rsi_at = None
+        elif _last_rsi_at is None or (now_utc - _last_rsi_at) >= timedelta(minutes=RSI_CHECK_INTERVAL):
+            _last_rsi_at = now_utc
+            LATEST_RSI_STATUS = "waiting"
+            LATEST_RSI_ERROR = None
+            try:
+                rsi_value, rsi_time = get_latest_rsi(
+                    api_key=SOLANATRACKER_API_KEY,
+                    token=OUTPUT_MINT,
+                    period=14,
+                    interval=RSI_INTERVAL
                 )
-                if should_fire:
-                    msg = f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} {direction} {threshold}"
-                    print(f"RSI Alert: {msg}", flush=True)
-                    delivered = send_alert("RSI Alert", msg)
-                    if delivered:
-                        info["triggered"] = True
-                        info["triggered_at"] = rsi_time
-                        notify_backend_rsi_trigger(key, rsi_time)
+                LATEST_RSI = round(float(rsi_value), 2)
+                LATEST_RSI_TIME = rsi_time
+                LATEST_RSI_STATUS = "ok"
+                LATEST_RSI_ERROR = None
+                LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
+                print(f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} at {rsi_time}", flush=True)
 
-        except Exception as e:
-            LATEST_RSI_STATUS = "error"
-            LATEST_RSI_ERROR = str(e)[:180]
-            LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
-            print(f"RSI check failed: {e}", flush=True)
+                for key, info in RSI_STATE.items():
+                    direction, val_str = key.split(":")
+                    threshold = float(val_str)
 
+                    if info["triggered"]:
+                        if RSI_RESET_ENABLED:
+                            crossed_back = (
+                                (direction == "above" and rsi_value < threshold) or
+                                (direction == "below" and rsi_value > threshold)
+                            )
+                            if crossed_back:
+                                info["triggered"] = False
+                                info.pop("triggered_at", None)
+                                try:
+                                    requests.post(
+                                        "http://127.0.0.1:8000/api/rsi/reset-alert",
+                                        json={"key": key},
+                                        timeout=2
+                                    )
+                                except Exception:
+                                    pass
+                        continue
+
+                    should_fire = (
+                        (direction == "above" and rsi_value > threshold) or
+                        (direction == "below" and rsi_value < threshold)
+                    )
+                    if should_fire:
+                        msg = f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} {direction} {threshold}"
+                        print(f"RSI Alert: {msg}", flush=True)
+                        delivered = send_alert("RSI Alert", msg)
+                        if delivered:
+                            info["triggered"] = True
+                            info["triggered_at"] = rsi_time
+                            notify_backend_rsi_trigger(key, rsi_time)
+
+            except Exception as e:
+                LATEST_RSI_STATUS = "error"
+                LATEST_RSI_ERROR = str(e)[:180]
+                LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
+                print(f"RSI check failed: {e}", flush=True)
+
+    if price_decision["status"] != "accepted":
+        rejected = price_decision["status"] == "rejected"
+        write_price_verification_state(
+            confirmation_token,
+            "error" if rejected else "verifying",
+            price_decision.get("message") or "Verifying an unusual Jupiter price move",
+            due_at=price_decision.get("due_at"),
+            advance_schedule=rejected,
+            check_interval=CHECK_INTERVAL,
+        )
+        print(f"Price sample for {token_label(confirmation_token)}: {price_decision['status']} ({price_decision['reason']})", flush=True)
+        return price_decision
     status_timestamp = write_status_json(
         price_buy,
         price_sell,
@@ -1781,7 +2165,7 @@ def check_prices():
         }, timeout=2)
     except Exception as e:
         print(f"Failed to send price to backend: {e}", flush=True)
-
+    return price_decision
 
 def community_rules_worker():
     while True:
@@ -1879,12 +2263,14 @@ if __name__ == "__main__":
             due_token = pick_due_scheduler_token(tokens, cfg)
             if due_token:
                 due_mint = str(due_token.get("mint") or "").strip()
+                price_only = bool(due_token.get("_price_confirmation"))
                 if due_mint == OUTPUT_MINT:
-                    check_prices()
+                    check_prices(price_only=price_only)
                 else:
-                    check_scheduled_token(due_token, cfg)
+                    check_scheduled_token(due_token, cfg, price_only=price_only)
                 if due_mint:
                     SCHEDULER_LAST_CHECK[due_mint] = time.time()
+                    note_scheduler_token_processed(due_mint)
             sleep_for = scheduler_sleep_seconds(tokens, cfg)
         except Exception as e:
             print(f"Scheduler error: {e}", flush=True)

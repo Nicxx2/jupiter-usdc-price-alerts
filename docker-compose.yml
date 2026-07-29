@@ -38,6 +38,13 @@ services:
       # Existing keyless price-monitor limiter (unchanged by Action Rules).
       JUPITER_REQUESTS_PER_SECOND: 0.5
 
+      # Recheck unusually large price moves before charting or alerting.
+      # Follow-up quotes use the same Jupiter limiter above.
+      PRICE_MOVE_CONFIRMATION_ENABLED: "true"
+      PRICE_MOVE_CONFIRMATION_THRESHOLD_PERCENT: 50
+      PRICE_MOVE_CONFIRMATION_TOLERANCE_PERCENT: 15
+      PRICE_MOVE_CONFIRMATION_DELAY_SECONDS: 5
+
       # Separate authenticated limiter used only by Action Rules.
       COMMUNITY_RULES_JUPITER_REQUESTS_PER_SECOND: 0.5
       # This is forced off automatically while JUPITER_API_KEY is blank.
