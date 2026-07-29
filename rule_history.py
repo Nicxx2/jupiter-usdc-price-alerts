@@ -508,40 +508,123 @@ def _spread_indices(length: int, count: int) -> List[int]:
     return sorted({round(index * (length - 1) / (count - 1)) for index in range(count)})
 
 
-def _sample_points_with_extremes(rows: List[sqlite3.Row], budget: int) -> List[sqlite3.Row]:
-    if len(rows) <= budget:
-        return rows
-    if budget <= 2:
-        return [rows[index] for index in _spread_indices(len(rows), budget)]
+def _prioritize_points(rows: List[sqlite3.Row], budget: int) -> List[sqlite3.Row]:
+    """Rank real readings in a stable, multiscale order for nested sampling."""
+    target_count = min(len(rows), max(0, int(budget)))
+    if target_count == 0:
+        return []
 
-    bucket_count = max(1, budget // 4)
+    priority: List[sqlite3.Row] = []
+    selected = set()
+
+    def add(row: sqlite3.Row) -> None:
+        row_id = int(row["id"])
+        if row_id not in selected:
+            selected.add(row_id)
+            priority.append(row)
+
+    add(rows[-1])
+    add(rows[0])
     first_time = int(rows[0]["observed_at_ms"])
     last_time = int(rows[-1]["observed_at_ms"])
     span = max(1, last_time - first_time + 1)
-    buckets: List[List[sqlite3.Row]] = [[] for _ in range(bucket_count)]
+    bucket_count = 1
+    while len(priority) < target_count and bucket_count <= len(rows):
+        buckets: List[List[sqlite3.Row]] = [[] for _ in range(bucket_count)]
+        for row in rows:
+            index = min(
+                bucket_count - 1,
+                int((int(row["observed_at_ms"]) - first_time) * bucket_count / span),
+            )
+            buckets[index].append(row)
+
+        for bucket in buckets:
+            if not bucket:
+                continue
+            for candidate in (
+                bucket[0],
+                bucket[-1],
+                min(bucket, key=lambda row: (_finite_number(row["value"]) or 0.0, int(row["id"]))),
+                max(bucket, key=lambda row: (_finite_number(row["value"]) or 0.0, -int(row["id"]))),
+            ):
+                add(candidate)
+        bucket_count *= 2
+
+    # Equal timestamps may never split into separate time buckets.
     for row in rows:
-        index = min(bucket_count - 1, int((int(row["observed_at_ms"]) - first_time) * bucket_count / span))
-        buckets[index].append(row)
+        add(row)
+        if len(priority) >= target_count:
+            break
+    return priority[:target_count]
 
-    chosen: Dict[int, sqlite3.Row] = {}
-    for bucket in buckets:
-        if not bucket:
-            continue
-        candidates = (
-            bucket[0],
-            bucket[-1],
-            min(bucket, key=lambda row: (_finite_number(row["value"]) or 0.0, int(row["id"]))),
-            max(bucket, key=lambda row: (_finite_number(row["value"]) or 0.0, -int(row["id"]))),
-        )
-        for row in candidates:
-            chosen[int(row["id"])] = row
 
-    if len(chosen) < budget:
-        remaining = [row for row in rows if int(row["id"]) not in chosen]
-        for index in _spread_indices(len(remaining), budget - len(chosen)):
-            chosen[int(remaining[index]["id"])] = remaining[index]
-    sampled = sorted(chosen.values(), key=lambda row: (int(row["observed_at_ms"]), int(row["id"])))
-    return sampled[:budget]
+def _representative_boundary_rows(
+    ordered: List[sqlite3.Row],
+    anchors: List[sqlite3.Row],
+) -> List[sqlite3.Row]:
+    """Keep boundaries needed to separate sampled outages and configuration changes."""
+    boundary_rows = [row for row in ordered if row["kind"] != "point"]
+    if not boundary_rows:
+        return []
+    if not anchors:
+        return [
+            boundary_rows[index]
+            for index in _spread_indices(len(boundary_rows), min(2, len(boundary_rows)))
+        ]
+
+    positions = {int(row["id"]): index for index, row in enumerate(ordered)}
+    anchor_positions = sorted({
+        positions[int(row["id"])]
+        for row in anchors
+        if int(row["id"]) in positions
+    })
+    if not anchor_positions:
+        return []
+
+    selected: Dict[int, sqlite3.Row] = {}
+
+    # A leading gap marks that the first retained reading follows unavailable data.
+    leading = [row for row in ordered[:anchor_positions[0]] if row["kind"] == "gap"]
+    if leading:
+        selected[int(leading[-1]["id"])] = leading[-1]
+
+    # One real gap or omitted target transition is sufficient to prevent
+    # Chart.js from joining readings across an unavailable period or scenario.
+    for left, right in zip(anchor_positions, anchor_positions[1:]):
+        between = ordered[left + 1:right]
+        for kind in ("gap", "target"):
+            boundary = next((row for row in between if row["kind"] == kind), None)
+            if boundary is not None:
+                selected[int(boundary["id"])] = boundary
+
+    # A trailing gap preserves the start of the current unavailable period.
+    trailing = [row for row in ordered[anchor_positions[-1] + 1:] if row["kind"] == "gap"]
+    if trailing:
+        selected[int(trailing[0]["id"])] = trailing[0]
+
+    return sorted(
+        selected.values(),
+        key=lambda row: (int(row["observed_at_ms"]), int(row["id"])),
+    )
+
+
+def _assemble_sampled_rows(
+    ordered: List[sqlite3.Row],
+    point_priority: List[sqlite3.Row],
+    target_rows: List[sqlite3.Row],
+    point_budget: int,
+) -> List[sqlite3.Row]:
+    kept_points = point_priority[:point_budget]
+    anchors = [*kept_points, *target_rows]
+    kept_boundaries = _representative_boundary_rows(ordered, anchors)
+    unique = {
+        int(row["id"]): row
+        for row in (*anchors, *kept_boundaries)
+    }
+    return sorted(
+        unique.values(),
+        key=lambda row: (int(row["observed_at_ms"]), int(row["id"])),
+    )
 
 
 def _downsample_rows(rows: Iterable[sqlite3.Row], limit: int) -> List[sqlite3.Row]:
@@ -549,18 +632,42 @@ def _downsample_rows(rows: Iterable[sqlite3.Row], limit: int) -> List[sqlite3.Ro
     if len(ordered) <= limit:
         return ordered
 
-    mandatory = [row for row in ordered if row["kind"] != "point"]
     point_rows = [row for row in ordered if row["kind"] == "point"]
-    if len(mandatory) >= limit - 2:
-        kept_mandatory = [mandatory[index] for index in _spread_indices(len(mandatory), max(1, limit - 2))]
-        candidates = [ordered[0], *kept_mandatory, ordered[-1]]
-    else:
-        point_budget = max(2, limit - len(mandatory))
-        kept_points = _sample_points_with_extremes(point_rows, point_budget)
-        candidates = [*mandatory, *kept_points]
+    if not point_rows:
+        return [ordered[index] for index in _spread_indices(len(ordered), limit)]
 
-    unique = {int(row["id"]): row for row in candidates}
-    return sorted(unique.values(), key=lambda row: (int(row["observed_at_ms"]), int(row["id"])))[:limit]
+    point_priority = _prioritize_points(point_rows, limit)
+    target_rows = [row for row in ordered if row["kind"] == "target"]
+    # Target/scenario transitions are normally rare and are retained exactly.
+    # Bound pathological configuration churn so valid trend readings and their
+    # gap boundaries can still be represented within the response limit.
+    target_budget = max(1, limit // 4)
+    if len(target_rows) > target_budget:
+        target_rows = [
+            target_rows[index]
+            for index in _spread_indices(len(target_rows), target_budget)
+        ]
+
+    # Find the largest useful point budget that leaves room for every boundary
+    # required to prevent false lines across outages or configuration changes.
+    low = 1
+    high = min(len(point_priority), limit)
+    best = _assemble_sampled_rows(ordered, point_priority, target_rows, 1)
+    while low <= high:
+        point_budget = (low + high) // 2
+        candidate = _assemble_sampled_rows(
+            ordered,
+            point_priority,
+            target_rows,
+            point_budget,
+        )
+        if len(candidate) <= limit:
+            best = candidate
+            low = point_budget + 1
+        else:
+            high = point_budget - 1
+
+    return best
 
 
 def get_rule_history(

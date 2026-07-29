@@ -206,6 +206,229 @@ class RuleHistoryTests(unittest.TestCase):
         self.assertEqual(empty["points"], [])
         self.assertIsNone(empty["latest_valid"])
 
+    def test_gap_dominated_history_keeps_a_useful_trend_in_every_window(self):
+        config = rules_config()
+        start = self.now - timedelta(hours=20)
+        for index in range(130):
+            moment = start + timedelta(minutes=index * 9)
+            holders = 999_999 if index == 63 else 1000 + index
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(config, moment, holders=holders),
+                path=self.path,
+            )
+            unavailable_at = moment + timedelta(minutes=1)
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(
+                    config,
+                    unavailable_at,
+                    fetch_error="Jupiter token data is unavailable",
+                ),
+                path=self.path,
+            )
+
+        for window in ("24h", "7d", "30d", "90d"):
+            with self.subTest(window=window):
+                payload = get_rule_history(
+                    MINT,
+                    "min_holders",
+                    window,
+                    path=self.path,
+                    max_points=120,
+                    now=self.now,
+                )
+                returned = payload["points"]
+                valid = [point for point in returned if point["kind"] == "point"]
+
+                self.assertTrue(payload["sampled"])
+                self.assertEqual(payload["total_events"], 260)
+                self.assertLessEqual(len(returned), 120)
+                self.assertGreaterEqual(len(valid), 50)
+                self.assertEqual(valid[0]["value"], 1000)
+                self.assertEqual(valid[-1]["value"], 1129)
+                self.assertIn(999_999, [point["value"] for point in valid])
+                self.assertEqual(payload["latest_valid"]["value"], 1129)
+                self.assertEqual(returned[-1]["kind"], "gap")
+
+                previous_point_index = None
+                for point_index, point in enumerate(returned):
+                    if point["kind"] != "point":
+                        continue
+                    if previous_point_index is not None:
+                        self.assertIn(
+                            "gap",
+                            [
+                                item["kind"]
+                                for item in returned[previous_point_index + 1:point_index]
+                            ],
+                        )
+                    previous_point_index = point_index
+
+    def test_each_window_applies_its_own_cutoff(self):
+        config = rules_config()
+        readings = (
+            (self.now - timedelta(days=80), 1001),
+            (self.now - timedelta(days=20), 1002),
+            (self.now - timedelta(days=5), 1003),
+            (self.now - timedelta(hours=12), 1004),
+        )
+        for moment, holders in readings:
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(config, moment, holders=holders),
+                path=self.path,
+            )
+
+        expected = {
+            "24h": [1004],
+            "7d": [1003, 1004],
+            "30d": [1002, 1003, 1004],
+            "90d": [1001, 1002, 1003, 1004],
+        }
+        for window, values in expected.items():
+            with self.subTest(window=window):
+                payload = get_rule_history(MINT, "min_holders", window, path=self.path, now=self.now)
+                self.assertEqual(
+                    [point["value"] for point in payload["points"] if point["kind"] == "point"],
+                    values,
+                )
+
+    def test_downsampling_preserves_a_long_outage_between_valid_segments(self):
+        config = rules_config()
+        start = self.now - timedelta(hours=4)
+        for index in range(70):
+            moment = start + timedelta(minutes=index)
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(config, moment, holders=1000 + index),
+                path=self.path,
+            )
+
+        unavailable_at = self.now - timedelta(hours=2, minutes=30)
+        record_rule_history(
+            MINT,
+            config,
+            self.evaluation(
+                config,
+                unavailable_at,
+                fetch_error="Jupiter token data is unavailable",
+            ),
+            path=self.path,
+        )
+
+        recovery = self.now - timedelta(hours=2)
+        for index in range(70):
+            moment = recovery + timedelta(minutes=index)
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(config, moment, holders=2000 + index),
+                path=self.path,
+            )
+
+        payload = get_rule_history(
+            MINT,
+            "min_holders",
+            "24h",
+            path=self.path,
+            max_points=120,
+            now=self.now,
+        )
+        returned = payload["points"]
+        left = max(
+            index
+            for index, point in enumerate(returned)
+            if point["kind"] == "point" and point["value"] < 2000
+        )
+        right = min(
+            index
+            for index, point in enumerate(returned)
+            if point["kind"] == "point" and point["value"] >= 2000
+        )
+
+        self.assertTrue(payload["sampled"])
+        self.assertLessEqual(len(returned), 120)
+        self.assertIn("gap", [point["kind"] for point in returned[left + 1:right]])
+
+    def test_downsampling_retains_target_transitions(self):
+        first_config = rules_config(target=1000)
+        second_config = rules_config(target=1100)
+        start = self.now - timedelta(hours=3)
+        for index in range(130):
+            moment = start + timedelta(minutes=index)
+            config = first_config if index < 65 else second_config
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(config, moment, holders=1000 + index),
+                path=self.path,
+            )
+
+        payload = get_rule_history(
+            MINT,
+            "min_holders",
+            "24h",
+            path=self.path,
+            max_points=120,
+            now=self.now,
+        )
+        returned = payload["points"]
+
+        self.assertTrue(payload["sampled"])
+        self.assertLessEqual(len(returned), 120)
+        self.assertEqual(
+            [point["target"] for point in returned if point["kind"] == "target"],
+            [1100],
+        )
+        self.assertIn(1000, [point["target"] for point in returned if point["kind"] == "point"])
+        self.assertIn(1100, [point["target"] for point in returned if point["kind"] == "point"])
+
+    def test_target_churn_keeps_boundaries_between_sampled_configurations(self):
+        start = self.now - timedelta(hours=3)
+        for index in range(90):
+            moment = start + timedelta(minutes=index)
+            config = rules_config(target=1000 + index)
+            record_rule_history(
+                MINT,
+                config,
+                self.evaluation(config, moment, holders=2000 + index),
+                path=self.path,
+            )
+
+        payload = get_rule_history(
+            MINT,
+            "min_holders",
+            "24h",
+            path=self.path,
+            max_points=120,
+            now=self.now,
+        )
+        returned = payload["points"]
+        point_indexes = [
+            index
+            for index, point in enumerate(returned)
+            if point["kind"] == "point"
+        ]
+
+        self.assertTrue(payload["sampled"])
+        self.assertLessEqual(len(returned), 120)
+        self.assertGreater(len(point_indexes), 10)
+        self.assertEqual(returned[point_indexes[-1]]["value"], 2089)
+        for left, right in zip(point_indexes, point_indexes[1:]):
+            left_point = returned[left]
+            right_point = returned[right]
+            if left_point["target"] == right_point["target"]:
+                continue
+            self.assertIn(
+                "target",
+                [point["kind"] for point in returned[left + 1:right]],
+            )
+
     def test_retention_removes_expired_events(self):
         config = rules_config()
         old = self.now - timedelta(days=91)
