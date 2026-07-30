@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import threading
@@ -390,12 +391,15 @@ def get_token_runtime(mint, token_config=None):
         "last_sell_alert": load_trigger_times(sell_triggers),
         "last_triggered_rsi": dict(rsi_triggers or {}),
         "rsi_state": {},
-        "last_rsi_at": parse_iso_to_utc(token_state.get("rsi_last_fetch_at") or token_state.get("latest_rsi_time")),
+        "last_rsi_at": parse_iso_to_utc(token_state.get("rsi_last_attempt_at") or token_state.get("rsi_last_fetch_at") or token_state.get("latest_rsi_time")),
         "latest_rsi": token_state.get("latest_rsi"),
         "latest_rsi_time": token_state.get("latest_rsi_time"),
         "rsi_status": token_state.get("rsi_status") or ("waiting" if solanatracker_effective_enabled() else "disabled"),
         "rsi_error": token_state.get("rsi_error"),
         "rsi_last_fetch_at": token_state.get("rsi_last_fetch_at"),
+        "rsi_last_attempt_at": token_state.get("rsi_last_attempt_at") or token_state.get("rsi_last_fetch_at"),
+        "rsi_last_success_at": token_state.get("rsi_last_success_at") or token_state.get("rsi_last_fetch_at"),
+        "rsi_source": dict(token_state.get("rsi_source") or {}) if isinstance(token_state.get("rsi_source"), dict) else {},
         "rsi_refresh_nonce": token_state.get("rsi_refresh_nonce", ""),
         "runtime_nonce": runtime_nonce,
     }
@@ -413,6 +417,117 @@ def parse_iso_to_utc(value):
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def unpack_rsi_result(result, expected_interval):
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        raise ValueError("Invalid RSI result")
+    value = float(result[0])
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise ValueError("RSI result is outside 0-100")
+    rsi_time = str(result[1] or "").strip()
+    candidate_time = parse_iso_to_utc(rsi_time)
+    if candidate_time is None:
+        raise ValueError("RSI result has an invalid candle timestamp")
+
+    metadata = result[2] if len(result) > 2 and isinstance(result[2], dict) else None
+    if metadata is None:
+        return value, rsi_time, {}
+
+    source_time = parse_iso_to_utc(metadata.get("timestamp") or rsi_time)
+    try:
+        close = float(metadata.get("close"))
+        volume = float(metadata.get("volume"))
+    except (TypeError, ValueError):
+        raise ValueError("RSI result has invalid candle metadata")
+    interval = str(metadata.get("interval") or expected_interval or "").strip()
+    if source_time is None or source_time != candidate_time or not math.isfinite(close) or close <= 0 or not math.isfinite(volume) or volume <= 0:
+        raise ValueError("RSI result has invalid candle metadata")
+    if interval != str(expected_interval or "").strip():
+        raise ValueError("RSI result interval does not match the configured interval")
+
+    source = {
+        "timestamp": source_time.isoformat(),
+        "close": close,
+        "volume": volume,
+        "interval": interval,
+        "active_bars": coerce_int(metadata.get("active_bars"), 0, minimum=0),
+        "calculation_version": str(metadata.get("calculation_version") or ""),
+    }
+    return value, source_time.isoformat(), source
+
+
+def rsi_sources_match(left, right):
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    left_time = parse_iso_to_utc(left.get("timestamp"))
+    right_time = parse_iso_to_utc(right.get("timestamp"))
+    try:
+        left_close = float(left.get("close"))
+        right_close = float(right.get("close"))
+        left_volume = float(left.get("volume"))
+        right_volume = float(right.get("volume"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        left_time is not None
+        and left_time == right_time
+        and left_close == right_close
+        and left_volume == right_volume
+        and str(left.get("interval") or "") == str(right.get("interval") or "")
+    )
+
+
+def apply_trusted_rsi_result(runtime, result, interval, observed_at=None):
+    """Accept a new/changed source candle while holding unchanged trusted RSI."""
+    value, rsi_time, source = unpack_rsi_result(result, interval)
+    observed_at = observed_at or datetime.now(timezone.utc).isoformat()
+    runtime["rsi_last_attempt_at"] = observed_at
+    runtime["rsi_last_fetch_at"] = observed_at
+
+    candidate_time = parse_iso_to_utc(rsi_time)
+    previous_time = parse_iso_to_utc(runtime.get("latest_rsi_time"))
+    previous_source = runtime.get("rsi_source") if isinstance(runtime.get("rsi_source"), dict) else {}
+
+    if previous_time is not None and candidate_time < previous_time:
+        runtime["rsi_status"] = "stale"
+        runtime["rsi_error"] = "SolanaTracker returned an older RSI candle; keeping the previous value"
+        return "regressed", runtime.get("latest_rsi")
+
+    if source and previous_time is not None and candidate_time == previous_time:
+        if rsi_sources_match(previous_source, source):
+            runtime["rsi_status"] = "ok"
+            runtime["rsi_error"] = None
+            runtime["rsi_last_success_at"] = observed_at
+            return "unchanged", runtime.get("latest_rsi")
+        if not previous_source and runtime.get("latest_rsi") is not None:
+            # Safe migration from pre-signature state: establish the source
+            # identity without replacing a trusted value on the same candle.
+            runtime["rsi_source"] = source
+            runtime["rsi_status"] = "ok"
+            runtime["rsi_error"] = None
+            runtime["rsi_last_success_at"] = observed_at
+            return "unchanged", runtime.get("latest_rsi")
+
+    runtime["latest_rsi"] = round(value, 2)
+    runtime["latest_rsi_time"] = rsi_time
+    runtime["rsi_source"] = source
+    runtime["rsi_status"] = "ok"
+    runtime["rsi_error"] = None
+    runtime["rsi_last_success_at"] = observed_at
+    return "accepted", runtime["latest_rsi"]
+
+
+def clear_runtime_rsi(runtime, status, error=None):
+    runtime["last_rsi_at"] = None
+    runtime["latest_rsi"] = None
+    runtime["latest_rsi_time"] = None
+    runtime["rsi_source"] = {}
+    runtime["rsi_status"] = status
+    runtime["rsi_error"] = error
+    runtime["rsi_last_fetch_at"] = None
+    runtime["rsi_last_attempt_at"] = None
+    runtime["rsi_last_success_at"] = None
 
 
 def sync_runtime_rsi_state(runtime, raw_alerts):
@@ -453,6 +568,42 @@ LATEST_RSI_TIME = None
 LATEST_RSI_STATUS = "waiting" if solanatracker_effective_enabled() else "disabled"
 LATEST_RSI_ERROR = None
 LATEST_RSI_LAST_FETCH_AT = None
+LATEST_RSI_SOURCE = {}
+LATEST_RSI_LAST_ATTEMPT_AT = None
+LATEST_RSI_LAST_SUCCESS_AT = None
+
+def sync_active_rsi_globals(runtime):
+    """Mirror the active token's persisted runtime into legacy UI globals."""
+    global _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR
+    global LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
+
+    _last_rsi_at = runtime.get("last_rsi_at")
+    LATEST_RSI = runtime.get("latest_rsi")
+    LATEST_RSI_TIME = runtime.get("latest_rsi_time")
+    LATEST_RSI_STATUS = runtime.get("rsi_status") or "waiting"
+    LATEST_RSI_ERROR = runtime.get("rsi_error")
+    LATEST_RSI_LAST_FETCH_AT = runtime.get("rsi_last_fetch_at")
+    LATEST_RSI_SOURCE = dict(runtime.get("rsi_source") or {})
+    LATEST_RSI_LAST_ATTEMPT_AT = runtime.get("rsi_last_attempt_at")
+    LATEST_RSI_LAST_SUCCESS_AT = runtime.get("rsi_last_success_at")
+
+
+def seed_active_rsi_runtime_from_globals(runtime):
+    """Compatibility bridge for an already-running pre-runtime active state."""
+    if runtime.get("latest_rsi") is not None or LATEST_RSI is None:
+        return
+    runtime.update({
+        "last_rsi_at": _last_rsi_at,
+        "latest_rsi": LATEST_RSI,
+        "latest_rsi_time": LATEST_RSI_TIME,
+        "rsi_status": LATEST_RSI_STATUS,
+        "rsi_error": LATEST_RSI_ERROR,
+        "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+        "rsi_source": dict(LATEST_RSI_SOURCE or {}),
+        "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
+        "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
+    })
+
 
 print("Starting script, checking env vars...", flush=True)
 print(f"INPUT_MINT: {INPUT_MINT}", flush=True)
@@ -643,7 +794,7 @@ def get_active_token_config(cfg):
 
 
 def reset_active_token_runtime(new_mint):
-    global OUTPUT_MINT, _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, TOKEN_CHANGED_SINCE_LAST_WRITE
+    global OUTPUT_MINT, _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT, TOKEN_CHANGED_SINCE_LAST_WRITE
 
     if not new_mint or new_mint == OUTPUT_MINT:
         return False
@@ -662,6 +813,9 @@ def reset_active_token_runtime(new_mint):
     LATEST_RSI_STATUS = "waiting" if solanatracker_effective_enabled() else "disabled"
     LATEST_RSI_ERROR = None
     LATEST_RSI_LAST_FETCH_AT = None
+    LATEST_RSI_SOURCE = {}
+    LATEST_RSI_LAST_ATTEMPT_AT = None
+    LATEST_RSI_LAST_SUCCESS_AT = None
     TOKEN_CHANGED_SINCE_LAST_WRITE = True
     return True
 
@@ -671,7 +825,7 @@ def load_dynamic_config():
     global RSI_ALERTS_RAW, RSI_INTERVAL, RSI_RESET_ENABLED, RSI_CHECK_INTERVAL, RSI_ENABLED
     global SOLANATRACKER_RATE_LIMIT_MODE, SOLANATRACKER_REQUESTS_PER_SECOND, SOLANATRACKER_FEATURES_ENABLED, INPUT_DECIMALS, OUTPUT_DECIMALS, OUTPUT_MINT, ACTIVE_TOKEN_CONFIG, NTFY_TOPIC
     global ACTIVE_RSI_REFRESH_NONCE, _last_rsi_at
-    global LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT
+    global LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
 
     token_changed = False
 
@@ -733,6 +887,9 @@ def load_dynamic_config():
                 LATEST_RSI_STATUS = "waiting" if not rsi_disabled_reason(active_token, cfg) else "disabled"
                 LATEST_RSI_ERROR = None if LATEST_RSI_STATUS == "waiting" else rsi_disabled_reason(active_token, cfg)
                 LATEST_RSI_LAST_FETCH_AT = None
+                LATEST_RSI_SOURCE = {}
+                LATEST_RSI_LAST_ATTEMPT_AT = None
+                LATEST_RSI_LAST_SUCCESS_AT = None
             parse_rsi_alerts()
 
             state_data = read_json_file(shared_json_path)
@@ -1232,6 +1389,9 @@ def write_status_json(
                     "last_triggered_sell": {k: v.isoformat() for k, v in last_sell_alert.items()},
                     "last_triggered_rsi": active_rsi_triggers,
                     "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+                    "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
+                    "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
+                    "rsi_source": dict(LATEST_RSI_SOURCE or {}),
                 }
                 if check_completed:
                     next_token_state.update({
@@ -1275,6 +1435,9 @@ def write_status_json(
                 "rsi_error": LATEST_RSI_ERROR,
                 "rsi_enabled": RSI_ENABLED,
                 "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+                "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
+                "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
+                "rsi_source": dict(LATEST_RSI_SOURCE or {}),
             }
             if check_completed:
                 next_existing.update({
@@ -1341,6 +1504,9 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
                 "rsi_enabled": rsi_enabled,
                 "rsi_refresh_nonce": runtime.get("rsi_refresh_nonce", ""),
                 "rsi_last_fetch_at": runtime.get("rsi_last_fetch_at"),
+                "rsi_last_attempt_at": runtime.get("rsi_last_attempt_at"),
+                "rsi_last_success_at": runtime.get("rsi_last_success_at"),
+                "rsi_source": dict(runtime.get("rsi_source") or {}),
                 "ntfy_topic": normalize_ntfy_topic((token_config or {}).get("ntfy_topic")),
                 "ntfy_effective_topic": ntfy_topic,
                 "ntfy_topic_source": ntfy_source,
@@ -1419,6 +1585,9 @@ def write_price_verification_state(
                     "rsi_enabled": rsi_enabled,
                     "rsi_refresh_nonce": runtime.get("rsi_refresh_nonce", ""),
                     "rsi_last_fetch_at": runtime.get("rsi_last_fetch_at"),
+                    "rsi_last_attempt_at": runtime.get("rsi_last_attempt_at"),
+                    "rsi_last_success_at": runtime.get("rsi_last_success_at"),
+                    "rsi_source": dict(runtime.get("rsi_source") or {}),
                     "last_triggered_buy": serialize_trigger_times(runtime.get("last_buy_alert")),
                     "last_triggered_sell": serialize_trigger_times(runtime.get("last_sell_alert")),
                     "last_triggered_rsi": dict(runtime.get("last_triggered_rsi") or {}),
@@ -1432,6 +1601,9 @@ def write_price_verification_state(
                     "rsi_error": LATEST_RSI_ERROR,
                     "rsi_enabled": RSI_ENABLED,
                     "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+                    "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
+                    "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
+                    "rsi_source": dict(LATEST_RSI_SOURCE or {}),
                     "last_triggered_buy": serialize_trigger_times(last_buy_alert),
                     "last_triggered_sell": serialize_trigger_times(last_sell_alert),
                     "last_triggered_rsi": active_rsi_triggers,
@@ -1442,6 +1614,9 @@ def write_price_verification_state(
                     "rsi_status": LATEST_RSI_STATUS,
                     "rsi_error": LATEST_RSI_ERROR,
                     "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
+                    "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
+                    "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
+                    "rsi_source": dict(LATEST_RSI_SOURCE or {}),
                     "last_triggered_buy": serialize_trigger_times(last_buy_alert),
                     "last_triggered_sell": serialize_trigger_times(last_sell_alert),
                     "last_triggered_rsi": active_rsi_triggers,
@@ -1780,64 +1955,58 @@ def check_scheduled_token(token_config, cfg=None, price_only=False):
         refresh_nonce = str((token_config or {}).get("rsi_refresh_nonce") or "")
         if refresh_nonce != runtime.get("rsi_refresh_nonce", ""):
             runtime["rsi_refresh_nonce"] = refresh_nonce
-            runtime["last_rsi_at"] = None
-            runtime["latest_rsi"] = None
-            runtime["latest_rsi_time"] = None
-            runtime["rsi_last_fetch_at"] = None
+            clear_runtime_rsi(runtime, "waiting")
         now_utc = datetime.now(timezone.utc)
         last_rsi_at = runtime.get("last_rsi_at")
         disabled_reason = rsi_disabled_reason(token_config, cfg)
         if disabled_reason:
-            runtime["latest_rsi"] = None
-            runtime["latest_rsi_time"] = None
-            runtime["rsi_status"] = "disabled"
-            runtime["rsi_error"] = disabled_reason
-            runtime["rsi_last_fetch_at"] = None
-            runtime["last_rsi_at"] = None
+            clear_runtime_rsi(runtime, "disabled", disabled_reason)
         elif last_rsi_at is None or (now_utc - last_rsi_at) >= timedelta(minutes=rsi_interval_minutes):
             runtime["last_rsi_at"] = now_utc
             runtime["rsi_status"] = "waiting"
             runtime["rsi_error"] = None
             try:
-                rsi_value, rsi_time = get_latest_rsi(
+                result = get_latest_rsi(
                     api_key=SOLANATRACKER_API_KEY,
                     token=mint,
                     period=14,
                     interval=rsi_interval,
+                    include_metadata=True,
                 )
-                runtime["latest_rsi"] = round(float(rsi_value), 2)
-                runtime["latest_rsi_time"] = rsi_time
-                runtime["rsi_status"] = "ok"
-                runtime["rsi_error"] = None
-                runtime["rsi_last_fetch_at"] = datetime.now(timezone.utc).isoformat()
+                decision, trusted_rsi = apply_trusted_rsi_result(runtime, result, rsi_interval)
+                rsi_time = runtime.get("latest_rsi_time")
+                if decision == "regressed":
+                    print(f"RSI check held for {label}: {runtime['rsi_error']}", flush=True)
+                elif trusted_rsi is not None:
+                    for key, info in rsi_state.items():
+                        direction, val_str = key.split(":", 1)
+                        threshold = float(val_str)
+                        if info.get("triggered"):
+                            if rsi_reset_enabled:
+                                crossed_back = (
+                                    (direction == "above" and trusted_rsi < threshold) or
+                                    (direction == "below" and trusted_rsi > threshold)
+                                )
+                                if crossed_back:
+                                    info["triggered"] = False
+                                    runtime["last_triggered_rsi"].pop(key, None)
+                            continue
 
-                for key, info in rsi_state.items():
-                    direction, val_str = key.split(":", 1)
-                    threshold = float(val_str)
-                    if info.get("triggered"):
-                        if rsi_reset_enabled:
-                            crossed_back = (
-                                (direction == "above" and rsi_value < threshold) or
-                                (direction == "below" and rsi_value > threshold)
-                            )
-                            if crossed_back:
-                                info["triggered"] = False
-                                runtime["last_triggered_rsi"].pop(key, None)
-                        continue
-
-                    should_fire = (
-                        (direction == "above" and rsi_value > threshold) or
-                        (direction == "below" and rsi_value < threshold)
-                    )
-                    if should_fire:
-                        delivered = send_alert("RSI Alert", f"RSI({rsi_interval}) = {rsi_value:.2f} {direction} {threshold}", token_config=token_config)
-                        if delivered:
-                            info["triggered"] = True
-                            runtime["last_triggered_rsi"][key] = rsi_time
+                        should_fire = (
+                            (direction == "above" and trusted_rsi > threshold) or
+                            (direction == "below" and trusted_rsi < threshold)
+                        )
+                        if should_fire:
+                            delivered = send_alert("RSI Alert", f"RSI({rsi_interval}) = {trusted_rsi:.2f} {direction} {threshold}", token_config=token_config)
+                            if delivered:
+                                info["triggered"] = True
+                                runtime["last_triggered_rsi"][key] = rsi_time
             except Exception as e:
+                attempted_at = datetime.now(timezone.utc).isoformat()
                 runtime["rsi_status"] = "error"
                 runtime["rsi_error"] = str(e)[:180]
-                runtime["rsi_last_fetch_at"] = datetime.now(timezone.utc).isoformat()
+                runtime["rsi_last_fetch_at"] = attempted_at
+                runtime["rsi_last_attempt_at"] = attempted_at
                 print(f"RSI check failed for {label}: {e}", flush=True)
 
     if price_decision["status"] != "accepted":
@@ -1957,8 +2126,19 @@ def scheduler_sleep_seconds(tokens, cfg):
 
 def check_prices(price_only=False):
     global _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT
+    global LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
 
     load_dynamic_config()
+    active_runtime = get_token_runtime(OUTPUT_MINT, ACTIVE_TOKEN_CONFIG)
+    configured_refresh_nonce = str((ACTIVE_TOKEN_CONFIG or {}).get("rsi_refresh_nonce") or "")
+    refresh_changed = configured_refresh_nonce != active_runtime.get("rsi_refresh_nonce", "")
+    if refresh_changed:
+        active_runtime["rsi_refresh_nonce"] = configured_refresh_nonce
+        clear_runtime_rsi(active_runtime, "waiting")
+    else:
+        seed_active_rsi_runtime_from_globals(active_runtime)
+    sync_active_rsi_globals(active_runtime)
+
     input_decimals = resolve_token_decimals(INPUT_MINT, INPUT_DECIMALS)
     output_decimals = resolve_token_decimals(OUTPUT_MINT, OUTPUT_DECIMALS)
     usdc_lamports = amount_to_atomic(USD_AMOUNT, input_decimals)
@@ -2069,70 +2249,72 @@ def check_prices(price_only=False):
         now_utc = datetime.now(timezone.utc)
         disabled_reason = rsi_disabled_reason(ACTIVE_TOKEN_CONFIG or {"rsi_enabled": RSI_ENABLED})
         if disabled_reason:
-            LATEST_RSI = None
-            LATEST_RSI_TIME = None
-            LATEST_RSI_STATUS = "disabled"
-            LATEST_RSI_ERROR = disabled_reason
-            LATEST_RSI_LAST_FETCH_AT = None
-            _last_rsi_at = None
-        elif _last_rsi_at is None or (now_utc - _last_rsi_at) >= timedelta(minutes=RSI_CHECK_INTERVAL):
-            _last_rsi_at = now_utc
-            LATEST_RSI_STATUS = "waiting"
-            LATEST_RSI_ERROR = None
+            clear_runtime_rsi(active_runtime, "disabled", disabled_reason)
+            sync_active_rsi_globals(active_runtime)
+        elif active_runtime.get("last_rsi_at") is None or (now_utc - active_runtime["last_rsi_at"]) >= timedelta(minutes=RSI_CHECK_INTERVAL):
+            active_runtime["last_rsi_at"] = now_utc
+            active_runtime["rsi_status"] = "waiting"
+            active_runtime["rsi_error"] = None
+            sync_active_rsi_globals(active_runtime)
             try:
-                rsi_value, rsi_time = get_latest_rsi(
+                result = get_latest_rsi(
                     api_key=SOLANATRACKER_API_KEY,
                     token=OUTPUT_MINT,
                     period=14,
-                    interval=RSI_INTERVAL
+                    interval=RSI_INTERVAL,
+                    include_metadata=True,
                 )
-                LATEST_RSI = round(float(rsi_value), 2)
-                LATEST_RSI_TIME = rsi_time
-                LATEST_RSI_STATUS = "ok"
-                LATEST_RSI_ERROR = None
-                LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
-                print(f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} at {rsi_time}", flush=True)
+                decision, trusted_rsi = apply_trusted_rsi_result(active_runtime, result, RSI_INTERVAL)
+                rsi_time = active_runtime.get("latest_rsi_time")
+                sync_active_rsi_globals(active_runtime)
+                if decision == "regressed":
+                    print(f"RSI check held: {LATEST_RSI_ERROR}", flush=True)
+                elif trusted_rsi is not None:
+                    print(f"RSI({RSI_INTERVAL}) = {trusted_rsi:.2f} at {rsi_time} ({decision})", flush=True)
 
-                for key, info in RSI_STATE.items():
-                    direction, val_str = key.split(":")
-                    threshold = float(val_str)
+                    for key, info in RSI_STATE.items():
+                        direction, val_str = key.split(":")
+                        threshold = float(val_str)
 
-                    if info["triggered"]:
-                        if RSI_RESET_ENABLED:
-                            crossed_back = (
-                                (direction == "above" and rsi_value < threshold) or
-                                (direction == "below" and rsi_value > threshold)
-                            )
-                            if crossed_back:
-                                info["triggered"] = False
-                                info.pop("triggered_at", None)
-                                try:
-                                    requests.post(
-                                        "http://127.0.0.1:8000/api/rsi/reset-alert",
-                                        json={"key": key},
-                                        timeout=2
-                                    )
-                                except Exception:
-                                    pass
-                        continue
+                        if info["triggered"]:
+                            if RSI_RESET_ENABLED:
+                                crossed_back = (
+                                    (direction == "above" and trusted_rsi < threshold) or
+                                    (direction == "below" and trusted_rsi > threshold)
+                                )
+                                if crossed_back:
+                                    info["triggered"] = False
+                                    info.pop("triggered_at", None)
+                                    try:
+                                        requests.post(
+                                            "http://127.0.0.1:8000/api/rsi/reset-alert",
+                                            json={"key": key},
+                                            timeout=2
+                                        )
+                                    except Exception:
+                                        pass
+                            continue
 
-                    should_fire = (
-                        (direction == "above" and rsi_value > threshold) or
-                        (direction == "below" and rsi_value < threshold)
-                    )
-                    if should_fire:
-                        msg = f"RSI({RSI_INTERVAL}) = {rsi_value:.2f} {direction} {threshold}"
-                        print(f"RSI Alert: {msg}", flush=True)
-                        delivered = send_alert("RSI Alert", msg)
-                        if delivered:
-                            info["triggered"] = True
-                            info["triggered_at"] = rsi_time
-                            notify_backend_rsi_trigger(key, rsi_time)
+                        should_fire = (
+                            (direction == "above" and trusted_rsi > threshold) or
+                            (direction == "below" and trusted_rsi < threshold)
+                        )
+                        if should_fire:
+                            msg = f"RSI({RSI_INTERVAL}) = {trusted_rsi:.2f} {direction} {threshold}"
+                            print(f"RSI Alert: {msg}", flush=True)
+                            delivered = send_alert("RSI Alert", msg)
+                            if delivered:
+                                info["triggered"] = True
+                                info["triggered_at"] = rsi_time
+                                notify_backend_rsi_trigger(key, rsi_time)
 
             except Exception as e:
-                LATEST_RSI_STATUS = "error"
-                LATEST_RSI_ERROR = str(e)[:180]
-                LATEST_RSI_LAST_FETCH_AT = datetime.now(timezone.utc).isoformat()
+                attempted_at = datetime.now(timezone.utc).isoformat()
+                active_runtime["rsi_status"] = "error"
+                active_runtime["rsi_error"] = str(e)[:180]
+                active_runtime["rsi_last_fetch_at"] = attempted_at
+                active_runtime["rsi_last_attempt_at"] = attempted_at
+                sync_active_rsi_globals(active_runtime)
                 print(f"RSI check failed: {e}", flush=True)
 
     if price_decision["status"] != "accepted":

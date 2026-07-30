@@ -51,6 +51,7 @@ def normalize_rsi_key(entry: str) -> str:
         raise ValueError(f"Invalid RSI alert format: {entry}")
 
 
+SUPPORTED_RSI_INTERVALS = {"1s", "1m", "5m", "15m", "1h", "4h"}
 app = FastAPI()
 
 app.add_middleware(
@@ -564,6 +565,8 @@ def is_rsi_warmup_message(message):
     text = str(message or "").lower()
     return any(fragment in text for fragment in (
         "not enough bars",
+        "not enough traded bars",
+        "no directional movement available",
         "not enough data for rsi",
         "no rsi candles returned",
         "no valid rsi candles returned",
@@ -970,6 +973,9 @@ def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, r
                     "rsi_status": rsi_status,
                     "rsi_error": rsi_error,
                     "rsi_last_fetch_at": None,
+                    "rsi_last_attempt_at": None,
+                    "rsi_last_success_at": None,
+                    "rsi_source": {},
                     "rsi_refresh_nonce": token.get("rsi_refresh_nonce", ""),
                 })
                 if mint == state.get("active_token_mint"):
@@ -979,6 +985,9 @@ def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, r
                         "rsi_status": rsi_status,
                         "rsi_error": rsi_error,
                         "rsi_last_fetch_at": None,
+                        "rsi_last_attempt_at": None,
+                        "rsi_last_success_at": None,
+                        "rsi_source": {},
                     })
 
             if rules_changed:
@@ -1125,6 +1134,9 @@ def clear_active_token_rsi_cache():
                     "rsi_status": "waiting" if os.getenv("SOLANATRACKER_API_KEY") else "disabled",
                     "rsi_error": None,
                     "rsi_last_fetch_at": None,
+                    "rsi_last_attempt_at": None,
+                    "rsi_last_success_at": None,
+                    "rsi_source": {},
                 })
                 token_states[active_mint] = token_state
             existing["token_states"] = token_states
@@ -1134,6 +1146,9 @@ def clear_active_token_rsi_cache():
                 "rsi_status": "waiting" if os.getenv("SOLANATRACKER_API_KEY") else "disabled",
                 "rsi_error": None,
                 "rsi_last_fetch_at": None,
+                "rsi_last_attempt_at": None,
+                "rsi_last_success_at": None,
+                "rsi_source": {},
             })
             atomic_write_json(STATE_PATH, existing)
     except Exception as e:
@@ -1178,6 +1193,9 @@ def clear_active_runtime_cache():
                 "last_triggered_buy": last_buy,
                 "last_triggered_sell": last_sell,
                 "last_triggered_rsi": last_rsi,
+                "rsi_last_attempt_at": token_state.get("rsi_last_attempt_at"),
+                "rsi_last_success_at": token_state.get("rsi_last_success_at"),
+                "rsi_source": dict(token_state.get("rsi_source") or {}) if isinstance(token_state.get("rsi_source"), dict) else {},
                 "latest_rsi": token_state.get("latest_rsi"),
                 "latest_rsi_time": token_state.get("latest_rsi_time"),
                 "rsi_status": token_state.get("rsi_status") or ("waiting" if os.getenv("SOLANATRACKER_API_KEY") else "disabled"),
@@ -1431,6 +1449,8 @@ async def add_token(payload: TokenPayload):
 async def update_token(mint: str, payload: TokenUpdatePayload):
     token = find_token_or_404(mint)
     fields = provided_fields(payload)
+    old_rsi_interval = str(token.get("rsi_interval") or state.get("rsi_interval") or "1s").strip()
+    rsi_interval_changed = False
     old_rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
     rsi_transition = None
     clean_rules_config = None
@@ -1457,14 +1477,19 @@ async def update_token(mint: str, payload: TokenUpdatePayload):
     if "rsi_check_interval" in fields:
         token["rsi_check_interval"] = optional_bounded_int(payload.rsi_check_interval, 1, 43200)
     if "rsi_interval" in fields:
-        token["rsi_interval"] = str(payload.rsi_interval or "1s").strip() or "1s"
+        next_rsi_interval = str(payload.rsi_interval or "1s").strip() or "1s"
+        if next_rsi_interval not in SUPPORTED_RSI_INTERVALS:
+            supported = ", ".join(sorted(SUPPORTED_RSI_INTERVALS))
+            raise HTTPException(status_code=400, detail=f"RSI interval must be one of: {supported}")
+        token["rsi_interval"] = next_rsi_interval
+        rsi_interval_changed = next_rsi_interval != old_rsi_interval
     if "rsi_reset_enabled" in fields:
         token["rsi_reset_enabled"] = coerce_bool(payload.rsi_reset_enabled, token.get("rsi_reset_enabled", False))
     if "rsi_enabled" in fields:
         token["rsi_enabled"] = coerce_bool(payload.rsi_enabled, token.get("rsi_enabled", True))
-        if token["rsi_enabled"] != old_rsi_enabled:
-            token["rsi_refresh_nonce"] = datetime.now(timezone.utc).isoformat()
-            rsi_transition = "waiting" if token["rsi_enabled"] else "disabled"
+    if rsi_interval_changed or coerce_bool(token.get("rsi_enabled"), True) != old_rsi_enabled:
+        token["rsi_refresh_nonce"] = datetime.now(timezone.utc).isoformat()
+        rsi_transition = "waiting" if coerce_bool(token.get("rsi_enabled"), True) else "disabled"
     if clean_rules_config is not None:
         token["rules_config"] = clean_rules_config
         rules_changed = rules_config_signature(clean_rules_config) != existing_rules_signature
@@ -1805,9 +1830,22 @@ async def reset_rsi_alert(data: RsiReset):
 
 @app.post("/api/rsi/interval")
 async def set_rsi_interval(cfg: IntervalConfig):
-    state["rsi_interval"] = cfg.interval
+    interval = str(cfg.interval or "").strip()
+    if interval not in SUPPORTED_RSI_INTERVALS:
+        supported = ", ".join(sorted(SUPPORTED_RSI_INTERVALS))
+        raise HTTPException(status_code=400, detail=f"RSI interval must be one of: {supported}")
+    previous = str(state.get("rsi_interval") or "1s")
+    state["rsi_interval"] = interval
+    active_token = get_active_token()
+    if active_token is not None:
+        previous = str(active_token.get("rsi_interval") or previous)
+        active_token["rsi_interval"] = interval
+        if interval != previous:
+            active_token["rsi_refresh_nonce"] = datetime.now(timezone.utc).isoformat()
+        apply_active_token_to_legacy()
     write_config()
-    clear_active_token_rsi_cache()
+    if interval != previous:
+        clear_active_token_rsi_cache()
     return {"success": True}
 
 @app.post("/api/rsi/reset-mode")
@@ -1858,6 +1896,9 @@ async def get_rsi_status():
     status = cached.get("rsi_status")
     message = cached.get("rsi_error")
     last_fetch_at = cached.get("rsi_last_fetch_at")
+    last_attempt_at = cached.get("rsi_last_attempt_at") or last_fetch_at
+    last_success_at = cached.get("rsi_last_success_at") or last_fetch_at
+    source = cached.get("rsi_source") if isinstance(cached.get("rsi_source"), dict) else {}
     active_token = get_active_token()
     active_rsi_enabled = coerce_bool((active_token or {}).get("rsi_enabled"), state.get("rsi_enabled", True))
 
@@ -1876,7 +1917,7 @@ async def get_rsi_status():
     elif status not in {"ok", "waiting", "error", "stale"}:
         status = "waiting" if latest_rsi is None else "ok"
 
-    fetched_dt = parse_iso_datetime(last_fetch_at or cached.get("latest_rsi_time"))
+    fetched_dt = parse_iso_datetime(last_success_at or cached.get("latest_rsi_time"))
     if status == "ok" and fetched_dt:
         effective_check_interval = effective_active_rsi_check_interval()
         max_age = timedelta(minutes=max(2, effective_check_interval * 2 + 1))
@@ -1906,6 +1947,9 @@ async def get_rsi_status():
         "status": status,
         "message": message,
         "last_fetch_at": last_fetch_at,
+        "last_attempt_at": last_attempt_at,
+        "last_success_at": last_success_at,
+        "source": source,
     }
 
 

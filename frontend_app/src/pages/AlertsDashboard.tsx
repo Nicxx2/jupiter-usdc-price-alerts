@@ -406,7 +406,9 @@ function getRsiStatus(triggered: boolean, resetEnabled: boolean): string {
 
 function friendlyRsiMessage(message?: string): string {
   if (!message) return "";
-  const bars = message.match(/not enough bars for RSI\((\d+)\): got (\d+)/i);
+  const tradedProgress = message.match(/not enough traded bars for RSI\((\d+)\): (\d+)\/(\d+) available/i);
+  if (tradedProgress) return `Waiting for enough traded RSI candles (${tradedProgress[2]}/${tradedProgress[3]} bars)`;
+  const bars = message.match(/not enough (?:traded )?bars for RSI\((\d+)\): got (\d+)/i);
   if (bars) return `Waiting for enough RSI candles (${bars[2]}/${Number(bars[1]) + 1} bars)`;
   const points = message.match(/not enough data for RSI: need >= (\d+) points, got (\d+)/i);
   if (points) return `Waiting for enough RSI candles (${points[2]}/${points[1]} bars)`;
@@ -417,7 +419,7 @@ function friendlyRsiMessage(message?: string): string {
 }
 
 function isRsiWarmupMessage(message?: string): boolean {
-  return /not enough (bars|data)|no (valid )?rsi candles returned|no non-zero volume bars/i.test(message || "");
+  return /not enough (?:traded )?(?:bars|data)|no (valid )?rsi candles returned|no non-zero volume bars/i.test(message || "");
 }
 
 function getRsiStatusMeta(status: string, message?: string) {
@@ -1557,7 +1559,7 @@ export default function AlertsDashboard() {
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.6</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.7</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button

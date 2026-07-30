@@ -161,6 +161,177 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.assertEqual(self.main.token_rsi_interval(custom, cfg), "5m")
         self.assertTrue(self.main.token_rsi_reset_enabled(custom, cfg))
 
+
+    @staticmethod
+    def rsi_result(value, timestamp="2026-07-30T12:00:00+00:00", close=10.0, volume=5.0, interval="1m"):
+        return value, timestamp, {
+            "timestamp": timestamp,
+            "close": close,
+            "volume": volume,
+            "interval": interval,
+            "active_bars": 200,
+            "calculation_version": "test-v2",
+        }
+
+    def test_trusted_rsi_holds_when_source_candle_is_unchanged(self):
+        runtime = {}
+        first = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(32.8),
+            "1m",
+            observed_at="2026-07-30T12:00:01+00:00",
+        )
+        second = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(52.24),
+            "1m",
+            observed_at="2026-07-30T12:05:01+00:00",
+        )
+
+        self.assertEqual(first, ("accepted", 32.8))
+        self.assertEqual(second, ("unchanged", 32.8))
+        self.assertEqual(runtime["latest_rsi"], 32.8)
+        self.assertEqual(runtime["rsi_last_success_at"], "2026-07-30T12:05:01+00:00")
+
+    def test_trusted_rsi_accepts_changed_or_newer_trade_candle(self):
+        runtime = {}
+        self.main.apply_trusted_rsi_result(runtime, self.rsi_result(32.8), "1m")
+
+        changed = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(40.0, close=10.5, volume=7.0),
+            "1m",
+        )
+        newer = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(48.0, timestamp="2026-07-30T12:01:00+00:00", close=11.0, volume=2.0),
+            "1m",
+        )
+
+        self.assertEqual(changed, ("accepted", 40.0))
+        self.assertEqual(newer, ("accepted", 48.0))
+        self.assertEqual(runtime["latest_rsi"], 48.0)
+
+    def test_trusted_rsi_rejects_regressed_candle_and_wrong_interval(self):
+        runtime = {}
+        self.main.apply_trusted_rsi_result(runtime, self.rsi_result(48.0), "1m")
+
+        regressed = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(20.0, timestamp="2026-07-30T11:59:00+00:00", close=8.0),
+            "1m",
+        )
+
+        self.assertEqual(regressed, ("regressed", 48.0))
+        self.assertEqual(runtime["latest_rsi"], 48.0)
+        self.assertEqual(runtime["rsi_status"], "stale")
+        with self.assertRaisesRegex(ValueError, "interval"):
+            self.main.apply_trusted_rsi_result(runtime, self.rsi_result(50.0, interval="5m"), "1m")
+
+        mismatched_time = list(self.rsi_result(50.0))
+        mismatched_time[2] = dict(mismatched_time[2], timestamp="2026-07-30T12:01:00+00:00")
+        with self.assertRaisesRegex(ValueError, "metadata"):
+            self.main.apply_trusted_rsi_result(runtime, tuple(mismatched_time), "1m")
+
+    def test_trusted_rsi_migrates_existing_same_candle_without_replacing_value(self):
+        runtime = {
+            "latest_rsi": 35.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_source": {},
+        }
+
+        decision = self.main.apply_trusted_rsi_result(runtime, self.rsi_result(60.0), "1m")
+
+        self.assertEqual(decision, ("unchanged", 35.0))
+        self.assertEqual(runtime["latest_rsi"], 35.0)
+        self.assertEqual(runtime["rsi_source"]["close"], 10.0)
+
+    def test_active_runtime_restores_persisted_error_without_an_rsi_value(self):
+        runtime = {
+            "last_rsi_at": datetime.now(timezone.utc),
+            "latest_rsi": None,
+            "latest_rsi_time": None,
+            "rsi_status": "error",
+            "rsi_error": "403 Forbidden",
+            "rsi_last_fetch_at": "2026-07-30T12:00:00+00:00",
+            "rsi_last_attempt_at": "2026-07-30T12:00:00+00:00",
+            "rsi_last_success_at": None,
+            "rsi_source": {},
+            "rsi_refresh_nonce": "same-refresh",
+        }
+        with mock.patch.multiple(
+            self.main,
+            load_dynamic_config=mock.Mock(),
+            get_token_runtime=mock.Mock(return_value=runtime),
+            resolve_token_decimals=mock.Mock(return_value=6),
+            get_out_amount_raw=mock.Mock(return_value=100_000_000),
+            assess_price_sample=mock.Mock(return_value={"status": "accepted", "reason": "normal"}),
+            write_status_json=mock.Mock(return_value="2026-07-30T12:00:00+00:00"),
+            OUTPUT_MINT=SOL_MINT,
+            ACTIVE_TOKEN_CONFIG={"mint": SOL_MINT, "rsi_refresh_nonce": "same-refresh"},
+            BUY_ALERTS=[],
+            SELL_ALERTS=[],
+            USD_AMOUNT=100.0,
+            LATEST_RSI=None,
+            LATEST_RSI_TIME=None,
+            LATEST_RSI_STATUS="waiting",
+            LATEST_RSI_ERROR=None,
+            LATEST_RSI_LAST_FETCH_AT=None,
+            LATEST_RSI_SOURCE={},
+            LATEST_RSI_LAST_ATTEMPT_AT=None,
+            LATEST_RSI_LAST_SUCCESS_AT=None,
+        ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)):
+            self.main.check_prices(price_only=True)
+
+            self.assertEqual(self.main.LATEST_RSI_STATUS, "error")
+            self.assertEqual(self.main.LATEST_RSI_ERROR, "403 Forbidden")
+            self.assertEqual(self.main.LATEST_RSI_LAST_ATTEMPT_AT, "2026-07-30T12:00:00+00:00")
+
+    def test_rsi_refresh_change_cannot_restore_stale_active_globals(self):
+        runtime = {
+            "last_rsi_at": datetime.now(timezone.utc),
+            "latest_rsi": 72.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_status": "ok",
+            "rsi_error": None,
+            "rsi_last_fetch_at": "2026-07-30T12:00:01+00:00",
+            "rsi_last_attempt_at": "2026-07-30T12:00:01+00:00",
+            "rsi_last_success_at": "2026-07-30T12:00:01+00:00",
+            "rsi_source": {"timestamp": "2026-07-30T12:00:00+00:00"},
+            "rsi_refresh_nonce": "old-refresh",
+        }
+        with mock.patch.multiple(
+            self.main,
+            load_dynamic_config=mock.Mock(),
+            get_token_runtime=mock.Mock(return_value=runtime),
+            resolve_token_decimals=mock.Mock(return_value=6),
+            get_out_amount_raw=mock.Mock(return_value=100_000_000),
+            assess_price_sample=mock.Mock(return_value={"status": "accepted", "reason": "normal"}),
+            write_status_json=mock.Mock(return_value="2026-07-30T12:00:00+00:00"),
+            OUTPUT_MINT=SOL_MINT,
+            ACTIVE_TOKEN_CONFIG={"mint": SOL_MINT, "rsi_refresh_nonce": "new-refresh"},
+            BUY_ALERTS=[],
+            SELL_ALERTS=[],
+            USD_AMOUNT=100.0,
+            LATEST_RSI=72.0,
+            LATEST_RSI_TIME="2026-07-30T12:00:00+00:00",
+            LATEST_RSI_STATUS="ok",
+            LATEST_RSI_ERROR=None,
+            LATEST_RSI_LAST_FETCH_AT="2026-07-30T12:00:01+00:00",
+            LATEST_RSI_SOURCE={"timestamp": "2026-07-30T12:00:00+00:00"},
+            LATEST_RSI_LAST_ATTEMPT_AT="2026-07-30T12:00:01+00:00",
+            LATEST_RSI_LAST_SUCCESS_AT="2026-07-30T12:00:01+00:00",
+        ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)):
+            self.main.check_prices(price_only=True)
+
+            self.assertEqual(runtime["rsi_refresh_nonce"], "new-refresh")
+            self.assertIsNone(runtime["latest_rsi"])
+            self.assertEqual(runtime["rsi_source"], {})
+            self.assertEqual(runtime["rsi_status"], "waiting")
+            self.assertIsNone(self.main.LATEST_RSI)
+            self.assertEqual(self.main.LATEST_RSI_SOURCE, {})
+            self.assertEqual(self.main.LATEST_RSI_STATUS, "waiting")
+
     def test_scheduler_picks_one_due_token_round_robin(self):
         cfg = {"check_interval": 60, "rsi_check_interval": 5}
         tokens = [
@@ -784,7 +955,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             "rsi_enabled": True,
             "runtime_nonce": "rsi-delivery-generation",
         }
-        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_enabled": True}
+        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_interval": "1m", "rsi_enabled": True}
         send = mock.Mock(side_effect=[False, True])
         runtime_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
         try:
@@ -796,7 +967,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
                 RSI_ENABLED=True,
                 resolve_token_decimals=mock.Mock(return_value=6),
                 get_out_amount_raw=mock.Mock(return_value=100_000_000),
-                get_latest_rsi=mock.Mock(return_value=(80.0, "2026-07-28T16:00:00+00:00")),
+                get_latest_rsi=mock.Mock(return_value=self.rsi_result(80.0, "2026-07-28T16:00:00+00:00")),
                 send_alert=send,
                 write_scheduled_token_status=mock.Mock(),
             ):
@@ -979,6 +1150,63 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
 
         self.assertIsNotNone(token)
         self.assertEqual(token["runtime_nonce"], "generation-2")
+
+    def test_backend_rsi_interval_change_validates_and_invalidates_cache(self):
+        backend = import_backend_module()
+        token = {
+            "mint": SOL_MINT,
+            "name": "SOL",
+            "enabled": True,
+            "rsi_enabled": True,
+            "rsi_interval": "1m",
+        }
+        originals = {
+            "tokens": backend.state.get("tokens"),
+            "active_token_mint": backend.state.get("active_token_mint"),
+        }
+        cache_update = mock.Mock()
+        try:
+            backend.state["tokens"] = [token]
+            backend.state["active_token_mint"] = None
+            payload = backend.TokenUpdatePayload(rsi_interval="5m")
+            payload.__fields_set__ = {"rsi_interval"}
+
+            with mock.patch.multiple(
+                backend,
+                write_config=mock.Mock(),
+                update_token_cached_states=cache_update,
+                get_token_state_summary=mock.Mock(return_value=[]),
+            ):
+                result = asyncio.run(backend.update_token(SOL_MINT, payload))
+
+            self.assertTrue(result["success"])
+            self.assertEqual(token["rsi_interval"], "5m")
+            self.assertTrue(token.get("rsi_refresh_nonce"))
+            self.assertEqual(cache_update.call_args.kwargs["rsi_status"], "waiting")
+
+            previous_nonce = token["rsi_refresh_nonce"]
+            same_payload = backend.TokenUpdatePayload(rsi_interval="5m")
+            same_payload.__fields_set__ = {"rsi_interval"}
+            cache_update.reset_mock()
+            with mock.patch.multiple(
+                backend,
+                write_config=mock.Mock(),
+                update_token_cached_states=cache_update,
+                get_token_state_summary=mock.Mock(return_value=[]),
+            ):
+                asyncio.run(backend.update_token(SOL_MINT, same_payload))
+            self.assertEqual(token["rsi_refresh_nonce"], previous_nonce)
+            self.assertIsNone(cache_update.call_args.kwargs["rsi_status"])
+
+            invalid_payload = backend.TokenUpdatePayload(rsi_interval="2m")
+            invalid_payload.__fields_set__ = {"rsi_interval"}
+            with self.assertRaises(backend.HTTPException) as ctx:
+                asyncio.run(backend.update_token(SOL_MINT, invalid_payload))
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertEqual(token["rsi_interval"], "5m")
+        finally:
+            backend.state["tokens"] = originals["tokens"]
+            backend.state["active_token_mint"] = originals["active_token_mint"]
 
     def test_backend_readd_clears_stale_generation_state(self):
         backend = import_backend_module()
@@ -1388,6 +1616,12 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
                     "rsi_error": None,
                     "rsi_last_fetch_at": "2026-06-24T12:00:01+00:00",
                     "last_triggered_buy": {buy_key: "2026-06-24T12:00:00+00:00"},
+                    "rsi_last_attempt_at": "2026-06-24T12:00:02+00:00",
+                    "rsi_last_success_at": "2026-06-24T12:00:01+00:00",
+                    "rsi_source": {
+                        "timestamp": "2026-06-24T12:00:00+00:00", "close": 1.2,
+                        "volume": 5.0, "interval": "1m",
+                    },
                     "last_triggered_sell": {},
                     "last_triggered_rsi": {trigger_key: "2026-06-24T12:00:00+00:00"},
                 }
@@ -1429,6 +1663,10 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.assertEqual(backend.state["last_triggered_rsi"], {trigger_key: "2026-06-24T12:00:00+00:00"})
             self.assertEqual(captured["latest_prices"], [history_point])
             self.assertEqual(captured["latest_rsi"], 64.25)
+            self.assertEqual(captured["rsi_last_attempt_at"], "2026-06-24T12:00:02+00:00")
+            self.assertEqual(captured["rsi_last_success_at"], "2026-06-24T12:00:01+00:00")
+            self.assertEqual(captured["rsi_source"]["timestamp"], "2026-06-24T12:00:00+00:00")
+            self.assertEqual(captured["rsi_source"]["interval"], "1m")
             self.assertEqual(captured["last_triggered_buy"], {buy_key: "2026-06-24T12:00:00+00:00"})
             self.assertEqual(captured["last_triggered_rsi"], {trigger_key: "2026-06-24T12:00:00+00:00"})
         finally:
@@ -1695,6 +1933,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         backend = import_backend_module()
         warmup_messages = [
             "Not enough bars for RSI(14): got 2",
+            "Not enough traded bars for RSI(14): 9/15 available",
             "Not enough data for RSI: need >= 15 points, got 2",
             "No RSI candles returned in the last 3 days",
             "No valid RSI candles returned in the last 3 days",

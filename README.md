@@ -14,7 +14,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v3.3.6
+# 🚀 Jupiter USDC Price Alerts v3.3.7
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -22,8 +22,9 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 
 ---
 
-## ✨ What's New in v3.3.6
+## ✨ What's New in v3.3.7
 
+- Improved SolanaTracker RSI reliability with standard Wilder calculations over genuine traded candles, stable no-trade values, safer source validation, and correct persistence across restarts, token switches, and interval changes.
 - Added safer confirmation for unusually large Jupiter price moves before updating charts, shared quote caches, or firing alerts.
 - Improved multi-token monitoring with live Token Overview updates, a clear active-token marker, accurate overdue scheduling, independent background alerts, safer notification retries, and cleaner fired-alert timing details.
 - Improved Action Readiness trends across 24h, 7d, 30d, and 90d so representative real readings remain visible while genuine provider gaps and rule or scenario changes stay clearly separated.
