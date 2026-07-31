@@ -26,6 +26,7 @@ from rule_history import (
     get_rule_history,
     mark_rule_history_gaps,
 )
+from rsi_utils import RSI_CALCULATION_VERSION
 from solana_rate_limiter import throttle, configure_rate_limit
 from typing import Dict, Any, Optional
 
@@ -606,6 +607,10 @@ def get_token_state_summary():
         rsi_error = token_state.get("rsi_error")
         rsi_status = token_state.get("rsi_status")
         rsi_value = token_state.get("latest_rsi")
+        rsi_pending_source = token_state.get("rsi_pending_source") if isinstance(token_state.get("rsi_pending_source"), dict) else {}
+        rsi_refresh_pending = bool(rsi_pending_source)
+        rsi_value_calculation_version = str(token_state.get("rsi_value_calculation_version") or "")
+        rsi_migration_pending = rsi_value is not None and rsi_value_calculation_version != RSI_CALCULATION_VERSION
         if not state.get("solanatracker_features_enabled", True):
             rsi_status = "disabled"
             rsi_error = "SolanaTracker disabled in settings"
@@ -618,8 +623,15 @@ def get_token_state_summary():
             rsi_status = "disabled"
             rsi_error = "RSI disabled for this token"
             rsi_value = None
+        elif rsi_refresh_pending:
+            rsi_status = "waiting"
+            rsi_error = rsi_error or "New traded RSI candle detected; verifying historical candles"
+            rsi_value = None
         elif is_rsi_warmup_message(rsi_error) and rsi_status == "error":
             rsi_status = "waiting"
+        elif rsi_migration_pending and rsi_status != "error":
+            rsi_status = "stale"
+            rsi_error = "RSI was calculated by an earlier app version; waiting for a verified refresh"
         summary.append({
             "mint": token["mint"],
             "name": token.get("name") or short_mint(token["mint"]),
@@ -631,10 +643,15 @@ def get_token_state_summary():
             "rsi_status": rsi_status,
             "last_checked": last_checked,
             "next_check_at": price_verification_due_at or derived_next_check_at(last_checked, effective_check_interval, token_state.get("next_check_at")),
+            "rsi_value_calculation_version": rsi_value_calculation_version,
+            "rsi_migration_pending": rsi_migration_pending,
+            "rsi_refresh_pending": rsi_refresh_pending,
+            "rsi_backfill_failures": coerce_int(token_state.get("rsi_backfill_failures"), 0, minimum=0),
+            "rsi_backfill_next_attempt_at": token_state.get("rsi_backfill_next_attempt_at"),
             "price_status": price_status,
             "price_message": price_message,
             "price_verification_due_at": price_verification_due_at,
-            "error": token_state.get("error") or (None if rsi_status == "disabled" or is_rsi_warmup_message(rsi_error) else rsi_error),
+            "error": token_state.get("error") or (None if rsi_status in {"disabled", "waiting"} or is_rsi_warmup_message(rsi_error) else rsi_error),
             "ntfy_topic": token.get("ntfy_topic", ""),
             "ntfy_effective_topic": effective_ntfy_topic(token),
             "ntfy_topic_source": ntfy_topic_source(token),
@@ -976,6 +993,11 @@ def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, r
                     "rsi_last_attempt_at": None,
                     "rsi_last_success_at": None,
                     "rsi_source": {},
+                    "rsi_pending_source": {},
+                    "rsi_backfill_failures": 0,
+                    "rsi_backfill_next_attempt_at": None,
+                    "rsi_value_calculation_version": "",
+                    "rsi_migration_pending": False,
                     "rsi_refresh_nonce": token.get("rsi_refresh_nonce", ""),
                 })
                 if mint == state.get("active_token_mint"):
@@ -988,6 +1010,11 @@ def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, r
                         "rsi_last_attempt_at": None,
                         "rsi_last_success_at": None,
                         "rsi_source": {},
+                        "rsi_pending_source": {},
+                        "rsi_backfill_failures": 0,
+                        "rsi_backfill_next_attempt_at": None,
+                        "rsi_value_calculation_version": "",
+                        "rsi_migration_pending": False,
                     })
 
             if rules_changed:
@@ -1137,6 +1164,11 @@ def clear_active_token_rsi_cache():
                     "rsi_last_attempt_at": None,
                     "rsi_last_success_at": None,
                     "rsi_source": {},
+                    "rsi_pending_source": {},
+                    "rsi_backfill_failures": 0,
+                    "rsi_backfill_next_attempt_at": None,
+                    "rsi_value_calculation_version": "",
+                    "rsi_migration_pending": False,
                 })
                 token_states[active_mint] = token_state
             existing["token_states"] = token_states
@@ -1149,6 +1181,11 @@ def clear_active_token_rsi_cache():
                 "rsi_last_attempt_at": None,
                 "rsi_last_success_at": None,
                 "rsi_source": {},
+                "rsi_pending_source": {},
+                "rsi_backfill_failures": 0,
+                "rsi_backfill_next_attempt_at": None,
+                "rsi_value_calculation_version": "",
+                "rsi_migration_pending": False,
             })
             atomic_write_json(STATE_PATH, existing)
     except Exception as e:
@@ -1196,6 +1233,11 @@ def clear_active_runtime_cache():
                 "rsi_last_attempt_at": token_state.get("rsi_last_attempt_at"),
                 "rsi_last_success_at": token_state.get("rsi_last_success_at"),
                 "rsi_source": dict(token_state.get("rsi_source") or {}) if isinstance(token_state.get("rsi_source"), dict) else {},
+                "rsi_pending_source": dict(token_state.get("rsi_pending_source") or {}) if isinstance(token_state.get("rsi_pending_source"), dict) else {},
+                "rsi_backfill_failures": coerce_int(token_state.get("rsi_backfill_failures"), 0, minimum=0),
+                "rsi_backfill_next_attempt_at": token_state.get("rsi_backfill_next_attempt_at"),
+                "rsi_value_calculation_version": str(token_state.get("rsi_value_calculation_version") or ""),
+                "rsi_migration_pending": token_state.get("latest_rsi") is not None and str(token_state.get("rsi_value_calculation_version") or "") != RSI_CALCULATION_VERSION,
                 "latest_rsi": token_state.get("latest_rsi"),
                 "latest_rsi_time": token_state.get("latest_rsi_time"),
                 "rsi_status": token_state.get("rsi_status") or ("waiting" if os.getenv("SOLANATRACKER_API_KEY") else "disabled"),
@@ -1341,6 +1383,8 @@ async def trigger_rsi(data: RsiTrigger):
 async def get_state():
     latest = read_json_file(STATE_PATH)
     active_history = get_token_price_history(latest, state.get("active_token_mint") or os.getenv("OUTPUT_MINT"))
+    rsi_refresh_pending = bool(latest.get("rsi_pending_source")) if isinstance(latest.get("rsi_pending_source"), dict) else False
+    effective_rsi_error = latest.get("rsi_error") or "New traded RSI candle detected; verifying historical candles"
     return {
         **state,
         "latest_prices": active_history,
@@ -1363,10 +1407,15 @@ async def get_state():
         "ntfy_topic": safe_ntfy_topic(state.get("ntfy_topic")),
         "ntfy_effective_topic": effective_global_ntfy_topic(),
         "ntfy_configured": bool(effective_global_ntfy_topic()),
-        "latest_rsi": latest.get("latest_rsi"),
+        "latest_rsi": None if rsi_refresh_pending else latest.get("latest_rsi"),
         "latest_rsi_time": latest.get("latest_rsi_time"),
-        "rsi_status": latest.get("rsi_status"),
-        "rsi_error": latest.get("rsi_error"),
+        "rsi_status": "waiting" if rsi_refresh_pending else latest.get("rsi_status"),
+        "rsi_error": effective_rsi_error if rsi_refresh_pending else latest.get("rsi_error"),
+        "rsi_value_calculation_version": str(latest.get("rsi_value_calculation_version") or ""),
+        "rsi_migration_pending": latest.get("latest_rsi") is not None and str(latest.get("rsi_value_calculation_version") or "") != RSI_CALCULATION_VERSION,
+        "rsi_refresh_pending": rsi_refresh_pending,
+        "rsi_backfill_failures": coerce_int(latest.get("rsi_backfill_failures"), 0, minimum=0),
+        "rsi_backfill_next_attempt_at": latest.get("rsi_backfill_next_attempt_at"),
     }
 
 
@@ -1899,6 +1948,12 @@ async def get_rsi_status():
     last_attempt_at = cached.get("rsi_last_attempt_at") or last_fetch_at
     last_success_at = cached.get("rsi_last_success_at") or last_fetch_at
     source = cached.get("rsi_source") if isinstance(cached.get("rsi_source"), dict) else {}
+    pending_source = cached.get("rsi_pending_source") if isinstance(cached.get("rsi_pending_source"), dict) else {}
+    refresh_pending = bool(pending_source)
+    backfill_failures = coerce_int(cached.get("rsi_backfill_failures"), 0, minimum=0)
+    backfill_next_attempt_at = cached.get("rsi_backfill_next_attempt_at")
+    value_calculation_version = str(cached.get("rsi_value_calculation_version") or "")
+    migration_pending = latest_rsi is not None and value_calculation_version != RSI_CALCULATION_VERSION
     active_token = get_active_token()
     active_rsi_enabled = coerce_bool((active_token or {}).get("rsi_enabled"), state.get("rsi_enabled", True))
 
@@ -1914,6 +1969,13 @@ async def get_rsi_status():
         status = "disabled"
         latest_rsi = None
         message = "RSI disabled for this token"
+    elif refresh_pending:
+        status = "waiting"
+        latest_rsi = None
+        message = message or "New traded RSI candle detected; verifying historical candles"
+    elif migration_pending and status != "error":
+        status = "stale"
+        message = "RSI was calculated by an earlier app version; waiting for a verified refresh"
     elif status not in {"ok", "waiting", "error", "stale"}:
         status = "waiting" if latest_rsi is None else "ok"
 
@@ -1950,6 +2012,12 @@ async def get_rsi_status():
         "last_attempt_at": last_attempt_at,
         "last_success_at": last_success_at,
         "source": source,
+        "pending_source": pending_source,
+        "value_calculation_version": value_calculation_version,
+        "migration_pending": migration_pending,
+        "refresh_pending": refresh_pending,
+        "backfill_failures": backfill_failures,
+        "backfill_next_attempt_at": backfill_next_attempt_at,
     }
 
 

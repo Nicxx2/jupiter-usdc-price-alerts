@@ -162,15 +162,14 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.assertTrue(self.main.token_rsi_reset_enabled(custom, cfg))
 
 
-    @staticmethod
-    def rsi_result(value, timestamp="2026-07-30T12:00:00+00:00", close=10.0, volume=5.0, interval="1m"):
+    def rsi_result(self, value, timestamp="2026-07-30T12:00:00+00:00", close=10.0, volume=5.0, interval="1m"):
         return value, timestamp, {
             "timestamp": timestamp,
             "close": close,
             "volume": volume,
             "interval": interval,
             "active_bars": 200,
-            "calculation_version": "test-v2",
+            "calculation_version": self.main.RSI_CALCULATION_VERSION,
         }
 
     def test_trusted_rsi_holds_when_source_candle_is_unchanged(self):
@@ -233,7 +232,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "metadata"):
             self.main.apply_trusted_rsi_result(runtime, tuple(mismatched_time), "1m")
 
-    def test_trusted_rsi_migrates_existing_same_candle_without_replacing_value(self):
+    def test_trusted_rsi_migrates_existing_same_candle_and_replaces_legacy_value(self):
         runtime = {
             "latest_rsi": 35.0,
             "latest_rsi_time": "2026-07-30T12:00:00+00:00",
@@ -242,9 +241,136 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
 
         decision = self.main.apply_trusted_rsi_result(runtime, self.rsi_result(60.0), "1m")
 
-        self.assertEqual(decision, ("unchanged", 35.0))
-        self.assertEqual(runtime["latest_rsi"], 35.0)
+        self.assertEqual(decision, ("accepted", 60.0))
+        self.assertEqual(runtime["latest_rsi"], 60.0)
         self.assertEqual(runtime["rsi_source"]["close"], 10.0)
+        self.assertEqual(runtime["rsi_value_calculation_version"], self.main.RSI_CALCULATION_VERSION)
+        self.assertFalse(runtime["rsi_migration_pending"])
+
+    def test_trusted_rsi_migrates_v337_source_metadata_without_trusting_legacy_value(self):
+        runtime = {
+            "latest_rsi": 35.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_source": dict(self.rsi_result(35.0)[2]),
+        }
+
+        decision = self.main.apply_trusted_rsi_result(runtime, self.rsi_result(60.0), "1m")
+
+        self.assertEqual(decision, ("accepted", 60.0))
+        self.assertEqual(runtime["latest_rsi"], 60.0)
+        self.assertEqual(runtime["rsi_value_calculation_version"], self.main.RSI_CALCULATION_VERSION)
+
+    def test_trusted_rsi_migration_can_replace_a_newer_legacy_phantom_timestamp(self):
+        runtime = {
+            "latest_rsi": 35.0,
+            "latest_rsi_time": "2026-07-30T13:00:00+00:00",
+            "rsi_source": {},
+        }
+
+        decision = self.main.apply_trusted_rsi_result(runtime, self.rsi_result(60.0), "1m")
+
+        self.assertEqual(decision, ("accepted", 60.0))
+        self.assertEqual(runtime["latest_rsi_time"], "2026-07-30T12:00:00+00:00")
+
+    def test_trusted_rsi_migration_rejects_a_source_older_than_its_v337_watermark(self):
+        runtime = {
+            "latest_rsi": 35.0,
+            "latest_rsi_time": "2026-07-30T13:00:00+00:00",
+            "rsi_source": dict(self.rsi_result(35.0)[2]),
+        }
+
+        decision = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(20.0, timestamp="2026-07-30T11:59:00+00:00"),
+            "1m",
+        )
+
+        self.assertEqual(decision, ("regressed", None))
+        self.assertEqual(runtime["latest_rsi"], 35.0)
+        self.assertTrue(runtime["rsi_migration_pending"])
+        self.assertEqual(runtime["rsi_status"], "stale")
+
+    def test_trusted_rsi_requires_current_calculation_metadata(self):
+        with self.assertRaisesRegex(ValueError, "calculation metadata"):
+            self.main.apply_trusted_rsi_result({}, (60.0, "2026-07-30T12:00:00+00:00"), "1m")
+
+    def test_trusted_rsi_repairs_a_partial_cache_with_no_stored_value(self):
+        newer_stamp = "2026-07-30T13:00:00+00:00"
+        runtime = {
+            "latest_rsi": None,
+            "latest_rsi_time": newer_stamp,
+            "rsi_source": dict(self.rsi_result(35.0, timestamp=newer_stamp)[2]),
+            "rsi_value_calculation_version": self.main.RSI_CALCULATION_VERSION,
+        }
+
+        decision = self.main.apply_trusted_rsi_result(
+            runtime,
+            self.rsi_result(60.0),
+            "1m",
+        )
+
+        self.assertEqual(decision, ("accepted", 60.0))
+        self.assertEqual(runtime["latest_rsi_time"], "2026-07-30T12:00:00+00:00")
+
+    def test_legacy_runtime_load_forces_refresh_and_marks_cached_value_stale(self):
+        mint = "TokenLegacyRsi"
+        token_state = {
+            "latest_rsi": 35.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_status": "ok",
+            "rsi_error": None,
+            "rsi_last_attempt_at": "2026-07-30T12:05:00+00:00",
+            "rsi_source": dict(self.rsi_result(35.0)[2]),
+        }
+        runtimes_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES.pop(mint, None)
+            with mock.patch.object(
+                self.main,
+                "token_state_from_shared",
+                return_value=({"token_states": {mint: token_state}}, token_state),
+            ):
+                runtime = self.main.get_token_runtime(mint, {"mint": mint})
+
+            self.assertIsNone(runtime["last_rsi_at"])
+            self.assertEqual(runtime["rsi_status"], "stale")
+            self.assertIn("earlier app version", runtime["rsi_error"])
+            self.assertTrue(runtime["rsi_migration_pending"])
+            self.assertEqual(runtime["latest_rsi"], 35.0)
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtimes_before)
+
+    def test_current_rsi_runtime_load_keeps_its_normal_schedule(self):
+        mint = "TokenCurrentRsi"
+        token_state = {
+            "latest_rsi": 60.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_status": "ok",
+            "rsi_last_attempt_at": "2026-07-30T12:05:00+00:00",
+            "rsi_source": dict(self.rsi_result(60.0)[2]),
+            "rsi_value_calculation_version": self.main.RSI_CALCULATION_VERSION,
+            "rsi_backfill_failures": 2,
+            "rsi_backfill_next_attempt_at": "2026-07-31T18:00:00+00:00",
+        }
+        runtimes_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES.pop(mint, None)
+            with mock.patch.object(
+                self.main,
+                "token_state_from_shared",
+                return_value=({"token_states": {mint: token_state}}, token_state),
+            ):
+                runtime = self.main.get_token_runtime(mint, {"mint": mint})
+
+            self.assertIsNotNone(runtime["last_rsi_at"])
+            self.assertEqual(runtime["rsi_status"], "ok")
+            self.assertFalse(runtime["rsi_migration_pending"])
+            self.assertEqual(runtime["rsi_backfill_failures"], 2)
+            self.assertEqual(runtime["rsi_backfill_next_attempt_at"], "2026-07-31T18:00:00+00:00")
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtimes_before)
 
     def test_active_runtime_restores_persisted_error_without_an_rsi_value(self):
         runtime = {
@@ -287,6 +413,60 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.assertEqual(self.main.LATEST_RSI_ERROR, "403 Forbidden")
             self.assertEqual(self.main.LATEST_RSI_LAST_ATTEMPT_AT, "2026-07-30T12:00:00+00:00")
 
+    def test_active_rsi_backfill_cooldown_keeps_normal_check_but_blocks_extra_history(self):
+        trusted_time = "2026-07-20T12:00:00+00:00"
+        candidate = dict(self.rsi_result(20.0, "2026-07-24T12:00:00+00:00", close=50.0, volume=2.0)[2])
+        due = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        runtime = {
+            "last_rsi_at": None,
+            "latest_rsi": 49.0,
+            "latest_rsi_time": trusted_time,
+            "rsi_status": "waiting",
+            "rsi_error": "history pending",
+            "rsi_source": dict(self.rsi_result(49.0, trusted_time, close=114.0, volume=1.0)[2]),
+            "rsi_pending_source": candidate,
+            "rsi_backfill_failures": 1,
+            "rsi_backfill_next_attempt_at": due,
+            "rsi_value_calculation_version": self.main.RSI_CALCULATION_VERSION,
+            "rsi_migration_pending": False,
+            "rsi_refresh_nonce": "same-refresh",
+        }
+        deferred = self.main.RsiBackfillPendingError(
+            "New traded RSI candle detected; waiting for the next protected history retry",
+            candidate,
+        )
+        fetch = mock.Mock(side_effect=deferred)
+
+        with mock.patch.multiple(
+            self.main,
+            load_dynamic_config=mock.Mock(),
+            get_token_runtime=mock.Mock(return_value=runtime),
+            resolve_token_decimals=mock.Mock(return_value=6),
+            get_out_amount_raw=mock.Mock(return_value=100_000_000),
+            assess_price_sample=mock.Mock(return_value={"status": "accepted", "reason": "normal"}),
+            get_latest_rsi=fetch,
+            write_status_json=mock.Mock(return_value="2026-07-31T12:00:00+00:00"),
+            OUTPUT_MINT=SOL_MINT,
+            ACTIVE_TOKEN_CONFIG={"mint": SOL_MINT, "rsi_enabled": True, "rsi_refresh_nonce": "same-refresh"},
+            BUY_ALERTS=[],
+            SELL_ALERTS=[],
+            RSI_STATE={},
+            RSI_ENABLED=True,
+            RSI_INTERVAL="1m",
+            RSI_CHECK_INTERVAL=5,
+            SOLANATRACKER_API_KEY="key",
+            SOLANATRACKER_FEATURES_ENABLED=True,
+            USD_AMOUNT=100.0,
+        ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)):
+            self.main.check_prices()
+
+            fetch.assert_called_once()
+            self.assertFalse(fetch.call_args.kwargs["allow_backfill"])
+            self.assertEqual(runtime["rsi_backfill_failures"], 1)
+            self.assertEqual(runtime["rsi_backfill_next_attempt_at"], due)
+            self.assertEqual(runtime["rsi_status"], "waiting")
+            self.assertEqual(self.main.LATEST_RSI_STATUS, "waiting")
+
     def test_rsi_refresh_change_cannot_restore_stale_active_globals(self):
         runtime = {
             "last_rsi_at": datetime.now(timezone.utc),
@@ -298,6 +478,9 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             "rsi_last_attempt_at": "2026-07-30T12:00:01+00:00",
             "rsi_last_success_at": "2026-07-30T12:00:01+00:00",
             "rsi_source": {"timestamp": "2026-07-30T12:00:00+00:00"},
+            "rsi_pending_source": dict(self.rsi_result(65.0)[2]),
+            "rsi_backfill_failures": 3,
+            "rsi_backfill_next_attempt_at": "2026-07-31T18:00:00+00:00",
             "rsi_refresh_nonce": "old-refresh",
         }
         with mock.patch.multiple(
@@ -319,6 +502,9 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             LATEST_RSI_ERROR=None,
             LATEST_RSI_LAST_FETCH_AT="2026-07-30T12:00:01+00:00",
             LATEST_RSI_SOURCE={"timestamp": "2026-07-30T12:00:00+00:00"},
+            LATEST_RSI_PENDING_SOURCE=dict(self.rsi_result(65.0)[2]),
+            LATEST_RSI_BACKFILL_FAILURES=3,
+            LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT="2026-07-31T18:00:00+00:00",
             LATEST_RSI_LAST_ATTEMPT_AT="2026-07-30T12:00:01+00:00",
             LATEST_RSI_LAST_SUCCESS_AT="2026-07-30T12:00:01+00:00",
         ), mock.patch.object(self.main.requests, "post", return_value=mock.Mock(ok=True)):
@@ -327,9 +513,15 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.assertEqual(runtime["rsi_refresh_nonce"], "new-refresh")
             self.assertIsNone(runtime["latest_rsi"])
             self.assertEqual(runtime["rsi_source"], {})
+            self.assertEqual(runtime["rsi_pending_source"], {})
+            self.assertEqual(runtime["rsi_backfill_failures"], 0)
+            self.assertIsNone(runtime["rsi_backfill_next_attempt_at"])
             self.assertEqual(runtime["rsi_status"], "waiting")
             self.assertIsNone(self.main.LATEST_RSI)
             self.assertEqual(self.main.LATEST_RSI_SOURCE, {})
+            self.assertEqual(self.main.LATEST_RSI_PENDING_SOURCE, {})
+            self.assertEqual(self.main.LATEST_RSI_BACKFILL_FAILURES, 0)
+            self.assertIsNone(self.main.LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT)
             self.assertEqual(self.main.LATEST_RSI_STATUS, "waiting")
 
     def test_scheduler_picks_one_due_token_round_robin(self):
@@ -518,11 +710,11 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             "sell_alerts": [0.05],
             "rsi_enabled": True,
         }
-        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_enabled": True}
+        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_interval": "1m", "rsi_enabled": True}
         send = mock.Mock(return_value=True)
         full_writer = mock.Mock(return_value=True)
         marker_writer = mock.Mock(return_value=True)
-        rsi = mock.Mock(return_value=(50.0, "2026-07-29T12:00:00+00:00"))
+        rsi = mock.Mock(return_value=self.rsi_result(50.0, "2026-07-29T12:00:00+00:00"))
         quote_outputs = iter([1_000_000_000, 100_000_000, 1_050_000_000, 105_000_000])
 
         def staged_quote(input_mint, output_mint, amount, cache_result=True, quote_capture=None):
@@ -603,6 +795,10 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
                 "verifying",
                 "Verifying an unusual Jupiter price move",
                 due_at=100.0,
+                runtime={
+                    "rsi_backfill_failures": 2,
+                    "rsi_backfill_next_attempt_at": "2026-07-31T18:00:00+00:00",
+                },
             )
 
         state = captured["data"]["token_states"][mint]
@@ -612,6 +808,8 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
         self.assertEqual(state["last_checked_at"], "2026-07-29T11:00:00+00:00")
         self.assertEqual(captured["data"]["token_price_history"], existing["token_price_history"])
         self.assertEqual(state["price_status"], "verifying")
+        self.assertEqual(state["rsi_backfill_failures"], 2)
+        self.assertEqual(state["rsi_backfill_next_attempt_at"], "2026-07-31T18:00:00+00:00")
         self.assertIsNone(state["error"])
     def test_active_switch_invalidates_alert_runtime_without_moving_schedule(self):
         previous_mint = "TokenPrevious"
@@ -912,6 +1110,235 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.main.TOKEN_RUNTIMES.clear()
             self.main.TOKEN_RUNTIMES.update(runtime_before)
 
+    def test_rsi_backfill_pending_suppresses_old_value_and_alert_until_verified(self):
+        trusted_time = "2026-07-20T12:00:00+00:00"
+        new_time = "2026-07-24T12:00:00+00:00"
+        token = {
+            "mint": "TokenLongGapRsi",
+            "name": "Long-gap RSI",
+            "buy_alerts": [],
+            "sell_alerts": [],
+            "rsi_alerts": ["below:30"],
+            "rsi_enabled": True,
+            "runtime_nonce": "long-gap-generation",
+        }
+        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_interval": "1m", "rsi_enabled": True}
+        trusted_source = dict(self.rsi_result(49.0, trusted_time, close=114.0, volume=1.0)[2])
+        candidate_source = dict(self.rsi_result(20.0, new_time, close=50.0, volume=2.0)[2])
+        runtime = {
+            "last_buy_alert": {},
+            "last_sell_alert": {},
+            "last_triggered_rsi": {},
+            "rsi_state": {},
+            "last_rsi_at": None,
+            "latest_rsi": 49.0,
+            "latest_rsi_time": trusted_time,
+            "rsi_status": "ok",
+            "rsi_error": None,
+            "rsi_last_fetch_at": trusted_time,
+            "rsi_last_attempt_at": trusted_time,
+            "rsi_last_success_at": trusted_time,
+            "rsi_source": trusted_source,
+            "rsi_pending_source": {},
+            "rsi_backfill_failures": 0,
+            "rsi_backfill_next_attempt_at": None,
+            "rsi_value_calculation_version": self.main.RSI_CALCULATION_VERSION,
+            "rsi_migration_pending": False,
+            "rsi_refresh_nonce": "",
+            "runtime_nonce": "long-gap-generation",
+        }
+        pending = self.main.RsiBackfillPendingError(
+            "New traded RSI candle detected; historical candles are temporarily unavailable",
+            candidate_source,
+            backfill_attempted=True,
+        )
+        deferred = self.main.RsiBackfillPendingError(
+            "New traded RSI candle detected; waiting for the next protected history retry",
+            candidate_source,
+        )
+        fetch = mock.Mock(side_effect=[
+            pending,
+            deferred,
+            self.rsi_result(20.0, new_time, close=50.0, volume=2.0),
+        ])
+        sent = mock.Mock(return_value=True)
+        runtimes_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES[token["mint"]] = runtime
+            with mock.patch.multiple(
+                self.main,
+                SOLANATRACKER_API_KEY="key",
+                SOLANATRACKER_FEATURES_ENABLED=True,
+                RSI_ENABLED=True,
+                resolve_token_decimals=mock.Mock(return_value=6),
+                get_out_amount_raw=mock.Mock(return_value=100_000_000),
+                assess_price_sample=mock.Mock(return_value={"status": "accepted", "reason": "normal"}),
+                get_latest_rsi=fetch,
+                send_alert=sent,
+                write_scheduled_token_status=mock.Mock(),
+            ):
+                self.main.check_scheduled_token(token, cfg)
+
+                sent.assert_not_called()
+                self.assertTrue(fetch.call_args_list[0].kwargs["allow_backfill"])
+                self.assertEqual(runtime["latest_rsi"], 49.0)
+                self.assertEqual(runtime["rsi_status"], "waiting")
+                self.assertEqual(runtime["rsi_pending_source"]["timestamp"], new_time)
+                self.assertEqual(runtime["rsi_backfill_failures"], 1)
+                first_due = runtime["rsi_backfill_next_attempt_at"]
+                self.assertGreater(
+                    self.main.parse_iso_to_utc(first_due),
+                    datetime.now(timezone.utc),
+                )
+                self.assertNotIn("below:30.00", runtime["last_triggered_rsi"])
+                runtime["last_rsi_at"] = None
+
+                self.main.check_scheduled_token(token, cfg)
+
+                sent.assert_not_called()
+                self.assertFalse(fetch.call_args_list[1].kwargs["allow_backfill"])
+                self.assertEqual(runtime["rsi_backfill_failures"], 1)
+                self.assertEqual(runtime["rsi_backfill_next_attempt_at"], first_due)
+                runtime["rsi_backfill_next_attempt_at"] = (
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ).isoformat()
+                runtime["last_rsi_at"] = None
+
+                self.main.check_scheduled_token(token, cfg)
+
+            self.assertTrue(fetch.call_args_list[2].kwargs["allow_backfill"])
+            sent.assert_called_once()
+            self.assertEqual(sent.call_args.args[0], "RSI Alert")
+            self.assertEqual(runtime["latest_rsi"], 20.0)
+            self.assertEqual(runtime["rsi_pending_source"], {})
+            self.assertEqual(runtime["rsi_backfill_failures"], 0)
+            self.assertIsNone(runtime["rsi_backfill_next_attempt_at"])
+            self.assertEqual(runtime["rsi_status"], "ok")
+            self.assertIn("below:30.00", runtime["last_triggered_rsi"])
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtimes_before)
+
+    def test_rsi_backfill_retry_delays_escalate_and_reset(self):
+        candidate = dict(self.rsi_result(20.0, "2026-07-24T12:00:00+00:00")[2])
+        runtime = {}
+        base = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+        observed_times = [base, base + timedelta(hours=2), base + timedelta(hours=9), base + timedelta(hours=34)]
+        expected_delays = [timedelta(hours=1), timedelta(hours=6), timedelta(hours=24), timedelta(hours=24)]
+
+        for index, (observed, expected_delay) in enumerate(zip(observed_times, expected_delays), start=1):
+            error = self.main.RsiBackfillPendingError("history unavailable", candidate, backfill_attempted=True)
+            self.main.mark_rsi_backfill_pending(runtime, error, observed_at=observed.isoformat())
+            self.assertEqual(runtime["rsi_backfill_failures"], index)
+            self.assertEqual(
+                self.main.parse_iso_to_utc(runtime["rsi_backfill_next_attempt_at"]),
+                observed + expected_delay,
+            )
+
+        saved_due = runtime["rsi_backfill_next_attempt_at"]
+        deferred = self.main.RsiBackfillPendingError("protected retry pending", candidate)
+        self.main.mark_rsi_backfill_pending(
+            runtime,
+            deferred,
+            observed_at=(base + timedelta(hours=35)).isoformat(),
+        )
+        self.assertEqual(runtime["rsi_backfill_failures"], 4)
+        self.assertEqual(runtime["rsi_backfill_next_attempt_at"], saved_due)
+        due = self.main.parse_iso_to_utc(saved_due)
+        self.assertFalse(self.main.rsi_backfill_retry_allowed(runtime, due - timedelta(seconds=1)))
+        self.assertTrue(self.main.rsi_backfill_retry_allowed(runtime, due))
+
+        self.main.clear_runtime_rsi(runtime, "waiting")
+        self.assertEqual(runtime["rsi_backfill_failures"], 0)
+        self.assertIsNone(runtime["rsi_backfill_next_attempt_at"])
+
+        orphaned = {
+            "rsi_pending_source": {},
+            "rsi_backfill_failures": 3,
+            "rsi_backfill_next_attempt_at": (base + timedelta(days=1)).isoformat(),
+        }
+        self.assertTrue(self.main.rsi_backfill_retry_allowed(orphaned, base))
+        self.assertEqual(orphaned["rsi_backfill_failures"], 0)
+        self.assertIsNone(orphaned["rsi_backfill_next_attempt_at"])
+
+        malformed_due = {
+            "rsi_pending_source": candidate,
+            "rsi_backfill_failures": 2,
+            "rsi_backfill_next_attempt_at": "not-a-date",
+        }
+        self.assertTrue(self.main.rsi_backfill_retry_allowed(malformed_due, base))
+        self.assertEqual(malformed_due["rsi_backfill_failures"], 0)
+        self.assertIsNone(malformed_due["rsi_backfill_next_attempt_at"])
+
+    def test_legacy_rsi_never_fires_alert_and_retries_on_the_next_due_cycle(self):
+        token = {
+            "mint": "TokenLegacyRetry",
+            "name": "Legacy RSI retry",
+            "buy_alerts": [],
+            "sell_alerts": [],
+            "rsi_alerts": ["above:50"],
+            "rsi_enabled": True,
+            "runtime_nonce": "legacy-rsi-generation",
+        }
+        cfg = {"check_interval": 60, "rsi_check_interval": 5, "rsi_interval": "1m", "rsi_enabled": True}
+        runtime = {
+            "last_buy_alert": {},
+            "last_sell_alert": {},
+            "last_triggered_rsi": {},
+            "rsi_state": {},
+            "last_rsi_at": None,
+            "latest_rsi": 80.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_status": "stale",
+            "rsi_error": "RSI was calculated by an earlier app version; waiting for a verified refresh",
+            "rsi_last_fetch_at": "2026-07-30T12:00:01+00:00",
+            "rsi_last_attempt_at": "2026-07-30T12:00:01+00:00",
+            "rsi_last_success_at": "2026-07-30T12:00:01+00:00",
+            "rsi_source": dict(self.rsi_result(80.0)[2]),
+            "rsi_value_calculation_version": "",
+            "rsi_migration_pending": True,
+            "rsi_refresh_nonce": "",
+            "runtime_nonce": "legacy-rsi-generation",
+        }
+        sent = mock.Mock(return_value=True)
+        fetch = mock.Mock(side_effect=[
+            RuntimeError("403 Forbidden"),
+            self.rsi_result(60.0),
+        ])
+        runtimes_before = copy.deepcopy(self.main.TOKEN_RUNTIMES)
+        try:
+            self.main.TOKEN_RUNTIMES[token["mint"]] = runtime
+            with mock.patch.multiple(
+                self.main,
+                SOLANATRACKER_API_KEY="key",
+                SOLANATRACKER_FEATURES_ENABLED=True,
+                RSI_ENABLED=True,
+                resolve_token_decimals=mock.Mock(return_value=6),
+                get_out_amount_raw=mock.Mock(return_value=100_000_000),
+                assess_price_sample=mock.Mock(return_value={"status": "accepted", "reason": "normal"}),
+                get_latest_rsi=fetch,
+                send_alert=sent,
+                write_scheduled_token_status=mock.Mock(),
+            ):
+                self.main.check_scheduled_token(token, cfg)
+
+                sent.assert_not_called()
+                self.assertEqual(runtime["latest_rsi"], 80.0)
+                self.assertTrue(runtime["rsi_migration_pending"])
+                self.assertEqual(runtime["rsi_status"], "error")
+                runtime["last_rsi_at"] = None
+
+                self.main.check_scheduled_token(token, cfg)
+
+            sent.assert_called_once()
+            self.assertEqual(runtime["latest_rsi"], 60.0)
+            self.assertEqual(runtime["rsi_value_calculation_version"], self.main.RSI_CALCULATION_VERSION)
+            self.assertFalse(runtime["rsi_migration_pending"])
+            self.assertIn("above:50.00", runtime["last_triggered_rsi"])
+        finally:
+            self.main.TOKEN_RUNTIMES.clear()
+            self.main.TOKEN_RUNTIMES.update(runtimes_before)
+
     def test_failed_price_notification_retries_before_recording_trigger(self):
         token = {
             "mint": "TokenDeliveryRetry",
@@ -1104,7 +1531,7 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             load_dynamic_config=mock.Mock(),
             resolve_token_decimals=mock.Mock(return_value=6),
             get_out_amount_raw=mock.Mock(return_value=100_000_000),
-            get_latest_rsi=mock.Mock(return_value=(80.0, trigger_time)),
+            get_latest_rsi=mock.Mock(return_value=self.rsi_result(80.0, trigger_time)),
             send_alert=mock.Mock(return_value=True),
             notify_backend_rsi_trigger=callback,
             read_json_file=mock.Mock(side_effect=lambda _path: copy.deepcopy(existing)),
@@ -1314,6 +1741,122 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             backend.state["check_interval"] = originals["check_interval"]
             backend.read_json_file = originals["read_json_file"]
 
+    def test_backend_exposes_legacy_rsi_as_stale_until_verified(self):
+        backend = import_backend_module()
+        original_env = os.environ.get("SOLANATRACKER_API_KEY")
+        originals = {
+            "tokens": copy.deepcopy(backend.state.get("tokens", [])),
+            "active_token_mint": backend.state.get("active_token_mint"),
+            "solanatracker_features_enabled": backend.state.get("solanatracker_features_enabled"),
+            "rsi_enabled": backend.state.get("rsi_enabled"),
+            "read_json_file": backend.read_json_file,
+        }
+        token_state = {
+            "latest_rsi": 35.0,
+            "latest_rsi_time": "2026-07-30T12:00:00+00:00",
+            "rsi_status": "ok",
+            "rsi_error": None,
+        }
+        cached = {**token_state, "token_states": {SOL_MINT: token_state}}
+        try:
+            os.environ["SOLANATRACKER_API_KEY"] = "key"
+            backend.state["tokens"] = [{"mint": SOL_MINT, "name": "SOL", "enabled": True, "rsi_enabled": True}]
+            backend.state["active_token_mint"] = SOL_MINT
+            backend.state["solanatracker_features_enabled"] = True
+            backend.state["rsi_enabled"] = True
+            backend.read_json_file = lambda _path: copy.deepcopy(cached)
+
+            summary = backend.get_token_state_summary()[0]
+            status = asyncio.run(backend.get_rsi_status())
+
+            self.assertEqual(summary["rsi"], 35.0)
+            self.assertEqual(summary["rsi_status"], "stale")
+            self.assertTrue(summary["rsi_migration_pending"])
+            self.assertIn("earlier app version", summary["error"])
+            self.assertEqual(status["latest_rsi"], 35.0)
+            self.assertEqual(status["status"], "stale")
+            self.assertTrue(status["migration_pending"])
+            self.assertEqual(status["value_calculation_version"], "")
+        finally:
+            if original_env is None:
+                os.environ.pop("SOLANATRACKER_API_KEY", None)
+            else:
+                os.environ["SOLANATRACKER_API_KEY"] = original_env
+            backend.state["tokens"] = originals["tokens"]
+            backend.state["active_token_mint"] = originals["active_token_mint"]
+            backend.state["solanatracker_features_enabled"] = originals["solanatracker_features_enabled"]
+            backend.state["rsi_enabled"] = originals["rsi_enabled"]
+            backend.read_json_file = originals["read_json_file"]
+
+    def test_backend_hides_old_rsi_while_new_trade_history_is_pending(self):
+        backend = import_backend_module()
+        original_env = os.environ.get("SOLANATRACKER_API_KEY")
+        originals = {
+            "tokens": copy.deepcopy(backend.state.get("tokens", [])),
+            "active_token_mint": backend.state.get("active_token_mint"),
+            "solanatracker_features_enabled": backend.state.get("solanatracker_features_enabled"),
+            "rsi_enabled": backend.state.get("rsi_enabled"),
+            "read_json_file": backend.read_json_file,
+        }
+        pending_source = {
+            "timestamp": "2026-07-24T12:00:00+00:00",
+            "close": 50.0,
+            "volume": 2.0,
+            "interval": "1m",
+            "active_bars": 1,
+            "calculation_version": backend.RSI_CALCULATION_VERSION,
+        }
+        token_state = {
+            "latest_rsi": 49.0,
+            "latest_rsi_time": "2026-07-20T12:00:00+00:00",
+            "rsi_status": "waiting",
+            "rsi_error": "New traded RSI candle detected; verifying historical candles",
+            "rsi_pending_source": pending_source,
+            "rsi_backfill_failures": 2,
+            "rsi_backfill_next_attempt_at": "2026-07-31T18:00:00+00:00",
+            "rsi_value_calculation_version": backend.RSI_CALCULATION_VERSION,
+        }
+        cached = {**token_state, "token_states": {SOL_MINT: token_state}}
+        try:
+            os.environ["SOLANATRACKER_API_KEY"] = "key"
+            backend.state["tokens"] = [{"mint": SOL_MINT, "name": "SOL", "enabled": True, "rsi_enabled": True}]
+            backend.state["active_token_mint"] = SOL_MINT
+            backend.state["solanatracker_features_enabled"] = True
+            backend.state["rsi_enabled"] = True
+            backend.read_json_file = lambda _path: copy.deepcopy(cached)
+
+            summary = backend.get_token_state_summary()[0]
+            state_payload = asyncio.run(backend.get_state())
+            status = asyncio.run(backend.get_rsi_status())
+
+            self.assertIsNone(summary["rsi"])
+            self.assertEqual(summary["rsi_status"], "waiting")
+            self.assertTrue(summary["rsi_refresh_pending"])
+            self.assertEqual(summary["rsi_backfill_failures"], 2)
+            self.assertEqual(summary["rsi_backfill_next_attempt_at"], "2026-07-31T18:00:00+00:00")
+            self.assertIsNone(summary["error"])
+            self.assertIsNone(state_payload["latest_rsi"])
+            self.assertEqual(state_payload["rsi_status"], "waiting")
+            self.assertTrue(state_payload["rsi_refresh_pending"])
+            self.assertEqual(state_payload["rsi_backfill_failures"], 2)
+            self.assertEqual(state_payload["rsi_backfill_next_attempt_at"], "2026-07-31T18:00:00+00:00")
+            self.assertIsNone(status["latest_rsi"])
+            self.assertEqual(status["status"], "waiting")
+            self.assertTrue(status["refresh_pending"])
+            self.assertEqual(status["backfill_failures"], 2)
+            self.assertEqual(status["backfill_next_attempt_at"], "2026-07-31T18:00:00+00:00")
+            self.assertEqual(status["pending_source"]["timestamp"], pending_source["timestamp"])
+            self.assertIn("verifying", status["message"])
+        finally:
+            if original_env is None:
+                os.environ.pop("SOLANATRACKER_API_KEY", None)
+            else:
+                os.environ["SOLANATRACKER_API_KEY"] = original_env
+            backend.state["tokens"] = originals["tokens"]
+            backend.state["active_token_mint"] = originals["active_token_mint"]
+            backend.state["solanatracker_features_enabled"] = originals["solanatracker_features_enabled"]
+            backend.state["rsi_enabled"] = originals["rsi_enabled"]
+            backend.read_json_file = originals["read_json_file"]
     def test_backend_token_summary_suppresses_rsi_when_solanatracker_disabled(self):
         backend = import_backend_module()
         originals = {
@@ -1622,6 +2165,8 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
                         "timestamp": "2026-06-24T12:00:00+00:00", "close": 1.2,
                         "volume": 5.0, "interval": "1m",
                     },
+                    "rsi_backfill_failures": 3,
+                    "rsi_backfill_next_attempt_at": "2026-07-31T18:00:00+00:00",
                     "last_triggered_sell": {},
                     "last_triggered_rsi": {trigger_key: "2026-06-24T12:00:00+00:00"},
                 }
@@ -1667,6 +2212,8 @@ class SchedulerAndRateLimitTests(unittest.TestCase):
             self.assertEqual(captured["rsi_last_success_at"], "2026-06-24T12:00:01+00:00")
             self.assertEqual(captured["rsi_source"]["timestamp"], "2026-06-24T12:00:00+00:00")
             self.assertEqual(captured["rsi_source"]["interval"], "1m")
+            self.assertEqual(captured["rsi_backfill_failures"], 3)
+            self.assertEqual(captured["rsi_backfill_next_attempt_at"], "2026-07-31T18:00:00+00:00")
             self.assertEqual(captured["last_triggered_buy"], {buy_key: "2026-06-24T12:00:00+00:00"})
             self.assertEqual(captured["last_triggered_rsi"], {trigger_key: "2026-06-24T12:00:00+00:00"})
         finally:

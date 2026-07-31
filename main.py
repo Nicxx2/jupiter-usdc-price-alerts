@@ -19,7 +19,7 @@ from community_rules import (
     rules_require_price_impact,
 )
 from rule_history import record_rule_history
-from rsi_utils import get_latest_rsi
+from rsi_utils import RSI_CALCULATION_VERSION, RsiBackfillPendingError, get_latest_rsi
 from solana_rate_limiter import configure_rate_limit
 from typing import Dict, Any, Optional
 
@@ -385,21 +385,36 @@ def get_token_runtime(mint, token_config=None):
     buy_triggers = token_state.get("last_triggered_buy") or (state_data.get("last_triggered_buy", {}) if mint == OUTPUT_MINT else {})
     sell_triggers = token_state.get("last_triggered_sell") or (state_data.get("last_triggered_sell", {}) if mint == OUTPUT_MINT else {})
     rsi_triggers = token_state.get("last_triggered_rsi") or (state_data.get("last_triggered_rsi", {}) if mint == OUTPUT_MINT else {})
+    latest_rsi = token_state.get("latest_rsi")
+    rsi_value_calculation_version = str(token_state.get("rsi_value_calculation_version") or "")
+    rsi_migration_pending = latest_rsi is not None and rsi_value_calculation_version != RSI_CALCULATION_VERSION
+    rsi_status = token_state.get("rsi_status") or ("waiting" if solanatracker_effective_enabled() else "disabled")
+    rsi_error = token_state.get("rsi_error")
+    rsi_backfill_next_attempt = parse_iso_to_utc(token_state.get("rsi_backfill_next_attempt_at"))
+    if rsi_migration_pending and rsi_status not in {"disabled", "error"}:
+        rsi_status = "stale"
+        rsi_error = "RSI was calculated by an earlier app version; waiting for a verified refresh"
+
 
     runtime = {
         "last_buy_alert": load_trigger_times(buy_triggers),
         "last_sell_alert": load_trigger_times(sell_triggers),
         "last_triggered_rsi": dict(rsi_triggers or {}),
         "rsi_state": {},
-        "last_rsi_at": parse_iso_to_utc(token_state.get("rsi_last_attempt_at") or token_state.get("rsi_last_fetch_at") or token_state.get("latest_rsi_time")),
-        "latest_rsi": token_state.get("latest_rsi"),
+        "last_rsi_at": None if rsi_migration_pending else parse_iso_to_utc(token_state.get("rsi_last_attempt_at") or token_state.get("rsi_last_fetch_at") or token_state.get("latest_rsi_time")),
+        "latest_rsi": latest_rsi,
         "latest_rsi_time": token_state.get("latest_rsi_time"),
-        "rsi_status": token_state.get("rsi_status") or ("waiting" if solanatracker_effective_enabled() else "disabled"),
-        "rsi_error": token_state.get("rsi_error"),
+        "rsi_status": rsi_status,
+        "rsi_error": rsi_error,
         "rsi_last_fetch_at": token_state.get("rsi_last_fetch_at"),
         "rsi_last_attempt_at": token_state.get("rsi_last_attempt_at") or token_state.get("rsi_last_fetch_at"),
         "rsi_last_success_at": token_state.get("rsi_last_success_at") or token_state.get("rsi_last_fetch_at"),
         "rsi_source": dict(token_state.get("rsi_source") or {}) if isinstance(token_state.get("rsi_source"), dict) else {},
+        "rsi_pending_source": dict(token_state.get("rsi_pending_source") or {}) if isinstance(token_state.get("rsi_pending_source"), dict) else {},
+        "rsi_backfill_failures": coerce_int(token_state.get("rsi_backfill_failures"), 0, minimum=0),
+        "rsi_backfill_next_attempt_at": rsi_backfill_next_attempt.isoformat() if rsi_backfill_next_attempt else None,
+        "rsi_value_calculation_version": rsi_value_calculation_version,
+        "rsi_migration_pending": rsi_migration_pending,
         "rsi_refresh_nonce": token_state.get("rsi_refresh_nonce", ""),
         "runtime_nonce": runtime_nonce,
     }
@@ -417,6 +432,28 @@ def parse_iso_to_utc(value):
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+RSI_BACKFILL_RETRY_DELAYS_SECONDS = (60 * 60, 6 * 60 * 60, 24 * 60 * 60)
+
+
+def clear_rsi_backfill_retry(runtime):
+    runtime["rsi_backfill_failures"] = 0
+    runtime["rsi_backfill_next_attempt_at"] = None
+
+
+def rsi_backfill_retry_allowed(runtime, now=None):
+    pending = runtime.get("rsi_pending_source") if isinstance(runtime.get("rsi_pending_source"), dict) else {}
+    pending_interval = str(pending.get("interval") or "")
+    failures = coerce_int(runtime.get("rsi_backfill_failures"), 0, minimum=0)
+    due = parse_iso_to_utc(runtime.get("rsi_backfill_next_attempt_at"))
+    if not pending or trusted_rsi_source_time(pending, pending_interval) is None or failures == 0 or due is None:
+        clear_rsi_backfill_retry(runtime)
+        return True
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return due <= now.astimezone(timezone.utc)
 
 
 def unpack_rsi_result(result, expected_interval):
@@ -475,7 +512,32 @@ def rsi_sources_match(left, right):
         and left_close == right_close
         and left_volume == right_volume
         and str(left.get("interval") or "") == str(right.get("interval") or "")
+        and str(left.get("calculation_version") or "") == str(right.get("calculation_version") or "")
     )
+
+
+def rsi_value_needs_migration(runtime):
+    return (
+        runtime.get("latest_rsi") is not None
+        and str(runtime.get("rsi_value_calculation_version") or "") != RSI_CALCULATION_VERSION
+    )
+
+
+def trusted_rsi_source_time(source, expected_interval):
+    if not isinstance(source, dict):
+        return None
+    if str(source.get("calculation_version") or "") != RSI_CALCULATION_VERSION:
+        return None
+    if str(source.get("interval") or "") != str(expected_interval or ""):
+        return None
+    try:
+        close = float(source.get("close"))
+        volume = float(source.get("volume"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(close) or close <= 0 or not math.isfinite(volume) or volume <= 0:
+        return None
+    return parse_iso_to_utc(source.get("timestamp"))
 
 
 def apply_trusted_rsi_result(runtime, result, interval, observed_at=None):
@@ -488,34 +550,68 @@ def apply_trusted_rsi_result(runtime, result, interval, observed_at=None):
     candidate_time = parse_iso_to_utc(rsi_time)
     previous_time = parse_iso_to_utc(runtime.get("latest_rsi_time"))
     previous_source = runtime.get("rsi_source") if isinstance(runtime.get("rsi_source"), dict) else {}
+    pending_source = runtime.get("rsi_pending_source") if isinstance(runtime.get("rsi_pending_source"), dict) else {}
+    calculation_version = str(source.get("calculation_version") or "") if source else ""
+    if calculation_version != RSI_CALCULATION_VERSION:
+        raise ValueError("RSI result is missing current calculation metadata")
 
-    if previous_time is not None and candidate_time < previous_time:
+    pending_time = trusted_rsi_source_time(pending_source, interval)
+    if pending_time is not None and candidate_time < pending_time:
+        runtime["rsi_status"] = "waiting"
+        runtime["rsi_error"] = "A newer traded RSI candle is waiting for enough verified history"
+        return "pending", None
+
+    if rsi_value_needs_migration(runtime):
+        previous_source_time = trusted_rsi_source_time(previous_source, interval)
+        if previous_source_time is not None and candidate_time < previous_source_time:
+            runtime["rsi_status"] = "stale"
+            runtime["rsi_error"] = "SolanaTracker returned an older RSI candle; waiting for a verified refresh"
+            runtime["rsi_migration_pending"] = True
+            return "regressed", None
+    elif runtime.get("latest_rsi") is not None and previous_time is not None and candidate_time < previous_time:
         runtime["rsi_status"] = "stale"
         runtime["rsi_error"] = "SolanaTracker returned an older RSI candle; keeping the previous value"
         return "regressed", runtime.get("latest_rsi")
 
-    if source and previous_time is not None and candidate_time == previous_time:
+    elif runtime.get("latest_rsi") is not None and previous_time is not None and candidate_time == previous_time:
         if rsi_sources_match(previous_source, source):
             runtime["rsi_status"] = "ok"
             runtime["rsi_error"] = None
             runtime["rsi_last_success_at"] = observed_at
-            return "unchanged", runtime.get("latest_rsi")
-        if not previous_source and runtime.get("latest_rsi") is not None:
-            # Safe migration from pre-signature state: establish the source
-            # identity without replacing a trusted value on the same candle.
-            runtime["rsi_source"] = source
-            runtime["rsi_status"] = "ok"
-            runtime["rsi_error"] = None
-            runtime["rsi_last_success_at"] = observed_at
+            runtime["rsi_migration_pending"] = False
+            runtime["rsi_pending_source"] = {}
+            clear_rsi_backfill_retry(runtime)
             return "unchanged", runtime.get("latest_rsi")
 
     runtime["latest_rsi"] = round(value, 2)
     runtime["latest_rsi_time"] = rsi_time
     runtime["rsi_source"] = source
+    runtime["rsi_value_calculation_version"] = RSI_CALCULATION_VERSION
+    runtime["rsi_migration_pending"] = False
+    runtime["rsi_pending_source"] = {}
+    clear_rsi_backfill_retry(runtime)
     runtime["rsi_status"] = "ok"
     runtime["rsi_error"] = None
     runtime["rsi_last_success_at"] = observed_at
     return "accepted", runtime["latest_rsi"]
+
+
+def mark_rsi_backfill_pending(runtime, error, observed_at=None):
+    observed_time = parse_iso_to_utc(observed_at) if observed_at else datetime.now(timezone.utc)
+    observed_time = observed_time or datetime.now(timezone.utc)
+    attempted_at = observed_time.isoformat()
+    runtime["rsi_status"] = "waiting"
+    runtime["rsi_error"] = str(error)[:180]
+    runtime["rsi_pending_source"] = dict(error.candidate_source or {})
+    runtime["rsi_last_fetch_at"] = attempted_at
+    runtime["rsi_last_attempt_at"] = attempted_at
+    if error.backfill_attempted:
+        failures = coerce_int(runtime.get("rsi_backfill_failures"), 0, minimum=0) + 1
+        delay_index = min(failures - 1, len(RSI_BACKFILL_RETRY_DELAYS_SECONDS) - 1)
+        runtime["rsi_backfill_failures"] = failures
+        runtime["rsi_backfill_next_attempt_at"] = (
+            observed_time + timedelta(seconds=RSI_BACKFILL_RETRY_DELAYS_SECONDS[delay_index])
+        ).isoformat()
 
 
 def clear_runtime_rsi(runtime, status, error=None):
@@ -523,6 +619,10 @@ def clear_runtime_rsi(runtime, status, error=None):
     runtime["latest_rsi"] = None
     runtime["latest_rsi_time"] = None
     runtime["rsi_source"] = {}
+    runtime["rsi_pending_source"] = {}
+    clear_rsi_backfill_retry(runtime)
+    runtime["rsi_value_calculation_version"] = ""
+    runtime["rsi_migration_pending"] = False
     runtime["rsi_status"] = status
     runtime["rsi_error"] = error
     runtime["rsi_last_fetch_at"] = None
@@ -569,13 +669,17 @@ LATEST_RSI_STATUS = "waiting" if solanatracker_effective_enabled() else "disable
 LATEST_RSI_ERROR = None
 LATEST_RSI_LAST_FETCH_AT = None
 LATEST_RSI_SOURCE = {}
+LATEST_RSI_PENDING_SOURCE = {}
+LATEST_RSI_BACKFILL_FAILURES = 0
+LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT = None
+LATEST_RSI_VALUE_CALCULATION_VERSION = ""
 LATEST_RSI_LAST_ATTEMPT_AT = None
 LATEST_RSI_LAST_SUCCESS_AT = None
 
 def sync_active_rsi_globals(runtime):
     """Mirror the active token's persisted runtime into legacy UI globals."""
     global _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR
-    global LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
+    global LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_PENDING_SOURCE, LATEST_RSI_BACKFILL_FAILURES, LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT, LATEST_RSI_VALUE_CALCULATION_VERSION, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
 
     _last_rsi_at = runtime.get("last_rsi_at")
     LATEST_RSI = runtime.get("latest_rsi")
@@ -584,6 +688,10 @@ def sync_active_rsi_globals(runtime):
     LATEST_RSI_ERROR = runtime.get("rsi_error")
     LATEST_RSI_LAST_FETCH_AT = runtime.get("rsi_last_fetch_at")
     LATEST_RSI_SOURCE = dict(runtime.get("rsi_source") or {})
+    LATEST_RSI_PENDING_SOURCE = dict(runtime.get("rsi_pending_source") or {})
+    LATEST_RSI_BACKFILL_FAILURES = coerce_int(runtime.get("rsi_backfill_failures"), 0, minimum=0)
+    LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT = runtime.get("rsi_backfill_next_attempt_at")
+    LATEST_RSI_VALUE_CALCULATION_VERSION = str(runtime.get("rsi_value_calculation_version") or "")
     LATEST_RSI_LAST_ATTEMPT_AT = runtime.get("rsi_last_attempt_at")
     LATEST_RSI_LAST_SUCCESS_AT = runtime.get("rsi_last_success_at")
 
@@ -600,6 +708,14 @@ def seed_active_rsi_runtime_from_globals(runtime):
         "rsi_error": LATEST_RSI_ERROR,
         "rsi_last_fetch_at": LATEST_RSI_LAST_FETCH_AT,
         "rsi_source": dict(LATEST_RSI_SOURCE or {}),
+        "rsi_pending_source": dict(LATEST_RSI_PENDING_SOURCE or {}),
+        "rsi_backfill_failures": LATEST_RSI_BACKFILL_FAILURES,
+        "rsi_backfill_next_attempt_at": LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT,
+        "rsi_value_calculation_version": LATEST_RSI_VALUE_CALCULATION_VERSION,
+        "rsi_migration_pending": (
+            LATEST_RSI is not None
+            and str(LATEST_RSI_VALUE_CALCULATION_VERSION or "") != RSI_CALCULATION_VERSION
+        ),
         "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
         "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
     })
@@ -794,7 +910,7 @@ def get_active_token_config(cfg):
 
 
 def reset_active_token_runtime(new_mint):
-    global OUTPUT_MINT, _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT, TOKEN_CHANGED_SINCE_LAST_WRITE
+    global OUTPUT_MINT, _last_rsi_at, LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_PENDING_SOURCE, LATEST_RSI_BACKFILL_FAILURES, LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT, LATEST_RSI_VALUE_CALCULATION_VERSION, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT, TOKEN_CHANGED_SINCE_LAST_WRITE
 
     if not new_mint or new_mint == OUTPUT_MINT:
         return False
@@ -814,6 +930,10 @@ def reset_active_token_runtime(new_mint):
     LATEST_RSI_ERROR = None
     LATEST_RSI_LAST_FETCH_AT = None
     LATEST_RSI_SOURCE = {}
+    LATEST_RSI_PENDING_SOURCE = {}
+    LATEST_RSI_BACKFILL_FAILURES = 0
+    LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT = None
+    LATEST_RSI_VALUE_CALCULATION_VERSION = ""
     LATEST_RSI_LAST_ATTEMPT_AT = None
     LATEST_RSI_LAST_SUCCESS_AT = None
     TOKEN_CHANGED_SINCE_LAST_WRITE = True
@@ -825,7 +945,7 @@ def load_dynamic_config():
     global RSI_ALERTS_RAW, RSI_INTERVAL, RSI_RESET_ENABLED, RSI_CHECK_INTERVAL, RSI_ENABLED
     global SOLANATRACKER_RATE_LIMIT_MODE, SOLANATRACKER_REQUESTS_PER_SECOND, SOLANATRACKER_FEATURES_ENABLED, INPUT_DECIMALS, OUTPUT_DECIMALS, OUTPUT_MINT, ACTIVE_TOKEN_CONFIG, NTFY_TOPIC
     global ACTIVE_RSI_REFRESH_NONCE, _last_rsi_at
-    global LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
+    global LATEST_RSI, LATEST_RSI_TIME, LATEST_RSI_STATUS, LATEST_RSI_ERROR, LATEST_RSI_LAST_FETCH_AT, LATEST_RSI_SOURCE, LATEST_RSI_PENDING_SOURCE, LATEST_RSI_BACKFILL_FAILURES, LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT, LATEST_RSI_VALUE_CALCULATION_VERSION, LATEST_RSI_LAST_ATTEMPT_AT, LATEST_RSI_LAST_SUCCESS_AT
 
     token_changed = False
 
@@ -888,6 +1008,10 @@ def load_dynamic_config():
                 LATEST_RSI_ERROR = None if LATEST_RSI_STATUS == "waiting" else rsi_disabled_reason(active_token, cfg)
                 LATEST_RSI_LAST_FETCH_AT = None
                 LATEST_RSI_SOURCE = {}
+                LATEST_RSI_PENDING_SOURCE = {}
+                LATEST_RSI_BACKFILL_FAILURES = 0
+                LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT = None
+                LATEST_RSI_VALUE_CALCULATION_VERSION = ""
                 LATEST_RSI_LAST_ATTEMPT_AT = None
                 LATEST_RSI_LAST_SUCCESS_AT = None
             parse_rsi_alerts()
@@ -1392,6 +1516,11 @@ def write_status_json(
                     "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
                     "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
                     "rsi_source": dict(LATEST_RSI_SOURCE or {}),
+                    "rsi_pending_source": dict(LATEST_RSI_PENDING_SOURCE or {}),
+                    "rsi_backfill_failures": LATEST_RSI_BACKFILL_FAILURES,
+                    "rsi_backfill_next_attempt_at": LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT,
+                    "rsi_value_calculation_version": LATEST_RSI_VALUE_CALCULATION_VERSION,
+                    "rsi_migration_pending": LATEST_RSI is not None and LATEST_RSI_VALUE_CALCULATION_VERSION != RSI_CALCULATION_VERSION,
                 }
                 if check_completed:
                     next_token_state.update({
@@ -1438,6 +1567,11 @@ def write_status_json(
                 "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
                 "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
                 "rsi_source": dict(LATEST_RSI_SOURCE or {}),
+                "rsi_pending_source": dict(LATEST_RSI_PENDING_SOURCE or {}),
+                "rsi_backfill_failures": LATEST_RSI_BACKFILL_FAILURES,
+                "rsi_backfill_next_attempt_at": LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT,
+                "rsi_value_calculation_version": LATEST_RSI_VALUE_CALCULATION_VERSION,
+                "rsi_migration_pending": LATEST_RSI is not None and LATEST_RSI_VALUE_CALCULATION_VERSION != RSI_CALCULATION_VERSION,
             }
             if check_completed:
                 next_existing.update({
@@ -1507,6 +1641,11 @@ def write_scheduled_token_status(token_config, runtime, price_buy, price_sell, t
                 "rsi_last_attempt_at": runtime.get("rsi_last_attempt_at"),
                 "rsi_last_success_at": runtime.get("rsi_last_success_at"),
                 "rsi_source": dict(runtime.get("rsi_source") or {}),
+                "rsi_pending_source": dict(runtime.get("rsi_pending_source") or {}),
+                "rsi_backfill_failures": coerce_int(runtime.get("rsi_backfill_failures"), 0, minimum=0),
+                "rsi_backfill_next_attempt_at": runtime.get("rsi_backfill_next_attempt_at"),
+                "rsi_value_calculation_version": str(runtime.get("rsi_value_calculation_version") or ""),
+                "rsi_migration_pending": rsi_value_needs_migration(runtime),
                 "ntfy_topic": normalize_ntfy_topic((token_config or {}).get("ntfy_topic")),
                 "ntfy_effective_topic": ntfy_topic,
                 "ntfy_topic_source": ntfy_source,
@@ -1588,6 +1727,11 @@ def write_price_verification_state(
                     "rsi_last_attempt_at": runtime.get("rsi_last_attempt_at"),
                     "rsi_last_success_at": runtime.get("rsi_last_success_at"),
                     "rsi_source": dict(runtime.get("rsi_source") or {}),
+                    "rsi_pending_source": dict(runtime.get("rsi_pending_source") or {}),
+                    "rsi_backfill_failures": coerce_int(runtime.get("rsi_backfill_failures"), 0, minimum=0),
+                    "rsi_backfill_next_attempt_at": runtime.get("rsi_backfill_next_attempt_at"),
+                    "rsi_value_calculation_version": str(runtime.get("rsi_value_calculation_version") or ""),
+                    "rsi_migration_pending": rsi_value_needs_migration(runtime),
                     "last_triggered_buy": serialize_trigger_times(runtime.get("last_buy_alert")),
                     "last_triggered_sell": serialize_trigger_times(runtime.get("last_sell_alert")),
                     "last_triggered_rsi": dict(runtime.get("last_triggered_rsi") or {}),
@@ -1604,6 +1748,11 @@ def write_price_verification_state(
                     "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
                     "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
                     "rsi_source": dict(LATEST_RSI_SOURCE or {}),
+                    "rsi_pending_source": dict(LATEST_RSI_PENDING_SOURCE or {}),
+                    "rsi_backfill_failures": LATEST_RSI_BACKFILL_FAILURES,
+                    "rsi_backfill_next_attempt_at": LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT,
+                    "rsi_value_calculation_version": LATEST_RSI_VALUE_CALCULATION_VERSION,
+                    "rsi_migration_pending": LATEST_RSI is not None and LATEST_RSI_VALUE_CALCULATION_VERSION != RSI_CALCULATION_VERSION,
                     "last_triggered_buy": serialize_trigger_times(last_buy_alert),
                     "last_triggered_sell": serialize_trigger_times(last_sell_alert),
                     "last_triggered_rsi": active_rsi_triggers,
@@ -1617,6 +1766,11 @@ def write_price_verification_state(
                     "rsi_last_attempt_at": LATEST_RSI_LAST_ATTEMPT_AT,
                     "rsi_last_success_at": LATEST_RSI_LAST_SUCCESS_AT,
                     "rsi_source": dict(LATEST_RSI_SOURCE or {}),
+                    "rsi_pending_source": dict(LATEST_RSI_PENDING_SOURCE or {}),
+                    "rsi_backfill_failures": LATEST_RSI_BACKFILL_FAILURES,
+                    "rsi_backfill_next_attempt_at": LATEST_RSI_BACKFILL_NEXT_ATTEMPT_AT,
+                    "rsi_value_calculation_version": LATEST_RSI_VALUE_CALCULATION_VERSION,
+                    "rsi_migration_pending": LATEST_RSI is not None and LATEST_RSI_VALUE_CALCULATION_VERSION != RSI_CALCULATION_VERSION,
                     "last_triggered_buy": serialize_trigger_times(last_buy_alert),
                     "last_triggered_sell": serialize_trigger_times(last_sell_alert),
                     "last_triggered_rsi": active_rsi_triggers,
@@ -1972,6 +2126,10 @@ def check_scheduled_token(token_config, cfg=None, price_only=False):
                     period=14,
                     interval=rsi_interval,
                     include_metadata=True,
+                    trusted_value=None if rsi_value_needs_migration(runtime) else runtime.get("latest_rsi"),
+                    trusted_source=runtime.get("rsi_source"),
+                    pending_source=runtime.get("rsi_pending_source"),
+                    allow_backfill=rsi_backfill_retry_allowed(runtime, now_utc),
                 )
                 decision, trusted_rsi = apply_trusted_rsi_result(runtime, result, rsi_interval)
                 rsi_time = runtime.get("latest_rsi_time")
@@ -2001,6 +2159,9 @@ def check_scheduled_token(token_config, cfg=None, price_only=False):
                             if delivered:
                                 info["triggered"] = True
                                 runtime["last_triggered_rsi"][key] = rsi_time
+            except RsiBackfillPendingError as e:
+                mark_rsi_backfill_pending(runtime, e)
+                print(f"RSI history pending for {label}: {e}", flush=True)
             except Exception as e:
                 attempted_at = datetime.now(timezone.utc).isoformat()
                 runtime["rsi_status"] = "error"
@@ -2263,6 +2424,10 @@ def check_prices(price_only=False):
                     period=14,
                     interval=RSI_INTERVAL,
                     include_metadata=True,
+                    trusted_value=None if rsi_value_needs_migration(active_runtime) else active_runtime.get("latest_rsi"),
+                    trusted_source=active_runtime.get("rsi_source"),
+                    pending_source=active_runtime.get("rsi_pending_source"),
+                    allow_backfill=rsi_backfill_retry_allowed(active_runtime, now_utc),
                 )
                 decision, trusted_rsi = apply_trusted_rsi_result(active_runtime, result, RSI_INTERVAL)
                 rsi_time = active_runtime.get("latest_rsi_time")
@@ -2308,6 +2473,10 @@ def check_prices(price_only=False):
                                 info["triggered_at"] = rsi_time
                                 notify_backend_rsi_trigger(key, rsi_time)
 
+            except RsiBackfillPendingError as e:
+                mark_rsi_backfill_pending(active_runtime, e)
+                sync_active_rsi_globals(active_runtime)
+                print(f"RSI history pending: {e}", flush=True)
             except Exception as e:
                 attempted_at = datetime.now(timezone.utc).isoformat()
                 active_runtime["rsi_status"] = "error"

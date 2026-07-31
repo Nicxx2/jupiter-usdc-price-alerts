@@ -28,6 +28,30 @@ INTERVAL_SECONDS = {
 MINIMUM_WARMUP_BARS = 120
 
 
+class InsufficientRsiHistoryError(ValueError):
+    """A valid provider response did not contain enough active RSI bars."""
+
+    def __init__(self, message, candles, required_bars, lookback_days):
+        super().__init__(message)
+        self.candles = candles
+        self.active_bars = len(candles)
+        self.required_bars = required_bars
+        self.lookback_days = lookback_days
+
+
+class RsiBackfillPendingError(ValueError):
+    """A new traded candle exists, but its RSI history is not verified yet."""
+
+    def __init__(self, message, candidate_source, backfill_attempted=False):
+        super().__init__(message)
+        self.candidate_source = dict(candidate_source or {})
+        self.backfill_attempted = bool(backfill_attempted)
+
+
+def empty_candle_frame():
+    return pd.DataFrame(columns=["timestamp", "close", "volume"])
+
+
 def interval_lookback_days(interval: str, period: int = 14, minimum_days: int = 3) -> int:
     """Return enough calendar history for stable Wilder smoothing at an interval."""
     seconds = INTERVAL_SECONDS.get(str(interval or "").strip())
@@ -45,7 +69,10 @@ def fetch_candles(
     remove_outliers: bool = True,
     fetch_n: int = 2000,
     period: int = 14,
-    lookback_days: int = 3
+    lookback_days: int = 3,
+    time_from_override: int = None,
+    time_to_override: int = None,
+    allow_insufficient: bool = False,
 ) -> pd.DataFrame:
     """
     Fetch OHLCV candles from SolanaTracker and retain only genuine trading bars.
@@ -55,7 +82,12 @@ def fetch_candles(
     cannot create a new RSI value.
     """
     effective_lookback_days = interval_lookback_days(interval, period, lookback_days)
-    time_from = int((datetime.now(timezone.utc) - timedelta(days=effective_lookback_days)).timestamp())
+    if time_from_override is None:
+        time_from = int((datetime.now(timezone.utc) - timedelta(days=effective_lookback_days)).timestamp())
+    else:
+        time_from = int(time_from_override)
+        if time_from <= 0:
+            raise ValueError("RSI history start time must be positive")
     url = f"https://data.solanatracker.io/chart/{token}"
     headers = {"x-api-key": api_key}
     params = {
@@ -66,6 +98,8 @@ def fetch_candles(
         "dynamicPools": "true",
         "fastCache": "false",
     }
+    if time_to_override is not None:
+        params["time_to"] = int(time_to_override)
     throttle()
     resp = requests.get(url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
@@ -74,7 +108,15 @@ def fetch_candles(
     required_columns = {"time", "close", "volume"}
     missing = required_columns - set(df.columns)
     if df.empty:
-        raise ValueError(f"No RSI candles returned in the last {effective_lookback_days} days")
+        candles = empty_candle_frame()
+        if allow_insufficient:
+            return candles
+        raise InsufficientRsiHistoryError(
+            f"No RSI candles returned in the last {effective_lookback_days} days",
+            candles,
+            period + 1,
+            effective_lookback_days,
+        )
     if missing:
         raise ValueError(f"RSI candle response missing columns: {', '.join(sorted(missing))}")
 
@@ -102,22 +144,51 @@ def fetch_candles(
         .sort_values("time", kind="stable")
         .reset_index(drop=True)
     )
+    # Enforce explicit backfill boundaries locally as well as asking the
+    # provider, so an ignored range parameter cannot contaminate the merge.
+    if time_from_override is not None:
+        df = df.loc[df["time"] >= time_from]
+    if time_to_override is not None:
+        df = df.loc[df["time"] <= int(time_to_override)]
 
     if df.empty:
-        raise ValueError(f"No valid RSI candles returned in the last {effective_lookback_days} days")
+        candles = empty_candle_frame()
+        if allow_insufficient:
+            return candles
+        raise InsufficientRsiHistoryError(
+            f"No valid RSI candles returned in the last {effective_lookback_days} days",
+            candles,
+            period + 1,
+            effective_lookback_days,
+        )
 
     df = df.loc[df["volume"] > 0].reset_index(drop=True)
     if df.empty:
-        raise ValueError(f"No non-zero volume bars in the last {effective_lookback_days} days")
-
-    if len(df) < period + 1:
-        raise ValueError(f"Not enough traded bars for RSI({period}): {len(df)}/{period + 1} available")
+        candles = empty_candle_frame()
+        if allow_insufficient:
+            return candles
+        raise InsufficientRsiHistoryError(
+            f"No non-zero volume bars in the last {effective_lookback_days} days",
+            candles,
+            period + 1,
+            effective_lookback_days,
+        )
 
     df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
     # Apply the response budget after removing inactive rows so real trades are
     # never displaced by long zero-volume gaps.
-    return df[["timestamp", "close", "volume"]].tail(fetch_n).reset_index(drop=True)
+    candles = df[["timestamp", "close", "volume"]].tail(fetch_n).reset_index(drop=True)
+    if len(candles) < period + 1:
+        if allow_insufficient:
+            return candles
+        raise InsufficientRsiHistoryError(
+            f"Not enough traded bars for RSI({period}): {len(candles)}/{period + 1} available",
+            candles,
+            period + 1,
+            effective_lookback_days,
+        )
+    return candles
 
 
 def compute_wilder_rsi(closes: pd.Series, volume: pd.Series = None, period: int = 14) -> pd.Series:
@@ -163,6 +234,91 @@ def compute_wilder_rsi(closes: pd.Series, volume: pd.Series = None, period: int 
     return rsi
 
 
+def normalize_rsi_source(source, interval):
+    if not isinstance(source, dict):
+        return None
+    if str(source.get("calculation_version") or "") != RSI_CALCULATION_VERSION:
+        return None
+    if str(source.get("interval") or "") != str(interval or ""):
+        return None
+    try:
+        timestamp = pd.Timestamp(source.get("timestamp"))
+        close = float(source.get("close"))
+        volume = float(source.get("volume"))
+        active_bars = int(source.get("active_bars") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    if not math.isfinite(close) or close <= 0 or not math.isfinite(volume) or volume <= 0:
+        return None
+    return {
+        "timestamp": timestamp.isoformat(),
+        "close": close,
+        "volume": volume,
+        "interval": str(interval),
+        "active_bars": max(0, active_bars),
+        "calculation_version": RSI_CALCULATION_VERSION,
+    }
+
+
+def candle_source(candles, interval):
+    if candles is None or candles.empty:
+        return None
+    last = candles.iloc[-1]
+    timestamp = pd.Timestamp(last["timestamp"])
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return {
+        "timestamp": timestamp.isoformat(),
+        "close": float(last["close"]),
+        "volume": float(last["volume"]),
+        "interval": str(interval),
+        "active_bars": len(candles),
+        "calculation_version": RSI_CALCULATION_VERSION,
+    }
+
+
+def source_is_newer_or_revised(candidate, trusted):
+    if not candidate or not trusted:
+        return False
+    candidate_time = pd.Timestamp(candidate["timestamp"])
+    trusted_time = pd.Timestamp(trusted["timestamp"])
+    if candidate_time > trusted_time:
+        return True
+    return (
+        candidate_time == trusted_time
+        and (
+            float(candidate["close"]) != float(trusted["close"])
+            or float(candidate["volume"]) != float(trusted["volume"])
+        )
+    )
+
+
+def merge_rsi_candles(historical, current, fetch_n):
+    historical = historical.copy() if historical is not None else empty_candle_frame()
+    current = current.copy() if current is not None else empty_candle_frame()
+    historical["_priority"] = 0
+    current["_priority"] = 1
+    merged = pd.concat([historical, current], ignore_index=True)
+    if merged.empty:
+        return empty_candle_frame()
+    return (
+        merged.sort_values(["timestamp", "_priority"], kind="stable")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp", kind="stable")
+        .tail(fetch_n)
+        [["timestamp", "close", "volume"]]
+        .reset_index(drop=True)
+    )
+
+
 def get_latest_rsi(
     api_key: str,
     token: str,
@@ -171,20 +327,101 @@ def get_latest_rsi(
     lookback_days: int = 3,
     fetch_n: int = 2000,
     include_metadata: bool = False,
+    trusted_value=None,
+    trusted_source=None,
+    pending_source=None,
+    allow_backfill=True,
 ):
     """Fetch candles and return the latest RSI plus optional source metadata."""
-    df = fetch_candles(
-        token=token,
-        api_key=api_key,
-        interval=interval,
-        remove_outliers=True,
-        fetch_n=fetch_n,
-        period=period,
-        lookback_days=lookback_days,
-    )
+    trusted = normalize_rsi_source(trusted_source, interval)
+    pending = normalize_rsi_source(pending_source, interval)
+    try:
+        trusted_number = float(trusted_value)
+        if not math.isfinite(trusted_number) or not 0 <= trusted_number <= 100:
+            trusted_number = None
+    except (TypeError, ValueError):
+        trusted_number = None
+    if trusted is None:
+        trusted_number = None
+
+    backfill_candidate = None
+    try:
+        df = fetch_candles(
+            token=token,
+            api_key=api_key,
+            interval=interval,
+            remove_outliers=True,
+            fetch_n=fetch_n,
+            period=period,
+            lookback_days=lookback_days,
+        )
+    except InsufficientRsiHistoryError as insufficient:
+        current = insufficient.candles
+        observed = candle_source(current, interval)
+
+        if pending is not None and (
+            observed is None or pd.Timestamp(observed["timestamp"]) < pd.Timestamp(pending["timestamp"])
+        ):
+            raise RsiBackfillPendingError(
+                "A newer traded RSI candle is waiting for enough verified history",
+                pending,
+            ) from insufficient
+
+        if trusted_number is not None and pending is None and not source_is_newer_or_revised(observed, trusted):
+            result = (trusted_number, trusted["timestamp"])
+            return result + (trusted,) if include_metadata else result
+
+        candidate = observed or pending
+        if trusted is None or candidate is None:
+            raise
+        if not allow_backfill:
+            raise RsiBackfillPendingError(
+                "New traded RSI candle detected; waiting for the next protected history retry",
+                candidate,
+            ) from insufficient
+
+        trusted_time = pd.Timestamp(trusted["timestamp"])
+        history_days = interval_lookback_days(interval, period, lookback_days)
+        history_from = int((trusted_time - pd.Timedelta(days=history_days)).timestamp())
+        history_to = int(trusted_time.timestamp()) + INTERVAL_SECONDS[interval]
+        try:
+            historical = fetch_candles(
+                token=token,
+                api_key=api_key,
+                interval=interval,
+                remove_outliers=True,
+                fetch_n=fetch_n,
+                period=period,
+                lookback_days=lookback_days,
+                time_from_override=history_from,
+                time_to_override=history_to,
+                allow_insufficient=True,
+            )
+        except Exception as exc:
+            raise RsiBackfillPendingError(
+                "New traded RSI candle detected; historical candles are temporarily unavailable",
+                candidate,
+                backfill_attempted=True,
+            ) from exc
+
+        df = merge_rsi_candles(historical, current, fetch_n)
+        backfill_candidate = candidate
+        if len(df) < period + 1:
+            raise RsiBackfillPendingError(
+                f"New traded RSI candle detected; waiting for enough history ({len(df)}/{period + 1} bars)",
+                candidate,
+                backfill_attempted=True,
+            ) from insufficient
+
     df["RSI"] = compute_wilder_rsi(df["close"], df["volume"], period).round(2)
     valid = df.dropna(subset=["RSI"])
     if valid.empty:
+        if backfill_candidate is not None:
+            raise RsiBackfillPendingError(
+                f"New traded RSI candle detected; verified history has no directional movement for RSI({period})",
+                backfill_candidate,
+                backfill_attempted=True,
+            )
         raise ValueError(f"No directional movement available for RSI({period})")
     last = valid.iloc[-1]
     result = (float(last["RSI"]), last["timestamp"].isoformat())

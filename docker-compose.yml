@@ -85,7 +85,7 @@ services:
       RSI_ENABLED: "true"
 
       # How often (in minutes) to refresh RSI checks
-      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      # Note: Free solanatracker.io API keys are limited to 2,500 requests per month
       RSI_CHECK_INTERVAL: 5
 
       # RSI alert thresholds (e.g. "above:30", "below:70")
@@ -99,7 +99,7 @@ services:
 
       # Persisted, wallet tracking config
       # Comma-separated list of Solana wallet addresses to track
-      # Note: Free solanatracker.io API keys are limited to 10,000 requests per month
+      # Note: Free solanatracker.io API keys are limited to 2,500 requests per month
       WALLET_ADDRESSES: ""
 
       # --- Push Notifications (via ntfy) ---
