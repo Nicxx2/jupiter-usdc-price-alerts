@@ -31,6 +31,11 @@ services:
       SOLANATRACKER_RATE_LIMIT_MODE: safe
       SOLANATRACKER_REQUESTS_PER_SECOND: 1
 
+      # Cached Token Safety reports. Enabled when SolanaTracker is available;
+      # disabling it in Settings is persisted across restarts and container updates.
+      TOKEN_SAFETY_ENABLED: "true"
+      TOKEN_SAFETY_INTERVAL_HOURS: 24
+
       # Optional and used only by Action Rules. Existing prices remain keyless.
       # Leave blank to keep Action Rules unavailable; create one at https://portal.jup.ag.
       JUPITER_API_KEY: ""

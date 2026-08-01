@@ -14,7 +14,7 @@ If you found this helpful and want to support what I do, you can leave a tip her
 
 ---
 
-# 🚀 Jupiter USDC Price Alerts v3.3.8
+# 🚀 Jupiter USDC Price Alerts v3.4
 
 A real-time, web-enabled price alert tool for Solana tokens using the **Jupiter Aggregator**.
 
@@ -22,8 +22,10 @@ Track simulated USDC swaps with real price impact across one or many Solana toke
 
 ---
 
-## ✨ What's New in v3.3.8
+## ✨ What's New in v3.4
 
+- Added cached Token Safety reports using one SolanaTracker token-information request per check, enabled by default when SolanaTracker is available, with persistent global and per-token controls, manual or scheduled refreshes, retained trusted results after failures, and no safety notifications.
+- Improved Token Overview with full aligned Buy and Sell prices, a responsive mobile layout, and compact safety shields that open a detailed report without changing the active token.
 - Improved SolanaTracker RSI reliability with standard Wilder calculations over genuine traded candles, stable no-trade values, safer source validation, and correct persistence across restarts, token switches, and interval changes.
 - Added safer confirmation for unusually large Jupiter price moves before updating charts, shared quote caches, or firing alerts.
 - Improved multi-token monitoring with live Token Overview updates, a clear active-token marker, accurate overdue scheduling, independent background alerts, safer notification retries, and cleaner fired-alert timing details.
@@ -231,7 +233,7 @@ services:
       # Output token mint (token you want to monitor, e.g. JIM)
       OUTPUT_MINT: <YOUR_OUTPUT_TOKEN_MINT>
 
-      # Solanatracker.io API key (required for RSI, wallet info, and sell simulator)
+      # Solanatracker.io API key (required for RSI, Token Safety, wallet info, and sell simulator)
       # If omitted, SolanaTracker-only panels will be disabled in the UI
       SOLANATRACKER_API_KEY: ""
 
@@ -244,6 +246,11 @@ services:
       # Use custom/off only if your plan allows it.
       SOLANATRACKER_RATE_LIMIT_MODE: safe
       SOLANATRACKER_REQUESTS_PER_SECOND: 1
+
+      # Cached Token Safety reports. Enabled when SolanaTracker is available;
+      # disabling it in Settings is persisted across restarts and container updates.
+      TOKEN_SAFETY_ENABLED: "true"
+      TOKEN_SAFETY_INTERVAL_HOURS: 24
 
       # Optional and used only by Action Rules. Existing prices remain keyless.
       # Leave blank to keep Action Rules unavailable; create one at https://portal.jup.ag.
@@ -367,9 +374,9 @@ You’ll be able to:
 
 - View real-time buy/sell prices for the active token
 - Add, validate, remove, and switch between multiple tracked tokens from the web UI
-- Keep each token's simulated USD amount, buy/sell alerts, RSI alerts, RSI interval, RSI reset mode, RSI on/off preference, decimals, ntfy topic, and check intervals isolated
+- Keep each token's simulated USD amount, buy/sell alerts, RSI alerts, RSI interval, RSI reset mode, RSI on/off preference, Token Safety preference, decimals, ntfy topic, and check intervals isolated
 - With the optional feature-only `JUPITER_API_KEY`, configure independent per-coin Action Rules for holders, market cap, liquidity, 24h volume, sell pressure, volume/liquidity, and Jupiter sell-quote price impact, with pass/fail/unknown status and optional confirmed ntfy alerts
-- Enable/disable SolanaTracker globally, choose safe/custom/off rate management, and see the RSI check interval plus monthly call estimate from settings
+- Enable/disable SolanaTracker globally, configure optional Token Safety globally and per token, choose manual or scheduled safety checks, and see combined automated RSI and Safety request estimates in Settings
 - See when each alert was triggered and reset individual alert cooldowns
 - Watch token-scoped chart history with selectable 2h, 4h, 6h, 12h, and 24h windows
 - Send test notifications for the global ntfy topic or a token-specific ntfy topic
@@ -511,7 +518,7 @@ Open the app and **subscribe to your topic** (e.g. `token-alerts`).
 - Mount `/shared` as shown above so alerts, wallets, price history, and UI-edited settings survive container recreation.
 - RSI is cached by the monitor process. The UI reads the cached value and status instead of making extra SolanaTracker candle calls per browser tab.
 - Missing or failed RSI data is shown as `--` with a small status dot instead of `0.00`.
-- `SOLANATRACKER_ENABLED=true` is the first-run default for SolanaTracker-only features. Turning it off in the UI persists to `/shared/config.json` and hides RSI, wallet info, and the sell simulator without stopping Jupiter price checks.
+- `SOLANATRACKER_ENABLED=true` is the first-run default for SolanaTracker-only features. Turning it off in the UI persists to `/shared/config.json` and hides RSI, Token Safety, wallet info, and the sell simulator without stopping Jupiter price checks.
 - `SOLANATRACKER_RATE_LIMIT_MODE=safe` protects free SolanaTracker accounts with a conservative 1 request/second limit. The UI labels this separately from the RSI check interval so request pacing is not confused with RSI cadence. SolanaTracker currently lists the Data API Free plan as 2,500 requests/month and 3 req/sec, so safe mode leaves headroom for RSI and wallet calls. Use `custom` with `SOLANATRACKER_REQUESTS_PER_SECOND`, or `off` only when your plan/private setup can handle it. See the [SolanaTracker pricing docs](https://docs.solanatracker.io/pricing) for current limits.
 - Token decimals are auto-detected through Solana RPC when possible, with `INPUT_DECIMALS` / `OUTPUT_DECIMALS` available as explicit overrides.
 - Quick offline validation: `python -m unittest tests.test_scheduler_rate_limit` checks scheduler interval inheritance, round-robin due-token selection, and rate-limit safe/custom/off behavior without live API calls.

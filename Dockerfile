@@ -40,6 +40,7 @@ COPY backend_api.py /app/
 COPY jupiter_quote.py /app/
 COPY rsi_utils.py /app/
 COPY solana_rate_limiter.py /app/
+COPY token_safety.py /app/
 
 # Create shared storage volume
 RUN mkdir /shared

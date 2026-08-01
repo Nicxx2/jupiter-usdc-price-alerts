@@ -21,6 +21,7 @@ from community_rules import (
 from rule_history import record_rule_history
 from rsi_utils import RSI_CALCULATION_VERSION, RsiBackfillPendingError, get_latest_rsi
 from solana_rate_limiter import configure_rate_limit
+from token_safety import fetch_token_safety
 from typing import Dict, Any, Optional
 
 def coerce_int(value, default, minimum=None, maximum=None):
@@ -110,6 +111,10 @@ CHECK_INTERVAL = env_int("CHECK_INTERVAL", 60, minimum=5)
 SOLANATRACKER_RATE_LIMIT_MODE = normalize_rate_limit_mode(os.getenv("SOLANATRACKER_RATE_LIMIT_MODE"), os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND"))
 SOLANATRACKER_REQUESTS_PER_SECOND = env_float("SOLANATRACKER_REQUESTS_PER_SECOND", 1.0, minimum=0.1, maximum=50.0)
 SOLANATRACKER_FEATURES_ENABLED = coerce_bool(os.getenv("SOLANATRACKER_ENABLED", os.getenv("SOLANATRACKER_FEATURES_ENABLED")), True)
+SOLANATRACKER_BASE_URL = os.getenv("SOLANATRACKER_BASE_URL", "https://data.solanatracker.io").rstrip("/")
+TOKEN_SAFETY_MAX_INTERVAL_HOURS = 720
+TOKEN_SAFETY_ENABLED_DEFAULT = coerce_bool(os.getenv("TOKEN_SAFETY_ENABLED"), True)
+TOKEN_SAFETY_INTERVAL_HOURS_DEFAULT = env_int("TOKEN_SAFETY_INTERVAL_HOURS", 24, minimum=0, maximum=TOKEN_SAFETY_MAX_INTERVAL_HOURS)
 apply_solanatracker_rate_limit()
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -156,6 +161,8 @@ PRICE_MOVE_CONFIRMATION_MIN_BASELINE_POINTS = 3
 COMMUNITY_RULES_CHECK_INTERVAL = env_int("COMMUNITY_RULES_CHECK_INTERVAL", 120, minimum=60, maximum=3600)
 COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_QUOTE_MAX_AGE_SECONDS", 90, minimum=30, maximum=3600)
 COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS = env_int("COMMUNITY_RULES_SOURCE_MAX_AGE_SECONDS", 3600, minimum=300, maximum=86400)
+TOKEN_SAFETY_WORKER_POLL_SECONDS = 10
+TOKEN_SAFETY_CHECKING_STALE_SECONDS = 120
 LAST_COMMUNITY_RULES_REFRESH = 0.0
 LAST_COMMUNITY_RULES_CONFIG_SIGNATURE = ""
 QUOTE_CACHE: Dict[tuple, Dict[str, Any]] = {}
@@ -2518,6 +2525,207 @@ def check_prices(price_only=False):
         print(f"Failed to send price to backend: {e}", flush=True)
     return price_decision
 
+
+def token_safety_interval_hours(cfg):
+    return coerce_int(
+        (cfg or {}).get("token_safety_interval_hours"),
+        TOKEN_SAFETY_INTERVAL_HOURS_DEFAULT,
+        minimum=0,
+        maximum=TOKEN_SAFETY_MAX_INTERVAL_HOURS,
+    )
+
+
+def token_safety_is_globally_enabled(cfg):
+    return (
+        coerce_bool((cfg or {}).get("solanatracker_features_enabled"), SOLANATRACKER_FEATURES_ENABLED)
+        and coerce_bool((cfg or {}).get("token_safety_enabled"), TOKEN_SAFETY_ENABLED_DEFAULT)
+        and solanatracker_api_key_configured()
+    )
+
+
+def token_safety_candidates(cfg, shared=None, now=None):
+    """Return at most one due token, with manual requests taking priority."""
+    if not token_safety_is_globally_enabled(cfg):
+        return None
+    now = now or datetime.now(timezone.utc)
+    shared = shared if isinstance(shared, dict) else read_json_file(shared_json_path)
+    token_states = shared.get("token_states", {}) if isinstance(shared, dict) else {}
+    if not isinstance(token_states, dict):
+        token_states = {}
+    interval_hours = token_safety_interval_hours(cfg)
+    manual_due = []
+    scheduled_due = []
+    for token in get_enabled_token_configs(cfg):
+        if not coerce_bool(token.get("safety_enabled"), True):
+            continue
+        mint = str(token.get("mint") or "").strip()
+        if not mint:
+            continue
+        token_state = token_states.get(mint, {})
+        if not isinstance(token_state, dict) or not token_state_matches_generation(token_state, token):
+            token_state = {}
+        safety = token_state.get("safety", {})
+        if not isinstance(safety, dict):
+            safety = {}
+        requested_nonce = str(token.get("safety_refresh_nonce") or "")
+        processed_nonce = str(safety.get("processed_refresh_nonce") or "")
+        candidate = {**token, "_safety_requested_nonce": requested_nonce, "_safety_interval_hours": interval_hours}
+        if requested_nonce and requested_nonce != processed_nonce:
+            manual_due.append(candidate)
+            continue
+        if interval_hours == 0:
+            continue
+        baseline = parse_iso_to_utc(safety.get("last_attempt_at") or safety.get("last_success_at"))
+        checking_stale = (
+            safety.get("status") == "checking"
+            and (
+                baseline is None
+                or baseline > now + timedelta(seconds=5)
+                or now >= baseline + timedelta(seconds=TOKEN_SAFETY_CHECKING_STALE_SECONDS)
+            )
+        )
+        if checking_stale:
+            scheduled_due.append(candidate)
+            continue
+        if baseline is None or now >= baseline + timedelta(hours=interval_hours):
+            scheduled_due.append(candidate)
+    return (manual_due or scheduled_due or [None])[0]
+
+
+def write_token_safety_checking(token):
+    mint = str((token or {}).get("mint") or "").strip()
+    if not mint:
+        return False
+    current_cfg = read_json_file(config_json_path)
+    current_token = next(
+        (item for item in get_enabled_token_configs(current_cfg) if str(item.get("mint") or "").strip() == mint),
+        None,
+    )
+    if (
+        not current_token
+        or str(current_token.get("runtime_nonce") or "") != str(token.get("runtime_nonce") or "")
+        or str(current_token.get("safety_refresh_nonce") or "") != str(token.get("_safety_requested_nonce") or "")
+        or not current_token.get("enabled", True)
+        or not coerce_bool(current_token.get("safety_enabled"), True)
+        or not token_safety_is_globally_enabled(current_cfg)
+    ):
+        return False
+    with json_file_lock(shared_json_path):
+        existing = read_json_file(shared_json_path)
+        token_states = existing.get("token_states", {})
+        if not isinstance(token_states, dict):
+            token_states = {}
+        token_state = token_states.get(mint, {})
+        if not isinstance(token_state, dict):
+            token_state = {}
+        current_generation = str(current_token.get("runtime_nonce") or "")
+        persisted_generation = str(token_state.get("runtime_nonce") or "")
+        if current_generation and persisted_generation and current_generation != persisted_generation:
+            token_state = {}
+        safety = token_state.get("safety", {})
+        if not isinstance(safety, dict):
+            safety = {}
+        safety.update({
+            "status": "checking",
+            "error": None,
+            "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+            "requested_nonce": str(token.get("_safety_requested_nonce") or ""),
+        })
+        token_state["runtime_nonce"] = current_generation or persisted_generation
+        token_state["safety"] = safety
+        token_states[mint] = token_state
+        existing["token_states"] = token_states
+        atomic_write_json(shared_json_path, existing)
+    return True
+
+
+def persist_token_safety_result(token, report=None, error=None, checked_at=None):
+    """Commit only if the token generation and safety settings still match."""
+    mint = str((token or {}).get("mint") or "").strip()
+    if not mint:
+        return False
+    checked_at = checked_at or datetime.now(timezone.utc)
+    current_cfg = read_json_file(config_json_path)
+    current_token = next(
+        (item for item in get_enabled_token_configs(current_cfg) if str(item.get("mint") or "").strip() == mint),
+        None,
+    )
+    if (
+        not current_token
+        or str(current_token.get("runtime_nonce") or "") != str(token.get("runtime_nonce") or "")
+        or str(current_token.get("safety_refresh_nonce") or "") != str(token.get("_safety_requested_nonce") or "")
+        or not current_token.get("enabled", True)
+        or not coerce_bool(current_token.get("safety_enabled"), True)
+        or not token_safety_is_globally_enabled(current_cfg)
+    ):
+        return False
+
+    interval_hours = token_safety_interval_hours(current_cfg)
+    next_due = checked_at + timedelta(hours=interval_hours) if interval_hours > 0 else None
+    requested_nonce = str(token.get("_safety_requested_nonce") or "")
+    with json_file_lock(shared_json_path):
+        existing = read_json_file(shared_json_path)
+        token_states = existing.get("token_states", {})
+        if not isinstance(token_states, dict):
+            token_states = {}
+        token_state = token_states.get(mint, {})
+        if not isinstance(token_state, dict):
+            token_state = {}
+        persisted_generation = str(token_state.get("runtime_nonce") or "")
+        current_generation = str(current_token.get("runtime_nonce") or "")
+        if persisted_generation and persisted_generation != current_generation:
+            return False
+        safety = token_state.get("safety", {})
+        if not isinstance(safety, dict):
+            safety = {}
+        safety.update({
+            "status": "fresh" if report is not None else ("stale" if isinstance(safety.get("report"), dict) else "error"),
+            "last_attempt_at": checked_at.isoformat(),
+            "next_due_at": next_due.isoformat() if next_due else None,
+            "processed_refresh_nonce": requested_nonce,
+            "requested_nonce": requested_nonce,
+            "error": str(error or "")[:240] or None,
+        })
+        if report is not None:
+            safety["report"] = report
+            safety["last_success_at"] = checked_at.isoformat()
+        token_state["runtime_nonce"] = current_generation or persisted_generation
+        token_state["safety"] = safety
+        token_states[mint] = token_state
+        existing["token_states"] = token_states
+        atomic_write_json(shared_json_path, existing)
+    return True
+
+
+def check_due_token_safety(cfg=None):
+    cfg = cfg if isinstance(cfg, dict) else read_json_file(config_json_path)
+    token = token_safety_candidates(cfg)
+    if not token:
+        return False
+    if not write_token_safety_checking(token):
+        return False
+    checked_at = datetime.now(timezone.utc)
+    try:
+        report = fetch_token_safety(
+            SOLANATRACKER_API_KEY,
+            token["mint"],
+            base_url=SOLANATRACKER_BASE_URL,
+            timeout=10,
+        )
+        persist_token_safety_result(token, report=report, checked_at=checked_at)
+    except Exception as exc:
+        persist_token_safety_result(token, error=f"SolanaTracker safety check failed: {str(exc)[:180]}", checked_at=checked_at)
+    return True
+
+
+def token_safety_worker():
+    while True:
+        try:
+            check_due_token_safety()
+        except Exception as exc:
+            print(f"Token Safety worker error: {exc}", flush=True)
+        time.sleep(TOKEN_SAFETY_WORKER_POLL_SECONDS)
+
 def community_rules_worker():
     while True:
         try:
@@ -2604,6 +2812,7 @@ if __name__ == "__main__":
     print("Jupiter Price Monitor started.", flush=True)
     threading.Thread(target=background_alert_cleaner, daemon=True).start()
     threading.Thread(target=community_rules_worker, daemon=True, name="community-rules").start()
+    threading.Thread(target=token_safety_worker, daemon=True, name="token-safety").start()
 
     while True:
         sleep_for = 5

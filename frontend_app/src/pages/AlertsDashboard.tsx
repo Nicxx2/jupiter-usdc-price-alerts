@@ -36,6 +36,24 @@ const formatChartPrice = (value: any) => {
   if (parsed === null) return "Unavailable";
   return parsed < 0.00000001 ? `$${parsed.toExponential(4)}` : `$${parsed.toFixed(8)}`;
 };
+const formatOverviewPrice = (value: any) => {
+  const parsed = chartPriceValue(value);
+  if (parsed === null) return "--";
+  return parsed < 0.00000001 ? parsed.toExponential(4) : parsed.toFixed(8);
+};
+const formatSafetyPercent = (value: any) => value === null || value === undefined ? "Unknown" : `${safe(value).toFixed(2)}%`;
+const formatSafetyUsd = (value: any) => value === null || value === undefined
+  ? "Unknown"
+  : new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(safe(value));
+
+function ShieldIcon({ className = "h-4 w-4" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className={className} aria-hidden="true">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 3 5.5 5.5v5.7c0 4.25 2.7 7.65 6.5 9.8 3.8-2.15 6.5-5.55 6.5-9.8V5.5L12 3Z" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="m9.2 12 1.8 1.8 3.9-4" />
+    </svg>
+  );
+}
 
 const pnlStatusText = (item: any) => {
   const status = item?.pnl_status;
@@ -233,8 +251,44 @@ type TokenConfig = {
   rsi_interval?: string | null;
   rsi_reset_enabled?: boolean | null;
   rsi_enabled?: boolean | null;
+  safety_enabled?: boolean | null;
   wallet_addresses?: string[];
   rules_config?: RulesConfig;
+};
+
+type TokenSafetySummary = {
+  enabled?: boolean;
+  status?: "fresh" | "checking" | "stale" | "error" | "not_checked" | "disabled" | "global_disabled" | "token_disabled" | string;
+  score?: number | null;
+  level?: "low" | "medium" | "high" | "critical" | string | null;
+  rugged?: boolean | null;
+  last_success_at?: string | null;
+  last_attempt_at?: string | null;
+  next_due_at?: string | null;
+  error?: string | null;
+};
+
+type TokenSafetyReport = {
+  score: number;
+  level: string;
+  rugged: boolean | null;
+  jupiter_verified: boolean | null;
+  danger_conflict?: boolean;
+  risks: Array<{ name: string; description?: string; level?: string; value?: string }>;
+  authorities: { mint?: "enabled" | "disabled" | "unknown"; freeze?: "enabled" | "disabled" | "unknown" };
+  concentration: { top10?: number | null; developer?: number | null; insiders?: number | null; snipers?: number | null; bundlers?: number | null };
+  holders?: number | null;
+  pools?: { count?: number | null; total_liquidity_usd?: number | null; largest_liquidity_usd?: number | null };
+};
+
+type TokenSafetyResponse = {
+  mint: string;
+  name?: string;
+  global_enabled?: boolean;
+  token_enabled?: boolean;
+  effective_enabled?: boolean;
+  status: TokenSafetySummary;
+  report?: TokenSafetyReport | null;
 };
 
 type TokenSummary = TokenConfig & {
@@ -254,6 +308,7 @@ type TokenSummary = TokenConfig & {
   ntfy_effective_topic?: string;
   ntfy_topic_source?: string;
   rules_state?: RulesState;
+  safety?: TokenSafetySummary;
 };
 
 type TokenDraft = {
@@ -262,8 +317,54 @@ type TokenDraft = {
   check_interval: string;
   rsi_check_interval: string;
   rsi_enabled: boolean;
+  safety_enabled: boolean;
   rules_config: RulesConfig;
 };
+
+const safetyBadgeMeta = (safety?: TokenSafetySummary | null) => {
+  const level = String(safety?.level || "").toLowerCase();
+  const levelLabel = level ? `${level.charAt(0).toUpperCase()}${level.slice(1)}` : "";
+  const score = safety?.score === null || safety?.score === undefined ? "" : `${safe(safety.score).toFixed(Number.isInteger(Number(safety.score)) ? 0 : 1)}/10`;
+  if (safety?.status === "checking") return { label: score ? `Checking ${score}` : "Checking", className: "border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-300", pulse: true };
+  if (safety?.status === "stale") return { label: score ? `Stale ${score}` : "Stale", className: "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300", pulse: false };
+  if (safety?.status === "error") return { label: "Check failed", className: "border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300", pulse: false };
+  if (safety?.status === "token_disabled") return { label: "Off", className: "border-gray-300 bg-gray-50 text-gray-500 dark:border-gray-700 dark:bg-gray-900/40 dark:text-gray-400", pulse: false };
+  if (["disabled", "global_disabled"].includes(String(safety?.status))) return { label: "Unavailable", className: "border-gray-300 bg-gray-50 text-gray-500 dark:border-gray-700 dark:bg-gray-900/40 dark:text-gray-400", pulse: false };
+  if (!safety?.level) return { label: "Not checked", className: "border-gray-300 bg-gray-50 text-gray-600 dark:border-gray-700 dark:bg-gray-900/40 dark:text-gray-300", pulse: false };
+  const classes: Record<string, string> = {
+    low: "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300",
+    medium: "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300",
+    high: "border-orange-300 bg-orange-50 text-orange-800 dark:border-orange-800 dark:bg-orange-950/40 dark:text-orange-300",
+    critical: "border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300",
+  };
+  return { label: `${levelLabel} ${score}`, className: classes[level] || classes.medium, pulse: false };
+};
+
+function TokenSafetyBadge({ safety, onClick, compact = false }: { safety?: TokenSafetySummary | null; onClick: () => void; compact?: boolean }) {
+  const meta = safetyBadgeMeta(safety);
+  const status = String(safety?.status || "");
+  const compactScore = safety?.score === null || safety?.score === undefined ? "" : `${safe(safety.score).toFixed(Number.isInteger(Number(safety.score)) ? 0 : 1)}/10`;
+  const compactLabel = status === "checking"
+    ? "Checking"
+    : status === "stale"
+      ? (compactScore ? `${compactScore} stale` : "Stale")
+      : ["token_disabled", "disabled", "global_disabled", "error"].includes(status)
+        ? meta.label
+        : compactScore || meta.label;
+  return (
+    <button
+      type="button"
+      onClick={(event) => { event.stopPropagation(); onClick(); }}
+      className={`relative z-10 inline-flex max-w-full self-start items-center gap-1 rounded-full border px-2 py-1 text-xs font-medium transition hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-blue-400 sm:self-auto ${meta.className}`}
+      title={`Open Token Safety · ${meta.label}`}
+      aria-label={`Open Token Safety report: ${meta.label}`}
+    >
+      <ShieldIcon className={`h-3.5 w-3.5 shrink-0 ${meta.pulse ? "animate-pulse" : ""}`} />
+      <span className="truncate sm:hidden">{compact ? compactLabel : meta.label}</span>
+      <span className="hidden truncate sm:inline">{meta.label}</span>
+    </button>
+  );
+}
 const formatTokenTime = (value?: string | null) => {
   if (!value) return "";
   const date = new Date(value);
@@ -478,6 +579,10 @@ export default function AlertsDashboard() {
   const [solanaTrackerEnabled, setSolanaTrackerEnabled] = useState(false);
   const [solanaTrackerFeaturesEnabled, setSolanaTrackerFeaturesEnabled] = useState(true);
   const [solanaTrackerApiConfigured, setSolanaTrackerApiConfigured] = useState(false);
+  const [tokenSafetyEnabled, setTokenSafetyEnabled] = useState(true);
+  const [tokenSafetyIntervalHours, setTokenSafetyIntervalHours] = useState(24);
+  const [tokenSafetyDraftEnabled, setTokenSafetyDraftEnabled] = useState(true);
+  const [tokenSafetyDraftIntervalHours, setTokenSafetyDraftIntervalHours] = useState(24);
   const [ntfyConfigured, setNtfyConfigured] = useState(false);
   const [ntfyTopic, setNtfyTopic] = useState("");
   const [communityRulesEnabled, setCommunityRulesEnabled] = useState(true);
@@ -512,6 +617,10 @@ export default function AlertsDashboard() {
   const [actionReadinessExpandedByMint, setActionReadinessExpandedByMint] = useState<Record<string, boolean>>({});
   const [addTokenExpanded, setAddTokenExpanded] = useState(false);
   const [editingTokenMint, setEditingTokenMint] = useState<string | null>(null);
+  const [safetyModalMint, setSafetyModalMint] = useState<string | null>(null);
+  const [safetyModalData, setSafetyModalData] = useState<TokenSafetyResponse | null>(null);
+  const [safetyModalLoading, setSafetyModalLoading] = useState(false);
+  const [safetyRefreshing, setSafetyRefreshing] = useState(false);
 
 
   const [rsi, setRsi] = useState<number | null>(null);
@@ -530,8 +639,11 @@ export default function AlertsDashboard() {
   const outputMintRef = useRef("");
   const ntfyTopicDirty = useRef(false);
   const communityRulesDraftDirty = useRef(false);
+  const tokenSafetyDraftDirty = useRef(false);
   const stateFetchRequestId = useRef(0);
   const settingsSaveInFlight = useRef(false);
+  const safetyTriggerRef = useRef<HTMLElement | null>(null);
+  const safetyFetchRequestId = useRef(0);
 
   const effectiveSolanaTrackerRps = useMemo(() => {
     if (solanaTrackerRateLimitMode === "off") return null;
@@ -557,22 +669,30 @@ export default function AlertsDashboard() {
     setCommunityRulesDraftEnabled(communityRulesEnabled);
   };
 
+  const resetTokenSafetyDraft = () => {
+    tokenSafetyDraftDirty.current = false;
+    setTokenSafetyDraftEnabled(tokenSafetyEnabled);
+    setTokenSafetyDraftIntervalHours(tokenSafetyIntervalHours);
+  };
+
   const closeSettingsPanel = () => {
     setSettingsHelpOpen(null);
     resetNtfyTopicDraft();
     setSettingsOpen(false);
     resetCommunityRulesDraft();
+    resetTokenSafetyDraft();
   };
 
   const toggleSettingsPanel = () => {
     setSettingsHelpOpen(null);
     resetNtfyTopicDraft();
     resetCommunityRulesDraft();
+    resetTokenSafetyDraft();
     setSettingsOpen((open) => !open);
   };
 
   useEffect(() => {
-    if (!settingsOpen || typeof document === "undefined") return;
+    if ((!settingsOpen && !safetyModalMint) || typeof document === "undefined") return;
     const previousBodyOverflow = document.body.style.overflow;
     const previousRootOverflow = document.documentElement.style.overflow;
     document.body.style.overflow = "hidden";
@@ -581,7 +701,23 @@ export default function AlertsDashboard() {
       document.body.style.overflow = previousBodyOverflow;
       document.documentElement.style.overflow = previousRootOverflow;
     };
-  }, [settingsOpen]);
+  }, [safetyModalMint, settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen && !safetyModalMint) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (safetyModalMint) {
+        setSafetyModalMint(null);
+        setSafetyModalData(null);
+        window.setTimeout(() => safetyTriggerRef.current?.focus(), 0);
+      } else {
+        closeSettingsPanel();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [safetyModalMint, settingsOpen]);
 
   const estimatedRsiUsage = useMemo(() => {
     if (!solanaTrackerFeaturesEnabled || !solanaTrackerApiConfigured) return { calls: 0, tokens: 0 };
@@ -600,8 +736,20 @@ export default function AlertsDashboard() {
     return { calls, tokens: enabledTokens };
   }, [rsiCheckInterval, solanaTrackerApiConfigured, solanaTrackerFeaturesEnabled, tokenSummaries, tokens]);
 
+  const estimatedSafetyUsage = useMemo(() => {
+    if (!solanaTrackerFeaturesEnabled || !solanaTrackerApiConfigured || !tokenSafetyDraftEnabled || tokenSafetyDraftIntervalHours <= 0) {
+      return { calls: 0, tokens: 0 };
+    }
+    const enabledTokens = tokens.filter((token) => token.enabled !== false && token.safety_enabled !== false).length;
+    return { calls: Math.ceil((30 * 24 * enabledTokens) / tokenSafetyDraftIntervalHours), tokens: enabledTokens };
+  }, [solanaTrackerApiConfigured, solanaTrackerFeaturesEnabled, tokenSafetyDraftEnabled, tokenSafetyDraftIntervalHours, tokens]);
+
+  const estimatedAutomatedSolanaTrackerUsage = estimatedRsiUsage.calls + estimatedSafetyUsage.calls;
+
   const solanaTrackerRateLabel = solanaTrackerRateLimitMode === "off" ? "off" : `${effectiveSolanaTrackerRps} request/sec`;
   const rsiDefaultIntervalLabel = `${Math.max(1, Math.floor(safe(rsiCheckInterval, 5)))} min`;
+  const tokenSafetyVisible = solanaTrackerFeaturesEnabled && solanaTrackerApiConfigured && tokenSafetyEnabled;
+  const tokenSafetyFrequencyPreset = [0, 24, 12, 6, 3].includes(tokenSafetyDraftIntervalHours) ? String(tokenSafetyDraftIntervalHours) : "custom";
 
   const activeToken = useMemo(
     () => tokens.find((token) => token.mint === activeTokenMint) || tokens[0] || null,
@@ -783,6 +931,7 @@ export default function AlertsDashboard() {
           check_interval: intervalDraft(token.check_interval ?? summary?.check_interval),
           rsi_check_interval: intervalDraft(token.rsi_check_interval ?? summary?.rsi_check_interval),
           rsi_enabled: (token.rsi_enabled ?? summary?.rsi_enabled ?? true) !== false,
+          safety_enabled: (token.safety_enabled ?? summary?.safety_enabled ?? true) !== false,
           rules_config: rulesDraft(token.rules_config || summary?.rules_config),
         };
         return acc;
@@ -810,6 +959,14 @@ export default function AlertsDashboard() {
       setSolanaTrackerEnabled(!!data.solanatracker_enabled);
       setSolanaTrackerFeaturesEnabled(data.solanatracker_features_enabled !== false);
       setSolanaTrackerApiConfigured(!!data.solanatracker_api_key_configured);
+      const nextTokenSafetyEnabled = data.token_safety_enabled === true;
+      const nextTokenSafetyIntervalHours = Math.max(0, Math.min(720, Math.floor(safe(data.token_safety_interval_hours, 24))));
+      setTokenSafetyEnabled(nextTokenSafetyEnabled);
+      setTokenSafetyIntervalHours(nextTokenSafetyIntervalHours);
+      if (!tokenSafetyDraftDirty.current) {
+        setTokenSafetyDraftEnabled(nextTokenSafetyEnabled);
+        setTokenSafetyDraftIntervalHours(nextTokenSafetyIntervalHours);
+      }
       const savedNtfyTopic = data.ntfy_topic || "";
       const effectiveNtfyTopic = data.ntfy_effective_topic || savedNtfyTopic || "";
       setNtfyTopicSaved(savedNtfyTopic);
@@ -1027,6 +1184,62 @@ export default function AlertsDashboard() {
     }
   };
 
+  const loadCachedTokenSafety = async (mint: string, silent = false) => {
+    const requestId = ++safetyFetchRequestId.current;
+    if (!silent) setSafetyModalLoading(true);
+    try {
+      const res = await fetch(`/api/tokens/${encodeURIComponent(mint)}/safety`);
+      if (!res.ok) throw new Error(await responseDetail(res, "Token Safety report could not be loaded"));
+      const data: TokenSafetyResponse = await res.json();
+      if (requestId !== safetyFetchRequestId.current) return;
+      setSafetyModalData(data);
+      if (data.status?.status !== "checking") setSafetyRefreshing(false);
+    } catch (err: any) {
+      if (requestId === safetyFetchRequestId.current && !silent) toast.error(err?.message || "Token Safety report could not be loaded");
+    } finally {
+      if (requestId === safetyFetchRequestId.current) setSafetyModalLoading(false);
+    }
+  };
+
+  const openTokenSafety = (mint: string) => {
+    safetyTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSafetyModalMint(mint);
+    setSafetyModalData(null);
+    loadCachedTokenSafety(mint);
+  };
+
+  const closeTokenSafety = () => {
+    safetyFetchRequestId.current += 1;
+    setSafetyModalMint(null);
+    setSafetyModalData(null);
+    setSafetyRefreshing(false);
+    window.setTimeout(() => safetyTriggerRef.current?.focus(), 0);
+  };
+
+  const refreshTokenSafety = async () => {
+    if (!safetyModalMint || safetyRefreshing) return;
+    setSafetyRefreshing(true);
+    try {
+      const res = await fetch(`/api/tokens/${encodeURIComponent(safetyModalMint)}/safety/refresh`, { method: "POST" });
+      if (!res.ok) throw new Error(await responseDetail(res, "Token Safety check could not be queued"));
+      toast.success("Token Safety check queued (1 request)");
+      await loadCachedTokenSafety(safetyModalMint, true);
+      fetchState();
+    } catch (err: any) {
+      setSafetyRefreshing(false);
+      toast.error(err?.message || "Token Safety check could not be queued");
+    }
+  };
+
+  useEffect(() => {
+    if (!safetyModalMint || safetyModalData?.status?.status !== "checking") return;
+    const pollId = window.setInterval(() => {
+      loadCachedTokenSafety(safetyModalMint, true);
+      fetchState();
+    }, 2_000);
+    return () => window.clearInterval(pollId);
+  }, [safetyModalData?.status?.status, safetyModalMint]);
+
   const applyResetMinutes = async () => {
     const res = await fetch("/api/reset-minutes", {
       method: "POST",
@@ -1047,12 +1260,16 @@ export default function AlertsDashboard() {
     const ntfyDraft = ntfyTopic.trim();
     const inheritedNtfyUnchanged = !ntfyTopicDirty.current && !ntfyTopicSaved && Boolean(ntfyTopicEffective) && ntfyDraft === ntfyTopicEffective;
     const submittedCommunityRulesEnabled = communityRulesDraftEnabled;
+    const submittedTokenSafetyEnabled = tokenSafetyDraftEnabled;
+    const submittedTokenSafetyIntervalHours = Math.max(0, Math.min(720, Math.floor(safe(tokenSafetyDraftIntervalHours, 24))));
     const payload: Record<string, number | string | boolean | null> = {
       check_interval: Math.max(5, Math.floor(safe(checkInterval, 60))),
       rsi_check_interval: Math.max(1, Math.floor(safe(rsiCheckInterval, 5))),
       solanatracker_rate_limit_mode: solanaTrackerRateLimitMode,
       solanatracker_requests_per_second: Math.max(0.1, safe(solanaTrackerRps, 1)),
       solanatracker_features_enabled: solanaTrackerFeaturesEnabled,
+      token_safety_enabled: submittedTokenSafetyEnabled,
+      token_safety_interval_hours: submittedTokenSafetyIntervalHours,
       community_rules_enabled: submittedCommunityRulesEnabled,
       ntfy_topic: inheritedNtfyUnchanged ? "" : ntfyDraft,
     };
@@ -1070,8 +1287,13 @@ export default function AlertsDashboard() {
       toast.success("Settings updated");
       ntfyTopicDirty.current = false;
       communityRulesDraftDirty.current = false;
+      tokenSafetyDraftDirty.current = false;
       setCommunityRulesEnabled(submittedCommunityRulesEnabled);
       setCommunityRulesDraftEnabled(submittedCommunityRulesEnabled);
+      setTokenSafetyEnabled(submittedTokenSafetyEnabled);
+      setTokenSafetyIntervalHours(submittedTokenSafetyIntervalHours);
+      setTokenSafetyDraftEnabled(submittedTokenSafetyEnabled);
+      setTokenSafetyDraftIntervalHours(submittedTokenSafetyIntervalHours);
       fetchState();
     } catch {
       toast.error("Failed to update settings");
@@ -1243,6 +1465,7 @@ export default function AlertsDashboard() {
     check_interval: intervalDraft(row.check_interval),
     rsi_check_interval: intervalDraft(row.rsi_check_interval),
     rsi_enabled: row.rsi_enabled !== false,
+    safety_enabled: row.safety_enabled !== false,
     rules_config: rulesDraft(row.rules_config),
   });
 
@@ -1287,6 +1510,7 @@ export default function AlertsDashboard() {
         check_interval: current[mint]?.check_interval || "",
         rsi_check_interval: current[mint]?.rsi_check_interval || "",
         rsi_enabled: current[mint]?.rsi_enabled ?? true,
+        safety_enabled: current[mint]?.safety_enabled ?? true,
         rules_config: current[mint]?.rules_config || rulesDraft(),
         ...changes,
       },
@@ -1301,6 +1525,7 @@ export default function AlertsDashboard() {
         check_interval: "",
         rsi_check_interval: "",
         rsi_enabled: true,
+        safety_enabled: true,
         rules_config: rulesDraft(),
       };
       return {
@@ -1328,6 +1553,7 @@ export default function AlertsDashboard() {
       check_interval: intervalDraft(row.check_interval),
       rsi_check_interval: intervalDraft(row.rsi_check_interval),
       rsi_enabled: row.rsi_enabled !== false,
+      safety_enabled: row.safety_enabled !== false,
       rules_config: rulesDraft(row.rules_config),
     };
     const priceInterval = intervalPayload(draft.check_interval, 5, "Price interval seconds");
@@ -1374,6 +1600,7 @@ export default function AlertsDashboard() {
           check_interval: priceInterval,
           rsi_check_interval: rsiIntervalValue,
           rsi_enabled: draft.rsi_enabled !== false,
+          safety_enabled: draft.safety_enabled !== false,
           rules_config: draft.rules_config,
         }),
       });
@@ -1556,10 +1783,35 @@ export default function AlertsDashboard() {
   } as const;
 
   const rsiMeta = getRsiStatusMeta(rsiStatus, rsiMessage);
+  const safetyModalReport = safetyModalData?.report || null;
+  const safetyModalStatus = safetyModalData?.status || null;
+  const safetyModalBadge = safetyBadgeMeta(safetyModalStatus);
+  const safetyKeyChecks = safetyModalReport ? [
+    {
+      label: "Not marked as rugged",
+      state: safetyModalReport.rugged === null ? "unknown" : safetyModalReport.rugged ? "fail" : "pass",
+      detail: safetyModalReport.rugged === null ? "Provider did not report rugged status" : safetyModalReport.rugged ? "SolanaTracker marks this token as rugged" : "No rugged flag in the latest report",
+    },
+    {
+      label: "Mint authority disabled",
+      state: safetyModalReport.authorities?.mint === "unknown" ? "unknown" : safetyModalReport.authorities?.mint === "disabled" ? "pass" : "fail",
+      detail: safetyModalReport.authorities?.mint === "enabled" ? "A pool reports an active mint authority" : safetyModalReport.authorities?.mint === "disabled" ? "All reported pools show no mint authority" : "Authority status was not available for every pool",
+    },
+    {
+      label: "Freeze authority disabled",
+      state: safetyModalReport.authorities?.freeze === "unknown" ? "unknown" : safetyModalReport.authorities?.freeze === "disabled" ? "pass" : "fail",
+      detail: safetyModalReport.authorities?.freeze === "enabled" ? "A pool reports an active freeze authority" : safetyModalReport.authorities?.freeze === "disabled" ? "All reported pools show no freeze authority" : "Authority status was not available for every pool",
+    },
+    {
+      label: "Jupiter verified",
+      state: safetyModalReport.jupiter_verified === null ? "unknown" : safetyModalReport.jupiter_verified ? "pass" : "warn",
+      detail: safetyModalReport.jupiter_verified === null ? "Verification status was not reported" : safetyModalReport.jupiter_verified ? "Verified by Jupiter" : "Not currently marked as Jupiter verified",
+    },
+  ] : [];
 
   return (
     <div className="relative p-6 max-w-4xl mx-auto space-y-6">
-      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.3.8</div>
+      <div className="absolute top-2 left-2 text-xs text-gray-500">v3.4</div>
 
       <div className="fixed right-3 top-3 z-50 flex items-center gap-2">
         <Button
@@ -1618,7 +1870,7 @@ export default function AlertsDashboard() {
                     ? "Globally disabled: no Action Rules requests or alerts. Per-coin settings are preserved."
                     : `Feature key configured. Rules refresh every ${communityRulesCheckInterval}s through their isolated ${jupiterRps} request/sec limiter. Rule Trends reuse those checks and add no Jupiter requests.`}
               </div>
-              <SettingsHelpLabel {...settingsHelpProps("solanatracker-features")} text="SolanaTracker" help="Enables SolanaTracker-only features: RSI, wallet info, and the sell simulator. Jupiter price checks and price alerts keep running when this is off." />
+              <SettingsHelpLabel {...settingsHelpProps("solanatracker-features")} text="SolanaTracker" help="Master switch for RSI, Token Safety, wallet info, and the sell simulator. Jupiter price checks and price alerts keep running when this is off." />
               <Select value={solanaTrackerFeaturesEnabled ? "true" : "false"} onChange={(e) => setSolanaTrackerFeaturesEnabled(e.target.value === "true")}>
                 <option value="true">Enabled</option>
                 <option value="false">Disabled</option>
@@ -1626,6 +1878,81 @@ export default function AlertsDashboard() {
 
               {solanaTrackerFeaturesEnabled && (
                 <>
+                  <SettingsHelpLabel {...settingsHelpProps("token-safety")} text="Token Safety Watch" help="Caches a SolanaTracker risk report for each enabled coin. It does not send alerts, affect price checks, or make requests when you open a report." />
+                  <Select
+                    aria-label="Token Safety Watch"
+                    value={tokenSafetyDraftEnabled ? "true" : "false"}
+                    disabled={settingsSaving}
+                    onChange={(e) => {
+                      const nextEnabled = e.target.value === "true";
+                      tokenSafetyDraftDirty.current = nextEnabled !== tokenSafetyEnabled || tokenSafetyDraftIntervalHours !== tokenSafetyIntervalHours;
+                      setTokenSafetyDraftEnabled(nextEnabled);
+                    }}
+                  >
+                    <option value="false">Disabled</option>
+                    <option value="true">Enabled</option>
+                  </Select>
+
+                  {(tokenSafetyDraftEnabled !== tokenSafetyEnabled || tokenSafetyDraftIntervalHours !== tokenSafetyIntervalHours) && (
+                    <div className="-mt-2 text-xs text-gray-500 sm:col-span-2">
+                      {tokenSafetyDraftEnabled !== tokenSafetyEnabled
+                        ? tokenSafetyDraftEnabled
+                          ? "Pending: Token Safety Watch will be enabled after you save. Until then, safety badges and scheduled checks remain off."
+                          : "Pending: Token Safety Watch will be disabled after you save. Until then, safety badges and scheduled checks remain active."
+                        : "Pending: the Token Safety Watch frequency will change after you save. The current schedule remains active until then."}
+                    </div>
+                  )}
+
+                  {tokenSafetyDraftEnabled && (
+                    <>
+                      <SettingsHelpLabel {...settingsHelpProps("token-safety-frequency")} text="Token Safety Watch frequency" help="One request per enabled token when due. Safe is daily; Manual only runs when you press Check now. Tokens are staggered through the shared SolanaTracker limiter." />
+                      <Select
+                        aria-label="Token Safety Watch frequency"
+                        value={tokenSafetyFrequencyPreset}
+                        disabled={settingsSaving}
+                        onChange={(e) => {
+                          const nextHours = e.target.value !== "custom"
+                            ? Number(e.target.value)
+                            : [0, 24, 12, 6, 3].includes(tokenSafetyDraftIntervalHours)
+                              ? 48
+                              : tokenSafetyDraftIntervalHours;
+                          tokenSafetyDraftDirty.current = tokenSafetyDraftEnabled !== tokenSafetyEnabled || nextHours !== tokenSafetyIntervalHours;
+                          setTokenSafetyDraftIntervalHours(nextHours);
+                        }}
+                      >
+                        <option value="0">Manual only</option>
+                        <option value="24">Safe · every 24 hours</option>
+                        <option value="12">Balanced · every 12 hours</option>
+                        <option value="6">Faster · every 6 hours</option>
+                        <option value="3">Fast · every 3 hours</option>
+                        <option value="custom">Custom</option>
+                      </Select>
+                      {tokenSafetyFrequencyPreset === "custom" && (
+                        <>
+                          <Label>Custom safety hours</Label>
+                          <Input
+                            aria-label="Custom Token Safety interval hours"
+                            type="number"
+                            min={1}
+                            max={720}
+                            value={tokenSafetyDraftIntervalHours}
+                            disabled={settingsSaving}
+                            onChange={(e) => {
+                              const nextHours = Math.max(1, Math.min(720, Math.floor(safe(e.target.value, 24))));
+                              tokenSafetyDraftDirty.current = tokenSafetyDraftEnabled !== tokenSafetyEnabled || nextHours !== tokenSafetyIntervalHours;
+                              setTokenSafetyDraftIntervalHours(nextHours);
+                            }}
+                          />
+                        </>
+                      )}
+                      <div className="-mt-2 text-xs text-gray-500 sm:col-span-2">
+                        {tokenSafetyDraftIntervalHours === 0
+                          ? "Manual only: no automated Token Safety requests. Check now actions are not included in estimates."
+                          : `${estimatedSafetyUsage.calls.toLocaleString()} automated safety request${estimatedSafetyUsage.calls === 1 ? "" : "s"}/month across ${estimatedSafetyUsage.tokens} enabled token${estimatedSafetyUsage.tokens === 1 ? "" : "s"}. Manual checks are excluded.`}
+                      </div>
+                    </>
+                  )}
+
                   <SettingsHelpLabel {...settingsHelpProps("rsi-check")} text="RSI check (min)" help="How often RSI is refreshed from SolanaTracker. More tokens and lower minutes create more API calls." />
                   <Input type="number" min={1} value={rsiCheckInterval} onChange={(e) => setRsiCheckInterval(safe(e.target.value, 5))} />
 
@@ -1691,9 +2018,9 @@ export default function AlertsDashboard() {
               <div className="text-xs text-gray-500 sm:col-span-2">
                 {solanaTrackerFeaturesEnabled
                   ? solanaTrackerApiConfigured
-                    ? `SolanaTracker rate limit: ${solanaTrackerRateLabel}. RSI check default: every ${rsiDefaultIntervalLabel}. Estimate: ${estimatedRsiUsage.calls.toLocaleString()}/month across ${estimatedRsiUsage.tokens} token${estimatedRsiUsage.tokens === 1 ? "" : "s"}.`
+                    ? `SolanaTracker rate limit: ${solanaTrackerRateLabel}. RSI check default: every ${rsiDefaultIntervalLabel}. ${tokenSafetyDraftEnabled ? `Combined automated estimate: ${estimatedAutomatedSolanaTrackerUsage.toLocaleString()}/month (RSI ${estimatedRsiUsage.calls.toLocaleString()} + Safety ${estimatedSafetyUsage.calls.toLocaleString()}).` : `RSI estimate: ${estimatedRsiUsage.calls.toLocaleString()}/month across ${estimatedRsiUsage.tokens} token${estimatedRsiUsage.tokens === 1 ? "" : "s"}.`}`
                     : "SolanaTracker API key not configured."
-                  : "SolanaTracker disabled - RSI, wallet info, and sell simulator hidden."}
+                  : "SolanaTracker disabled - RSI, Token Safety, wallet info, and sell simulator hidden."}
               </div>
             </div>
 
@@ -1710,6 +2037,154 @@ export default function AlertsDashboard() {
               >
                 Test alert
               </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {safetyModalMint && (
+        <div className="fixed inset-0 z-[60] flex items-end justify-center bg-gray-950/65 p-0 backdrop-blur-[1px] sm:items-center sm:p-4" onClick={closeTokenSafety}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="token-safety-title"
+            className="flex max-h-[94dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-900 sm:max-h-[90dvh] sm:rounded-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-gray-200 px-4 py-4 dark:border-gray-700 sm:px-5">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <ShieldIcon className="h-5 w-5 text-blue-500" />
+                  <h2 id="token-safety-title" className="truncate text-lg font-semibold">Token Safety — {safetyModalData?.name || tokenName(tokenRows.find((row) => row.mint === safetyModalMint))}</h2>
+                </div>
+                <div className="mt-1 truncate font-mono text-xs text-gray-500" title={safetyModalMint}>{safetyModalMint}</div>
+              </div>
+              <Button variant="ghost" size="icon" onClick={closeTokenSafety} aria-label="Close Token Safety" autoFocus>
+                <Cross2Icon />
+              </Button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-5">
+              {safetyModalLoading && !safetyModalData ? (
+                <div className="flex min-h-48 items-center justify-center text-sm text-gray-500">Loading cached report…</div>
+              ) : (
+                <div className="space-y-4">
+                  <div className={`rounded-xl border p-4 ${safetyModalBadge.className}`}>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <div className="flex items-center gap-2 text-lg font-semibold">
+                          <ShieldIcon className={`h-6 w-6 ${safetyModalBadge.pulse ? "animate-pulse" : ""}`} />
+                          {safetyModalBadge.label}
+                        </div>
+                        <div className="mt-1 text-xs opacity-80">
+                          {safetyModalStatus?.last_success_at ? `Last successful check ${formatTokenTime(safetyModalStatus.last_success_at)}` : "No successful check yet"}
+                        </div>
+                      </div>
+                      {safetyModalReport && (
+                        <div className="text-left sm:text-right">
+                          <div className="text-xs uppercase tracking-wide opacity-70">Risk score</div>
+                          <div className="text-2xl font-bold tabular-nums">{safe(safetyModalReport.score).toFixed(Number.isInteger(Number(safetyModalReport.score)) ? 0 : 1)}<span className="text-sm font-medium">/10</span></div>
+                        </div>
+                      )}
+                    </div>
+                    {safetyModalStatus?.status === "stale" && (
+                      <p className="mt-3 text-sm">The previous trusted report is shown because the latest refresh failed or is overdue.</p>
+                    )}
+                    {safetyModalStatus?.error && (
+                      <p className="mt-2 break-words rounded-md bg-white/50 p-2 text-xs dark:bg-black/15">{safetyModalStatus.error}</p>
+                    )}
+                  </div>
+
+                  {!safetyModalReport ? (
+                    <div className="rounded-xl border border-dashed border-gray-300 p-6 text-center dark:border-gray-700">
+                      <ShieldIcon className="mx-auto h-9 w-9 text-gray-400" />
+                      <div className="mt-2 font-medium">No cached safety report</div>
+                      <p className="mt-1 text-sm text-gray-500">Run Check now when you want to use one SolanaTracker request. Opening this window never checks automatically.</p>
+                    </div>
+                  ) : (
+                    <>
+                      {safetyModalReport.danger_conflict && (
+                        <div className="rounded-lg border border-orange-300 bg-orange-50 p-3 text-sm text-orange-800 dark:border-orange-900 dark:bg-orange-950/30 dark:text-orange-300">
+                          The provider returned a danger flag alongside a lower summary score. Review the warnings below rather than relying on the score alone.
+                        </div>
+                      )}
+
+                      <section>
+                        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500">Key checks</h3>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {safetyKeyChecks.map((check) => (
+                            <div key={check.label} className="rounded-lg border border-gray-200 p-3 dark:border-gray-700">
+                              <div className="flex items-start gap-2">
+                                <span className={`mt-0.5 text-base ${check.state === "pass" ? "text-emerald-500" : check.state === "fail" ? "text-red-500" : check.state === "warn" ? "text-amber-500" : "text-gray-400"}`} aria-hidden="true">
+                                  {check.state === "pass" ? "✓" : check.state === "fail" ? "!" : check.state === "warn" ? "⚠" : "?"}
+                                </span>
+                                <div><div className="font-medium">{check.label}</div><div className="mt-0.5 text-xs text-gray-500">{check.detail}</div></div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+
+                      <section>
+                        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500">Trading concentration</h3>
+                        <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                          {([
+                            ["Top 10", safetyModalReport.concentration?.top10],
+                            ["Developer", safetyModalReport.concentration?.developer],
+                            ["Insiders", safetyModalReport.concentration?.insiders],
+                            ["Snipers", safetyModalReport.concentration?.snipers],
+                            ["Bundlers", safetyModalReport.concentration?.bundlers],
+                          ] as Array<[string, number | null | undefined]>).map(([label, value]) => (
+                            <div key={label} className="rounded-lg border border-gray-200 p-3 dark:border-gray-700">
+                              <div className="text-xs text-gray-500">{label}</div>
+                              <div className="mt-1 font-semibold tabular-nums">{formatSafetyPercent(value)}</div>
+                              {value !== null && value !== undefined && (
+                                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"><div className="h-full rounded-full bg-blue-500" style={{ width: `${Math.min(100, Math.max(0, safe(value)))}%` }} /></div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+
+                      <section>
+                        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500">Market context</h3>
+                        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                          <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-800"><div className="text-xs text-gray-500">Holders</div><div className="mt-1 font-semibold tabular-nums">{safetyModalReport.holders === null || safetyModalReport.holders === undefined ? "Unknown" : safetyModalReport.holders.toLocaleString()}</div></div>
+                          <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-800"><div className="text-xs text-gray-500">Pools</div><div className="mt-1 font-semibold tabular-nums">{safetyModalReport.pools?.count ?? "Unknown"}</div></div>
+                          <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-800"><div className="text-xs text-gray-500">Total liquidity</div><div className="mt-1 font-semibold tabular-nums">{formatSafetyUsd(safetyModalReport.pools?.total_liquidity_usd)}</div></div>
+                          <div className="rounded-lg bg-gray-50 p-3 dark:bg-gray-800"><div className="text-xs text-gray-500">Largest pool</div><div className="mt-1 font-semibold tabular-nums">{formatSafetyUsd(safetyModalReport.pools?.largest_liquidity_usd)}</div></div>
+                        </div>
+                      </section>
+
+                      <section>
+                        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-gray-500">Warnings</h3>
+                        {safetyModalReport.risks?.length ? (
+                          <div className="space-y-2">
+                            {safetyModalReport.risks.map((risk, index) => (
+                              <div key={`${risk.name}:${index}`} className={`rounded-lg border p-3 ${risk.level === "danger" ? "border-red-300 bg-red-50 dark:border-red-900 dark:bg-red-950/20" : "border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/20"}`}>
+                                <div className="flex items-start justify-between gap-2"><span className="font-medium">{risk.level === "danger" ? "!" : "⚠"} {risk.name}</span>{risk.value && <span className="shrink-0 text-xs font-medium">{risk.value}</span>}</div>
+                                {risk.description && <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">{risk.description}</p>}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/20 dark:text-emerald-300">No risk warnings were included in the latest SolanaTracker report.</div>
+                        )}
+                      </section>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col-reverse gap-2 border-t border-gray-200 bg-white px-4 py-3 dark:border-gray-700 dark:bg-gray-900 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+              <div className="text-xs text-gray-500">Cached locally · no safety alerts · opening uses 0 requests</div>
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={refreshTokenSafety} disabled={safetyRefreshing || safetyModalStatus?.status === "checking" || !safetyModalData?.effective_enabled}>
+                  {safetyRefreshing || safetyModalStatus?.status === "checking" ? "Checking…" : "Check now · 1 request"}
+                </Button>
+                <Button onClick={closeTokenSafety}>Close</Button>
+              </div>
             </div>
           </div>
         </div>
@@ -1751,8 +2226,6 @@ export default function AlertsDashboard() {
                 <div className="p-3 text-sm text-gray-500">No tokens configured</div>
               ) : (
                 tokenOverviewRows.map((row) => {
-                  const hasBuy = row.buy_price !== null && row.buy_price !== undefined;
-                  const hasSell = row.sell_price !== null && row.sell_price !== undefined;
                   const hasRsi = row.rsi !== null && row.rsi !== undefined;
                   const rowRsiEnabled = row.rsi_enabled !== false;
                   const rowRsiText = !solanaTrackerFeaturesEnabled
@@ -1770,20 +2243,24 @@ export default function AlertsDashboard() {
                   const statusLabel = row.error ? "Issue" : isPriceVerifying ? "Verifying move" : row.active ? "Active" : row.rsi_status === "stale" ? "Stale" : "Watching";
                   const dotClass = row.error ? "bg-red-500" : isPriceVerifying ? "bg-yellow-500" : row.active ? "bg-green-500" : row.rsi_status === "stale" ? "bg-yellow-500" : "bg-gray-400";
                   return (
-                    <button
+                    <div
                       key={row.mint}
-                      type="button"
-                      aria-current={row.active ? "true" : undefined}
-                      onClick={() => !row.active && switchActiveToken(row.mint)}
-                      disabled={tokenSaving || row.active}
-                      className={`grid w-full grid-cols-2 gap-2 border-t border-gray-200 p-3 text-left text-sm first:border-t-0 hover:bg-gray-50 disabled:cursor-default disabled:hover:bg-transparent dark:border-gray-700 dark:hover:bg-gray-700/35 dark:disabled:hover:bg-transparent ${
-                        jupiterApiConfigured && communityRulesEnabled
-                          ? "md:grid-cols-[minmax(0,1.65fr)_repeat(6,minmax(4.75rem,1fr))]"
-                          : "md:grid-cols-[minmax(0,1.65fr)_repeat(5,minmax(4.75rem,1fr))]"
+                      className={`group relative grid w-full grid-cols-2 gap-x-3 gap-y-2 border-t border-gray-200 p-3 text-left text-sm first:border-t-0 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-700/35 ${
+                        tokenSafetyVisible
+                          ? "lg:grid-cols-[minmax(7.5rem,1.25fr)_minmax(7.25rem,1fr)_minmax(7.25rem,1fr)_minmax(3.5rem,.5fr)_minmax(7.75rem,.95fr)_minmax(5.75rem,.75fr)]"
+                          : "lg:grid-cols-[minmax(8rem,1.45fr)_minmax(7.25rem,1fr)_minmax(7.25rem,1fr)_minmax(3.5rem,.55fr)_minmax(6rem,.8fr)]"
                       }`}
-                      title={row.error || row.price_message || row.mint}
                     >
-                      <span className="col-span-2 flex min-w-0 items-center gap-1.5 md:col-span-1">
+                      <button
+                        type="button"
+                        aria-current={row.active ? "true" : undefined}
+                        aria-label={`${row.active ? "Active token" : "Use token"}: ${tokenName(row)}`}
+                        onClick={() => !row.active && switchActiveToken(row.mint)}
+                        disabled={tokenSaving || row.active}
+                        className="absolute inset-0 z-0 rounded-sm focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-400 disabled:cursor-default"
+                        title={row.error || row.price_message || row.mint}
+                      />
+                      <span className={`${tokenSafetyVisible ? "col-span-1" : "col-span-2"} pointer-events-none relative z-[1] order-1 flex min-w-0 items-center gap-1.5 lg:col-span-1`}>
                         <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${dotClass}`} />
                         {row.active && (
                           <span className="inline-flex flex-shrink-0 text-blue-600 dark:text-blue-400" title="Selected active token">
@@ -1794,15 +2271,32 @@ export default function AlertsDashboard() {
                         <span className="min-w-[2.5rem] max-w-[5.5rem] truncate font-medium" title={tokenName(row)}>{tokenName(row)}</span>
                         <span className="min-w-0 flex-1 truncate font-mono text-xs text-gray-500">{shortMint(row.mint)}</span>
                       </span>
-                      <span className="min-w-0 truncate">Buy <strong>{hasBuy ? fmt(row.buy_price, 8) : "--"}</strong></span>
-                      <span className="min-w-0 truncate">Sell <strong>{hasSell ? fmt(row.sell_price, 8) : "--"}</strong></span>
-                      <span className="min-w-0 truncate">RSI <strong>{rowRsiText}</strong></span>
-                      {jupiterApiConfigured && communityRulesEnabled && (
-                        <span className="min-w-0 truncate">Rules <strong>{rowRulesMeta.label}</strong></span>
+                      {tokenSafetyVisible && (
+                        <span className="relative z-10 order-2 flex justify-end lg:order-5 lg:justify-start">
+                          <TokenSafetyBadge safety={row.safety} compact onClick={() => openTokenSafety(row.mint)} />
+                        </span>
                       )}
-                      <span className="min-w-0 truncate">{topicSourceLabel(row.ntfy_topic_source)}</span>
-                      <span className="min-w-0 truncate" title={row.price_message || row.next_check_at || undefined}>{scheduleLabel || statusLabel}</span>
-                    </button>
+                      <span className="pointer-events-none relative z-[1] order-3 min-w-0 font-mono tabular-nums lg:order-2" title={row.buy_price === null || row.buy_price === undefined ? undefined : String(row.buy_price)}>
+                        <span className="block text-[10px] font-sans font-medium uppercase tracking-wide text-gray-500">Buy</span>
+                        <strong className="whitespace-nowrap text-xs sm:text-sm">{formatOverviewPrice(row.buy_price)}</strong>
+                      </span>
+                      <span className="pointer-events-none relative z-[1] order-4 min-w-0 font-mono tabular-nums lg:order-3" title={row.sell_price === null || row.sell_price === undefined ? undefined : String(row.sell_price)}>
+                        <span className="block text-[10px] font-sans font-medium uppercase tracking-wide text-gray-500">Sell</span>
+                        <strong className="whitespace-nowrap text-xs sm:text-sm">{formatOverviewPrice(row.sell_price)}</strong>
+                      </span>
+                      <span className="pointer-events-none relative z-[1] order-5 min-w-0 lg:order-4">
+                        <span className="block text-[10px] font-medium uppercase tracking-wide text-gray-500">RSI</span>
+                        <strong>{rowRsiText}</strong>
+                      </span>
+                      <span className="pointer-events-none relative z-[1] order-6 min-w-0" title={row.price_message || row.next_check_at || undefined}>
+                        <span className="block text-[10px] font-medium uppercase tracking-wide text-gray-500">Status</span>
+                        <span className="whitespace-nowrap text-xs sm:text-sm">{scheduleLabel || statusLabel}</span>
+                      </span>
+                      <span className="pointer-events-none relative z-[1] order-7 col-span-2 min-w-0 truncate text-xs text-gray-500 lg:col-span-full">
+                        {jupiterApiConfigured && communityRulesEnabled && <>Rules: <strong>{rowRulesMeta.label}</strong><span aria-hidden="true"> · </span></>}
+                        {topicSourceLabel(row.ntfy_topic_source)}
+                      </span>
+                    </div>
                   );
                 })
               )}
@@ -1853,6 +2347,9 @@ export default function AlertsDashboard() {
                   ))
                 )}
               </Select>
+              {tokenSafetyVisible && activeTokenSummary && (
+                <TokenSafetyBadge safety={activeTokenSummary.safety} onClick={() => openTokenSafety(activeTokenSummary.mint)} />
+              )}
               <Button size="sm" variant="outline" onClick={toggleTokenManager} className="whitespace-nowrap" aria-expanded={tokenManagerExpanded}>
                 {tokenManagerExpanded ? "Hide" : "Manage"}
               </Button>
@@ -1944,6 +2441,7 @@ export default function AlertsDashboard() {
                         check_interval: intervalDraft(row.check_interval),
                         rsi_check_interval: intervalDraft(row.rsi_check_interval),
                         rsi_enabled: row.rsi_enabled !== false,
+                        safety_enabled: row.safety_enabled !== false,
                         rules_config: rulesDraft(row.rules_config),
                       };
                       const topicTitle = row.ntfy_effective_topic
@@ -2009,7 +2507,7 @@ export default function AlertsDashboard() {
 
                           {isEditing && (
                             <div className="mt-3 rounded border border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-900/30">
-                              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
                                 <Input
                                   aria-label={`${tokenName(row)} name`}
                                   placeholder="Name"
@@ -2053,7 +2551,19 @@ export default function AlertsDashboard() {
                                   <option value="true">RSI on</option>
                                   <option value="false">RSI off</option>
                                 </Select>
+                                <Select
+                                  aria-label={`${tokenName(row)} Token Safety checks`}
+                                  value={draft.safety_enabled ? "true" : "false"}
+                                  onChange={(e) => updateTokenDraft(row.mint, { safety_enabled: e.target.value === "true" })}
+                                  className="min-w-0"
+                                >
+                                  <option value="true">Token Safety on</option>
+                                  <option value="false">Token Safety off</option>
+                                </Select>
                               </div>
+                              {!tokenSafetyEnabled && (
+                                <p className="mt-2 text-xs text-gray-500">Token Safety is globally off. This coin preference is preserved for when you enable it in Settings.</p>
+                              )}
                               <div className="mt-4 rounded-lg border border-blue-200 bg-white p-3 dark:border-blue-900 dark:bg-gray-950/40">
                                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                                   <div>

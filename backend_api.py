@@ -71,6 +71,9 @@ NTFY_TOPIC_ALPHABET = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0
 SOLANATRACKER_PNL_RETRIES = 2
 SOLANATRACKER_BASE_URL = os.getenv("SOLANATRACKER_BASE_URL", "https://data.solanatracker.io").rstrip("/")
 SOLANATRACKER_PNL_MODE = os.getenv("SOLANATRACKER_PNL_MODE", "adjusted").strip().lower()
+TOKEN_SAFETY_MIN_INTERVAL_HOURS = 1
+TOKEN_SAFETY_MAX_INTERVAL_HOURS = 720
+TOKEN_SAFETY_CHECKING_STALE_SECONDS = 120
 
 def _optional_int(value):
     try:
@@ -165,6 +168,18 @@ def solanatracker_api_key_configured():
 
 def solanatracker_effective_enabled():
     return bool(state.get("solanatracker_features_enabled", True)) and solanatracker_api_key_configured()
+
+
+def token_safety_globally_enabled():
+    return solanatracker_effective_enabled() and coerce_bool(state.get("token_safety_enabled"), True)
+
+
+def token_safety_effective_enabled(token):
+    return (
+        token_safety_globally_enabled()
+        and coerce_bool((token or {}).get("enabled"), True)
+        and coerce_bool((token or {}).get("safety_enabled"), True)
+    )
 
 
 def normalize_rate_limit_mode(value, requests_per_second=None):
@@ -390,6 +405,8 @@ def normalize_token_entry(entry, fallback=None):
         "rsi_reset_enabled": coerce_bool(entry.get("rsi_reset_enabled", fallback.get("rsi_reset_enabled", state.get("rsi_reset_enabled", False))), state.get("rsi_reset_enabled", False)),
         "rsi_enabled": coerce_bool(entry.get("rsi_enabled", fallback.get("rsi_enabled", state.get("rsi_enabled", True))), True),
         "rsi_refresh_nonce": str(entry.get("rsi_refresh_nonce", fallback.get("rsi_refresh_nonce", "")) or ""),
+        "safety_enabled": coerce_bool(entry.get("safety_enabled", fallback.get("safety_enabled", True)), True),
+        "safety_refresh_nonce": str(entry.get("safety_refresh_nonce", fallback.get("safety_refresh_nonce", "")) or ""),
         "runtime_nonce": str(entry.get("runtime_nonce", fallback.get("runtime_nonce", "")) or ""),
         "rules_config": normalize_rules_config(entry.get("rules_config", fallback.get("rules_config", default_rules_config()))),
         "ntfy_topic": safe_ntfy_topic(entry.get("ntfy_topic", fallback.get("ntfy_topic", ""))),
@@ -414,6 +431,7 @@ def current_legacy_token():
         "rsi_interval": state.get("rsi_interval", "1s"),
         "rsi_reset_enabled": state.get("rsi_reset_enabled", False),
         "rsi_enabled": state.get("rsi_enabled", True),
+        "safety_enabled": True,
         "ntfy_topic": "",
         "wallet_addresses": state.get("wallet_addresses", []),
         "check_interval": None,
@@ -582,6 +600,59 @@ def derived_next_check_at(last_checked, interval_seconds, fallback=None):
     return (checked + timedelta(seconds=interval_seconds)).isoformat()
 
 
+def token_safety_cache_for(mint):
+    latest = read_json_file(STATE_PATH)
+    token_states = latest.get("token_states", {}) if isinstance(latest, dict) else {}
+    token_state = token_states.get(mint, {}) if isinstance(token_states, dict) else {}
+    safety = token_state.get("safety", {}) if isinstance(token_state, dict) else {}
+    return safety if isinstance(safety, dict) else {}
+
+
+def token_safety_checking_is_recent(safety, now=None):
+    if not isinstance(safety, dict) or safety.get("status") != "checking":
+        return False
+    started = parse_iso_to_utc(safety.get("last_attempt_at") or safety.get("requested_at"))
+    now = now or datetime.now(timezone.utc)
+    return bool(
+        started
+        and started <= now + timedelta(seconds=5)
+        and now < started + timedelta(seconds=TOKEN_SAFETY_CHECKING_STALE_SECONDS)
+    )
+
+
+def compact_token_safety(token, safety):
+    report = safety.get("report") if isinstance(safety.get("report"), dict) else None
+    effective = token_safety_effective_enabled(token)
+    abandoned_check = False
+    if not effective:
+        if not solanatracker_effective_enabled():
+            status = "disabled"
+        elif not coerce_bool(state.get("token_safety_enabled"), True):
+            status = "global_disabled"
+        else:
+            status = "token_disabled"
+    else:
+        status = str(safety.get("status") or ("fresh" if report else "not_checked"))
+        next_due = parse_iso_to_utc(safety.get("next_due_at"))
+        abandoned_check = status == "checking" and not token_safety_checking_is_recent(safety)
+        if abandoned_check:
+            status = "stale" if report else "error"
+        if report and status == "fresh" and next_due and datetime.now(timezone.utc) >= next_due:
+            status = "stale"
+    return {
+        "enabled": effective,
+        "status": status,
+        "score": report.get("score") if report else None,
+        "level": report.get("level") if report else None,
+        "rugged": report.get("rugged") if report else None,
+        "last_success_at": safety.get("last_success_at"),
+        "last_attempt_at": safety.get("last_attempt_at"),
+        "next_due_at": safety.get("next_due_at"),
+        "error": safety.get("error") or ("Previous safety check did not finish; check again" if abandoned_check else None),
+        "schema_version": report.get("schema_version") if report else None,
+    }
+
+
 def get_token_state_summary():
     latest = read_json_file(STATE_PATH)
     token_states = latest.get("token_states", {}) if isinstance(latest, dict) else {}
@@ -590,6 +661,9 @@ def get_token_state_summary():
         token_state = token_states.get(token["mint"], {})
         if not isinstance(token_state, dict):
             token_state = {}
+        safety_state = token_state.get("safety", {})
+        if not isinstance(safety_state, dict):
+            safety_state = {}
         rules_state = stale_rules_state(
             token_state.get("rules_state"),
             token.get("rules_config"),
@@ -661,6 +735,8 @@ def get_token_state_summary():
             "rsi_interval": token.get("rsi_interval"),
             "rsi_reset_enabled": token.get("rsi_reset_enabled"),
             "rsi_enabled": rsi_enabled,
+            "safety_enabled": coerce_bool(token.get("safety_enabled"), True),
+            "safety": compact_token_safety(token, safety_state),
             "effective_check_interval": effective_check_interval,
             "effective_rsi_check_interval": effective_rsi_check_interval,
             "active": token["mint"] == state.get("active_token_mint"),
@@ -718,6 +794,9 @@ state = {
     "solanatracker_rate_limit_mode": normalize_rate_limit_mode(os.getenv("SOLANATRACKER_RATE_LIMIT_MODE"), os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND")),
     "solanatracker_requests_per_second": clamp_float(os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND", "1"), 1.0, 0.1, 50.0),
     "solanatracker_features_enabled": solanatracker_features_default(),
+    # Enabled by default when the master SolanaTracker feature and API key are available.
+    "token_safety_enabled": coerce_bool(os.getenv("TOKEN_SAFETY_ENABLED"), True),
+    "token_safety_interval_hours": coerce_int(os.getenv("TOKEN_SAFETY_INTERVAL_HOURS"), 24, minimum=0, maximum=TOKEN_SAFETY_MAX_INTERVAL_HOURS),
     "community_rules_enabled": coerce_bool(os.getenv("COMMUNITY_RULES_ENABLED"), True) and jupiter_api_key_configured(),
     "community_rules_refresh_nonce": "",
     "ntfy_topic": "",
@@ -822,6 +901,8 @@ def load_env_defaults():
         state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(os.getenv("SOLANATRACKER_RATE_LIMIT_MODE", state["solanatracker_rate_limit_mode"]), os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND", state["solanatracker_requests_per_second"]))
         state["solanatracker_requests_per_second"] = clamp_float(os.getenv("SOLANATRACKER_REQUESTS_PER_SECOND", state["solanatracker_requests_per_second"]), 1.0, 0.1, 50.0)
         state["solanatracker_features_enabled"] = coerce_bool(os.getenv("SOLANATRACKER_ENABLED", os.getenv("SOLANATRACKER_FEATURES_ENABLED", state["solanatracker_features_enabled"])), state["solanatracker_features_enabled"])
+        state["token_safety_enabled"] = coerce_bool(os.getenv("TOKEN_SAFETY_ENABLED", state["token_safety_enabled"]), state["token_safety_enabled"])
+        state["token_safety_interval_hours"] = coerce_int(os.getenv("TOKEN_SAFETY_INTERVAL_HOURS"), state["token_safety_interval_hours"], minimum=0, maximum=TOKEN_SAFETY_MAX_INTERVAL_HOURS)
         state["community_rules_enabled"] = coerce_bool(os.getenv("COMMUNITY_RULES_ENABLED", state["community_rules_enabled"]), state["community_rules_enabled"]) and jupiter_api_key_configured()
         apply_solanatracker_rate_limit()
         state["input_decimals"] = _optional_decimals(os.getenv("INPUT_DECIMALS", state["input_decimals"] or ""))
@@ -856,6 +937,8 @@ def load_state():
             state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(cfg.get("solanatracker_rate_limit_mode", state["solanatracker_rate_limit_mode"]), cfg.get("solanatracker_requests_per_second", state["solanatracker_requests_per_second"]))
             state["solanatracker_requests_per_second"] = clamp_float(cfg.get("solanatracker_requests_per_second", state["solanatracker_requests_per_second"]), state["solanatracker_requests_per_second"], 0.1, 50.0)
             state["solanatracker_features_enabled"] = coerce_bool(cfg.get("solanatracker_features_enabled", state["solanatracker_features_enabled"]), state["solanatracker_features_enabled"])
+            state["token_safety_enabled"] = coerce_bool(cfg.get("token_safety_enabled", state["token_safety_enabled"]), state["token_safety_enabled"])
+            state["token_safety_interval_hours"] = coerce_int(cfg.get("token_safety_interval_hours", state["token_safety_interval_hours"]), state["token_safety_interval_hours"], minimum=0, maximum=TOKEN_SAFETY_MAX_INTERVAL_HOURS)
             state["community_rules_enabled"] = coerce_bool(cfg.get("community_rules_enabled", state["community_rules_enabled"]), state["community_rules_enabled"]) and jupiter_api_key_configured()
             state["community_rules_refresh_nonce"] = str(cfg.get("community_rules_refresh_nonce") or "")
             apply_solanatracker_rate_limit()
@@ -908,6 +991,8 @@ def write_config():
             "solanatracker_rate_limit_mode": state["solanatracker_rate_limit_mode"],
             "solanatracker_requests_per_second": state["solanatracker_requests_per_second"],
             "solanatracker_features_enabled": state["solanatracker_features_enabled"],
+            "token_safety_enabled": state["token_safety_enabled"],
+            "token_safety_interval_hours": state["token_safety_interval_hours"],
             "community_rules_enabled": state["community_rules_enabled"],
             "community_rules_refresh_nonce": state["community_rules_refresh_nonce"],
             "ntfy_topic": safe_ntfy_topic(state.get("ntfy_topic")),
@@ -1063,6 +1148,34 @@ def update_token_cached_states(token, *, rsi_status=None, rules_changed=False, r
             atomic_write_json(STATE_PATH, existing)
     except Exception as exc:
         print(f"Failed to update cached token state for {mint}: {exc}")
+
+
+def mark_token_safety_queued(token, refresh_nonce):
+    """Queue a safety refresh without discarding the last trusted report."""
+    mint = str((token or {}).get("mint") or "").strip()
+    if not mint:
+        return
+    with json_file_lock(STATE_PATH):
+        existing = read_json_file(STATE_PATH)
+        token_states = existing.get("token_states", {})
+        if not isinstance(token_states, dict):
+            token_states = {}
+        token_state = token_states.get(mint, {})
+        if not isinstance(token_state, dict):
+            token_state = {}
+        safety = token_state.get("safety", {})
+        if not isinstance(safety, dict):
+            safety = {}
+        safety.update({
+            "status": "checking",
+            "error": None,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "requested_nonce": refresh_nonce,
+        })
+        token_state["safety"] = safety
+        token_states[mint] = token_state
+        existing["token_states"] = token_states
+        atomic_write_json(STATE_PATH, existing)
 
 
 def update_active_token_trigger_cache(side, key, timestamp=None, remove=False):
@@ -1324,6 +1437,8 @@ class RuntimeSettings(BaseModel):
     solanatracker_requests_per_second: Optional[float] = None
     solanatracker_rate_limit_mode: Optional[str] = None
     solanatracker_features_enabled: Optional[bool] = None
+    token_safety_enabled: Optional[bool] = None
+    token_safety_interval_hours: Optional[int] = None
     ntfy_topic: Optional[str] = None
     input_decimals: Optional[int] = None
     output_decimals: Optional[int] = None
@@ -1340,6 +1455,7 @@ class TokenPayload(BaseModel):
     rsi_interval: Optional[str] = None
     rsi_reset_enabled: Optional[bool] = None
     rsi_enabled: Optional[bool] = None
+    safety_enabled: Optional[bool] = None
     rules_config: Optional[Dict[str, Any]] = None
 
 
@@ -1351,6 +1467,7 @@ class TokenUpdatePayload(BaseModel):
     rsi_interval: Optional[str] = None
     rsi_reset_enabled: Optional[bool] = None
     rsi_enabled: Optional[bool] = None
+    safety_enabled: Optional[bool] = None
     rules_config: Optional[Dict[str, Any]] = None
 
 
@@ -1476,6 +1593,7 @@ async def add_token(payload: TokenPayload):
         "rsi_interval": state["rsi_interval"],
         "rsi_reset_enabled": state["rsi_reset_enabled"],
         "rsi_enabled": coerce_bool(payload.rsi_enabled, True),
+        "safety_enabled": coerce_bool(payload.safety_enabled, True),
         "runtime_nonce": datetime.now(timezone.utc).isoformat(),
         "rules_config": clean_rules_config,
         "ntfy_topic": clean_ntfy_topic,
@@ -1536,6 +1654,8 @@ async def update_token(mint: str, payload: TokenUpdatePayload):
         token["rsi_reset_enabled"] = coerce_bool(payload.rsi_reset_enabled, token.get("rsi_reset_enabled", False))
     if "rsi_enabled" in fields:
         token["rsi_enabled"] = coerce_bool(payload.rsi_enabled, token.get("rsi_enabled", True))
+    if "safety_enabled" in fields:
+        token["safety_enabled"] = coerce_bool(payload.safety_enabled, token.get("safety_enabled", True))
     if rsi_interval_changed or coerce_bool(token.get("rsi_enabled"), True) != old_rsi_enabled:
         token["rsi_refresh_nonce"] = datetime.now(timezone.utc).isoformat()
         rsi_transition = "waiting" if coerce_bool(token.get("rsi_enabled"), True) else "disabled"
@@ -1566,6 +1686,44 @@ async def update_token(mint: str, payload: TokenUpdatePayload):
                 print(f"Failed to mark Action Rule history gap for {token['mint']}: {e}", flush=True)
 
     return {"success": True, "token": token, "summary": get_token_state_summary()}
+
+
+@app.get("/api/tokens/{mint}/safety")
+async def get_token_safety(mint: str):
+    token = find_token_or_404(mint)
+    safety = token_safety_cache_for(token["mint"])
+    return {
+        "mint": token["mint"],
+        "name": token.get("name") or short_mint(token["mint"]),
+        "global_enabled": token_safety_globally_enabled(),
+        "token_enabled": coerce_bool(token.get("safety_enabled"), True),
+        "effective_enabled": token_safety_effective_enabled(token),
+        "status": compact_token_safety(token, safety),
+        "report": safety.get("report") if isinstance(safety.get("report"), dict) else None,
+    }
+
+
+@app.post("/api/tokens/{mint}/safety/refresh")
+async def refresh_token_safety(mint: str):
+    token = find_token_or_404(mint)
+    if not solanatracker_effective_enabled():
+        raise HTTPException(status_code=400, detail="Enable SolanaTracker and configure its API key first")
+    if not coerce_bool(state.get("token_safety_enabled"), True):
+        raise HTTPException(status_code=400, detail="Token Safety Watch is disabled")
+    if not coerce_bool(token.get("enabled"), True):
+        raise HTTPException(status_code=400, detail="This token is disabled")
+    if not coerce_bool(token.get("safety_enabled"), True):
+        raise HTTPException(status_code=400, detail="Token Safety is disabled for this token")
+
+    current = token_safety_cache_for(token["mint"])
+    if token_safety_checking_is_recent(current):
+        return {"success": True, "queued": True, "already_queued": True}
+
+    refresh_nonce = datetime.now(timezone.utc).isoformat()
+    token["safety_refresh_nonce"] = refresh_nonce
+    write_config()
+    mark_token_safety_queued(token, refresh_nonce)
+    return {"success": True, "queued": True, "already_queued": False}
 
 
 @app.post("/api/tokens/{mint}/notify/test")
@@ -1665,6 +1823,10 @@ async def update_settings(settings: RuntimeSettings):
         raise HTTPException(status_code=400, detail="Check interval must be at least 5 seconds")
     if settings.rsi_check_interval is not None and settings.rsi_check_interval < 1:
         raise HTTPException(status_code=400, detail="RSI check interval must be at least 1 minute")
+    if "token_safety_interval_hours" in fields:
+        interval = settings.token_safety_interval_hours
+        if interval is None or interval < 0 or (interval != 0 and interval < TOKEN_SAFETY_MIN_INTERVAL_HOURS) or interval > TOKEN_SAFETY_MAX_INTERVAL_HOURS:
+            raise HTTPException(status_code=400, detail="Token Safety interval must be manual (0) or between 1 and 720 hours")
     if "solanatracker_rate_limit_mode" in fields:
         raw_mode_for_validation = str(settings.solanatracker_rate_limit_mode or "safe").strip().lower()
         if raw_mode_for_validation not in {"safe", "custom", "off", "disabled", "none"}:
@@ -1686,6 +1848,8 @@ async def update_settings(settings: RuntimeSettings):
         state["check_interval"] = settings.check_interval
     if settings.rsi_check_interval is not None:
         state["rsi_check_interval"] = settings.rsi_check_interval
+    if "token_safety_interval_hours" in fields:
+        state["token_safety_interval_hours"] = settings.token_safety_interval_hours
     if "solanatracker_rate_limit_mode" in fields:
         state["solanatracker_rate_limit_mode"] = normalize_rate_limit_mode(raw_mode_for_validation)
     if settings.solanatracker_requests_per_second is not None:
@@ -1704,6 +1868,8 @@ async def update_settings(settings: RuntimeSettings):
                 token_rsi_enabled = coerce_bool(token.get("rsi_enabled"), True)
                 next_status = "waiting" if state["solanatracker_features_enabled"] and token_rsi_enabled else "disabled"
                 update_token_cached_states(token, rsi_status=next_status)
+    if "token_safety_enabled" in fields:
+        state["token_safety_enabled"] = coerce_bool(settings.token_safety_enabled, state["token_safety_enabled"])
     if "community_rules_enabled" in fields:
         state["community_rules_enabled"] = requested_rules_for_validation
         if state["community_rules_enabled"] != old_community_rules_enabled:
